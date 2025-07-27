@@ -7,3 +7,4 @@ rust-version = "1.85"
 
 [dependencies]
 inkwell = { version = "0.6.0", features = ["llvm18-1"] }
+libc = "0.2"

@@ -36,7 +36,6 @@ unsafe extern "C" {
     ) -> usize;
     fn fclose(stream: *mut std::ffi::c_void) -> i32;
     fn fgets(s: *mut i8, size: i32, stream: *mut std::ffi::c_void) -> *mut i8;
-    fn stdin() -> *mut std::ffi::c_void;
 
 }
 use inkwell::AddressSpace;
@@ -56,6 +55,17 @@ use std::fmt::{Debug, Display, Formatter};
 use std::fs;
 use std::mem;
 use std::ptr;
+
+use libc::{c_void, FILE};
+
+unsafe extern "C" {
+    static mut stdin: *mut FILE;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_stdin() -> *mut c_void {
+    unsafe { stdin as *mut c_void }
+}
 
 #[derive(Debug, Clone)]
 struct Token {
@@ -1462,6 +1472,9 @@ impl<'ctx> Compiler<'ctx> {
         let fclose_fn = self.get_or_create_fclose();
         self.execution_engine
             .add_global_mapping(&fclose_fn, fclose as usize);
+        let get_stdin_fn = self.get_or_create_get_stdin();
+        self.execution_engine
+            .add_global_mapping(&get_stdin_fn, get_stdin as usize);
 
         // Retrieve the JIT'd function
         unsafe { self.execution_engine.get_function("main").ok() }
@@ -2048,7 +2061,7 @@ impl<'ctx> Compiler<'ctx> {
                 // Read a line from stdin
                 let malloc_fn = self.get_or_create_malloc();
                 let fgets_fn = self.get_or_create_fgets();
-                let stdin_fn = self.get_or_create_stdin();
+                let stdin_fn = self.get_or_create_get_stdin();
                 let strlen_fn = self.get_or_create_strlen();
 
                 // If there's an argument, print it as a prompt
@@ -2921,14 +2934,14 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
-    fn get_or_create_stdin(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function("stdin") {
+    fn get_or_create_get_stdin(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_stdin") {
             f
         } else {
             let void_ptr = self.context.ptr_type(AddressSpace::default());
             // stdin signature: () -> void*
             let fn_type = void_ptr.fn_type(&[], false);
-            self.module.add_function("stdin", fn_type, None)
+            self.module.add_function("get_stdin", fn_type, None)
         }
     }
 
