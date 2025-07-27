@@ -1,9 +1,0 @@
-fun do_something(n: Num) {
-    print "Hello, " + n.str();
-}
-
-for let i = 0; i < 10; i = i + 1; {
-    do_something(i);
-}
-
-

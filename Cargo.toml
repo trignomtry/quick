@@ -1,13 +1,9 @@
 [package]
 name = "quickscript"
 version = "0.1.0"
-authors = ["Codecrafters <hello@codecrafters.io>"]
-edition = "2021"
-rust-version = "1.80"
+authors = ["Trig Northrup <northruptrig@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
-actix-web = "4.11.0"
-dashmap = "6.1.0"
-fastrand = "2.3.0"
-tokio = { version = "1.46.0", features = ["full"] }
 inkwell = { version = "0.6.0", features = ["llvm18-1"] }

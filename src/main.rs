@@ -1,38 +1,61 @@
-// #![allow(unused_variables)]
-// #![allow(dead_code)]
-// #![allow(unused_mut)]
-// #![allow(unused_imports)]
+//! #![allow(unused_variables)]
+//! #![allow(dead_code)]
+//! #![allow(unused_mut)]
+//! #![allow(unused_imports)]
 
 use crate::TokenKind::*;
-// Extern declarations for C runtime functions
-extern "C" {
+unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
     fn printf(fmt: *const i8, ...) -> i32;
     fn malloc(size: usize) -> *mut std::ffi::c_void;
+    fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
+    fn memcpy(
+        dest: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        n: usize,
+    ) -> *mut std::ffi::c_void;
     fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8;
     fn sprintf(buf: *mut i8, fmt: *const i8, ...) -> i32;
     fn strcat(dest: *mut i8, src: *const i8) -> *mut i8;
     fn strlen(s: *const i8) -> usize;
+    fn rand() -> i32;
+    fn time(t: *mut i64) -> i64;
+    fn srand(seed: u32);
+    fn fopen(filename: *const i8, mode: *const i8) -> *mut std::ffi::c_void;
+    fn fwrite(
+        ptr: *const std::ffi::c_void,
+        size: usize,
+        count: usize,
+        stream: *mut std::ffi::c_void,
+    ) -> usize;
+    fn fread(
+        ptr: *mut std::ffi::c_void,
+        size: usize,
+        count: usize,
+        stream: *mut std::ffi::c_void,
+    ) -> usize;
+    fn fclose(stream: *mut std::ffi::c_void) -> i32;
+    fn fgets(s: *mut i8, size: i32, stream: *mut std::ffi::c_void) -> *mut i8;
+    fn stdin() -> *mut std::ffi::c_void;
+
 }
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder};
-use dashmap::DashMap;
-use fastrand::f64 as random;
-use inkwell::builder::Builder;
+use inkwell::AddressSpace;
+use inkwell::OptimizationLevel;
+use inkwell::builder::{Builder, BuilderError};
 use inkwell::context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
-use inkwell::types::{BasicType, BasicTypeEnum, PointerType};
+use inkwell::types::{BasicType, BasicTypeEnum};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, PointerValue,
 };
-use inkwell::AddressSpace;
-use inkwell::OptimizationLevel;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
-use std::fmt::{Debug, Display, Formatter, Pointer};
+use std::fmt::{Debug, Display, Formatter};
 use std::fs;
-use std::sync::{Arc, RwLock};
+use std::mem;
+use std::ptr;
 
 #[derive(Debug, Clone)]
 struct Token {
@@ -143,20 +166,8 @@ enum Expr {
     Get(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     List(Vec<Expr>),
-    Object(DashMap<String, Expr>),
+    Object(String, HashMap<String, Expr>),
     Block(Vec<Instruction>),
-}
-
-impl Debug for Function {
-    fn fmt(&self, f: &mut Formatter) -> std::result::Result<(), std::fmt::Error> {
-        write!(f, "Function block")
-    }
-}
-
-impl Clone for Function {
-    fn clone(&self) -> Self {
-        Function((*self.0).clone_box())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +175,7 @@ enum Instruction {
     Let {
         name: String,
         value: Expr,
-        type_hint: Option<Type>, // optional, inferred if None
+        type_hint: Type,
     },
     Assign(String, Expr, Option<Type>),
     Println(Expr),
@@ -206,9 +217,9 @@ enum Value {
     Str(String),
     /// Special return value used to signal early exit from functions
     Return(Box<Value>),
-    Object(DashMap<String, Value>),
+    Object(HashMap<String, Value>),
     Bool(bool),
-    Function(Vec<(String, String)>, Function),
+    Function(Vec<(String, String)>, Vec<Instruction>),
     List(Vec<Value>),
     Nil,
 }
@@ -253,11 +264,11 @@ impl Debug for Value {
                 f,
                 "[{}]",
                 l.iter()
-                    .map(move |f| format!("{f:?}"))
+                    .map(move |f| format!("{:?}", f))
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
-            Self::Object(o) => write!(f, "{o:?}"),
+            Self::Object(o) => write!(f, "{:?}", o),
             Self::Nil => write!(f, "nil"),
         }
     }
@@ -275,11 +286,11 @@ impl Display for Value {
                 f,
                 "[{}]",
                 l.iter()
-                    .map(move |f| format!("{f:?}"))
+                    .map(move |f| format!("{:?}", f))
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
-            Self::Object(o) => write!(f, "{o:?}"),
+            Self::Object(o) => write!(f, "{:?}", o),
             Self::Nil => write!(f, "nil"),
         }
     }
@@ -300,7 +311,7 @@ impl Value {
                     .join(", ");
                 format!("[{inner}]")
             }
-            Value::Object(o) => format!("{o:?}"),
+            Value::Object(o) => format!("{:?}", o),
             Value::Nil => "nil".to_string(),
             Value::Bool(b) => b.to_string(),
         }
@@ -309,65 +320,17 @@ impl Value {
 
 #[derive(Default, Clone)]
 struct PreCtx {
-    var_types: DashMap<String, Type>,
-    types: DashMap<String, DashMap<String, Type>>,
-}
-
-#[derive(Default, Clone)]
-struct Context {
-    variables: DashMap<String, Value>,
-    routes: Arc<RwLock<Vec<(Reqs, Vec<PathPart>, Function)>>>,
-    parent: Option<Arc<Context>>,
-}
-
-impl Context {
-    fn get(&self, name: &str) -> Option<Value> {
-        if let Some(val) = self.variables.get(name) {
-            Some(val.value().clone())
-        } else if let Some(parent) = self.parent.as_ref() {
-            parent.get(name)
-        } else {
-            None
-        }
-    }
-    fn change(&self, name: &str, val: Value) -> Option<Value> {
-        // If the variable exists in the current context, update it here
-        if self.variables.contains_key(name) {
-            return self.insert(name, val);
-        }
-        // Otherwise, if there's a parent context, recurse into it
-        if let Some(parent_ctx) = &self.parent {
-            return parent_ctx.change(name, val);
-        }
-        // If no existing declaration in any context, insert into current
-        self.insert(name, val)
-    }
-
-    fn route(&self, method: Reqs, path: Vec<PathPart>, func: Function) {
-        // Walk to the root context before pushing a route
-        let mut current: Arc<Context> = Arc::new(self.clone());
-        while let Some(parent) = &current.parent {
-            current = parent.clone();
-        }
-        current.routes.write().unwrap().push((method, path, func));
-    }
-
-    fn insert(&self, name: &str, val: Value) -> Option<Value> {
-        self.variables.insert(name.to_string(), val)
-    }
+    var_types: HashMap<String, Type>,
+    types: HashMap<String, HashMap<String, Type>>,
 }
 
 struct Parser {
     tokens: Vec<Token>,
     current: usize, // index into `tokens`
     pctx: PreCtx,
-    /// Inferred return type for the current function being parsed
     current_return_type: Option<Type>,
-    /// Are we currently inside a `maybe` block?
     inside_maybe: bool,
-    /// Tracks if any non-nil return has been seen in current function
     saw_non_nil_return: bool,
-    /// Tracks if any explicit nil return has been seen in current function
     saw_nil_return: bool,
 }
 
@@ -380,7 +343,7 @@ enum Type {
     Io,
     List(Box<Type>),
     Option(Box<Type>),
-    Custom(DashMap<String, Type>),
+    Custom(HashMap<String, Type>),
     Function(Vec<(String, String)>, Box<Type>),
 }
 
@@ -406,9 +369,7 @@ impl PartialEq for Type {
                 if map_l.len() != map_r.len() {
                     return false;
                 }
-                for entry in map_l.iter() {
-                    let key = entry.key();
-                    let val_l = entry.value();
+                for (key, val_l) in map_l.iter() {
                     match map_r.get(key) {
                         Some(val_r) if *val_l == *val_r => continue,
                         _ => return false,
@@ -422,29 +383,6 @@ impl PartialEq for Type {
     }
 }
 
-trait CloneableFnMut: Fn(Arc<Context>) -> Value + Send + Sync {
-    fn clone_box(&self) -> Box<dyn CloneableFnMut>;
-}
-
-impl<T> CloneableFnMut for T
-where
-    T: Fn(Arc<Context>) -> Value + Clone + Send + Sync + 'static,
-{
-    fn clone_box(&self) -> Box<dyn CloneableFnMut> {
-        Box::new(self.clone())
-    }
-}
-
-impl Clone for Box<dyn CloneableFnMut> {
-    fn clone(&self) -> Box<dyn CloneableFnMut> {
-        // Force vtable dispatch on the underlying closure
-        let f: &dyn CloneableFnMut = &**self;
-        f.clone_box()
-    }
-}
-
-type MetalFunction = Box<dyn CloneableFnMut>;
-struct Function(MetalFunction);
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -490,7 +428,8 @@ impl Parser {
                     &Type::Option(Box::new(old.clone()))
                 } else {
                     return Err(format!(
-                        "Mismatched return types in function: {old:?} vs {ret_type:?}",
+                        "Mismatched return types in function: {:?} vs {:?}",
+                        old, ret_type,
                     ));
                 }
             } else {
@@ -564,7 +503,7 @@ impl Parser {
             };
             self.advance();
             self.consume(LBrace, "Expected a { after object name")?;
-            let fields = DashMap::new();
+            let mut fields = HashMap::new();
             while !self.match_kind(TokenKind::RBrace) {
                 let Identifier(field) = self.peek().kind else {
                     return Err(format!(
@@ -657,7 +596,8 @@ impl Parser {
                 self.consume(Colon, {
                     if self.peek().kind == Comma {
                         return Err(format!(
-                            "Function parameters must have types, try: {param_name}: Str or {param_name}: Num",
+                            "Function parameters must have types, try: {}: Str or {}: Num",
+                            param_name, param_name,
                         ));
                     } else {
                         "Expected ':' after param name"
@@ -788,7 +728,8 @@ impl Parser {
             let cond_type = get_type_of_expr(&expr, &self.pctx)?;
             if cond_type != Type::Bool {
                 return Err(format!(
-                    "Condition in 'while' statement must be a boolean, found {cond_type:?}",
+                    "Condition in 'while' statement must be a boolean, found {:?}",
+                    cond_type,
                 ));
             }
             // Parse the loop body (a statement, e.g., a block)
@@ -829,8 +770,9 @@ impl Parser {
             if let Some(existing) = self.pctx.var_types.get(&var_name) {
                 if *existing != expr_type {
                     return Err(format!(
-                            "Cannot redeclare variable '{var_name}' with different type. Previous: {existing:?}, New: {expr_type:?}",
-                        ));
+                        "Cannot redeclare variable '{}' with different type. Previous: {:?}, New: {:?}",
+                        var_name, existing, expr_type,
+                    ));
                 }
             } else {
                 self.pctx
@@ -841,7 +783,7 @@ impl Parser {
             Ok(Instruction::Let {
                 name: var_name,
                 value: expr,
-                type_hint: Some(expr_type),
+                type_hint: expr_type,
             })
         } else if matches!(self.peek().kind, TokenKind::Identifier(_))
             && self
@@ -864,11 +806,17 @@ impl Parser {
             if let Some(existing) = self.pctx.var_types.get(&name) {
                 if *existing != expr_type && *existing != Type::Nil {
                     return Err(format!(
-                        "Cannot assign to variable '{name}' with different type. Previous: {existing:?}, New: {expr_type:?}",
+                        "Cannot assign to variable '{}' with different type. Previous: {:?}, New: {:?}",
+                        name, existing, expr_type,
                     ));
                 }
             } else {
-                return Err(format!("Variable '{name}' used before declaration"));
+                return Err(format!("Variable '{}' used before declaration", name));
+            }
+            if let Some(existing) = self.pctx.var_types.get(&name) {
+                if *existing == Type::Nil {
+                    self.pctx.var_types.insert(name.clone(), expr_type.clone());
+                }
             }
             self.match_kind(TokenKind::Semicolon);
             Ok(Instruction::Assign(name, expr, Some(expr_type)))
@@ -886,10 +834,6 @@ impl Parser {
             self.match_kind(TokenKind::Semicolon);
             Ok(Instruction::Return(expr))
         }
-    }
-
-    fn parse(&mut self) -> Result<Expr, String> {
-        self.expression()
     }
 
     // ───── recursive-descent grammar ─────
@@ -1002,7 +946,7 @@ impl Parser {
             if i.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
                 && self.match_kind(TokenKind::LBrace)
             {
-                let vals = DashMap::new();
+                let mut vals = HashMap::new();
                 while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
                     let Identifier(key) = self.peek().kind else {
                         return Err(format!("Expected identifier, found {}", self.peek().kind));
@@ -1020,22 +964,26 @@ impl Parser {
                 }
                 self.consume(TokenKind::RBrace, "Expected '}' after object literal")?;
                 if let Some(r) = self.pctx.types.get(i) {
-                    for entry in r.iter() {
-                        let name = entry.key();
-                        let typ = entry.value();
-                        if let Some(r) = vals.get(name) {
-                            let real_type = get_type_of_expr(&r, &self.pctx)?;
+                    let mut all_fields_present = true;
+                    for (name, typ) in r.iter() {
+                        if let Some(r_val) = vals.get(name) {
+                            let real_type = get_type_of_expr(r_val, &self.pctx)?;
                             if real_type != *typ {
                                 return Err(format!(
-                                    "Expected {name} to be type {typ:?}, got {real_type:?}",
+                                    "Expected {} to be type {:?}, got {:?}",
+                                    name, typ, real_type
                                 ));
                             }
                         } else {
-                            return Err(format!("{i} object requires the field {name}"));
+                            all_fields_present = false;
+                            break;
                         }
                     }
+                    if !all_fields_present {
+                        return Err(format!("{} object requires more fields", i));
+                    }
                 }
-                return Ok(Expr::Object(vals));
+                return Ok(Expr::Object(i.clone(), vals));
             }
             // start with a variable reference
             let mut expr = Expr::Variable(i.clone());
@@ -1067,22 +1015,18 @@ impl Parser {
                     }
                 }
                 self.consume(TokenKind::RParen, "Expected ')' after arguments.")?;
-                if let Some(Type::Function(f, _)) =
-                    self.pctx.var_types.get(i).map(move |o| o.value().clone())
-                {
+                if let Some(Type::Function(f, _)) = self.pctx.var_types.get(i).cloned() {
                     if f.len() != args.len() {
                         return Err(format!(
                             "Function parameters incorrect, expected {} found {}",
                             f.len(),
-                            args.len()
+                            args.len(),
                         ));
                     }
                 }
                 for arg in &args {
                     let ty = get_type_of_expr(arg, &self.pctx)?;
-                    if let Some(Type::Function(f, _)) =
-                        self.pctx.var_types.get(i).map(move |o| o.value().clone())
-                    {
+                    if let Some(Type::Function(f, _)) = self.pctx.var_types.get(i).cloned() {
                         for (_, t) in f {
                             let te = match t.as_str() {
                                 "Str" => Type::Str,
@@ -1092,7 +1036,8 @@ impl Parser {
                             };
                             if te != ty {
                                 return Err(format!(
-                                    "Function parameters incorrect, expected {t} found {ty:?}",
+                                    "Function parameters incorrect, expected {} found {:?}",
+                                    t, ty,
                                 ));
                             }
                         }
@@ -1104,9 +1049,41 @@ impl Parser {
         }
 
         if self.match_kind(TokenKind::LParen) {
-            let expr = self.expression()?;
+            // parse grouped expression
+            let mut expr = self.expression()?;
             self.consume(TokenKind::RParen, "Expect ')' after expression.")?;
-            return Ok(Expr::Grouping(Box::new(expr)));
+            // allow property access, indexing, and calls on grouped expressions
+            loop {
+                if self.match_kind(TokenKind::Dot) {
+                    if let TokenKind::Identifier(name) = &self.peek().kind {
+                        let prop = name.clone();
+                        self.advance();
+                        expr = Expr::Get(Box::new(expr), prop);
+                    } else {
+                        return Err(format!(
+                            "Expected identifier after '.', found {}",
+                            self.peek().kind
+                        ));
+                    }
+                } else if self.match_kind(TokenKind::LBrack) {
+                    let index_pr = self.expression()?;
+                    self.consume(RBrack, "Expected ']' after list index")?;
+                    expr = Expr::Index(Box::new(expr), Box::new(index_pr));
+                } else if self.match_kind(TokenKind::LParen) {
+                    let mut args = Vec::new();
+                    while !self.check(&TokenKind::RParen) {
+                        args.push(self.expression()?);
+                        if !self.match_kind(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.consume(TokenKind::RParen, "Expected ')' after arguments.")?;
+                    expr = Expr::Call(Box::new(expr), args);
+                } else {
+                    break;
+                }
+            }
+            return Ok(expr);
         }
 
         if self.match_kind(TokenKind::LBrace) {
@@ -1331,34 +1308,9 @@ fn main() {
     let filename = &args[2];
 
     match command.as_str() {
-        "evaluate" => {
-            let file_contents = fs::read_to_string(filename).unwrap_or_else(|_| {
-                eprintln!("Failed to read file {filename}");
-                std::string::String::new()
-            });
-            let tokens = tokenize(file_contents.chars().collect());
-            if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
-                for t in tokens {
-                    if let Error(_, _) = t.kind {
-                        t.print();
-                    }
-                }
-                std::process::exit(65);
-            }
-            let mut parser = Parser::new(tokens);
-            match parser.parse() {
-                Ok(p) => {
-                    println!("{}", eval(p, Arc::new(Context::default())).value());
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(65);
-                }
-            }
-        }
         "run" => {
             let file_contents = fs::read_to_string(filename).unwrap_or_else(|_| {
-                eprintln!("Failed to read file {filename}");
+                eprintln!("Failed to read file {}", filename);
                 std::string::String::new()
             });
             let tokens = tokenize(file_contents.chars().collect());
@@ -1386,7 +1338,16 @@ fn main() {
                         execution_engine,
                         instructions: p,
                         vars: RefCell::new(HashMap::new()),
+                        var_types: RefCell::new(HashMap::new()),
+                        pctx: RefCell::new(parser.pctx),
                     };
+
+                    // seed the C PRNG so io.random() varies each run
+                    unsafe {
+                        // get current epoch seconds
+                        let now = time(ptr::null_mut());
+                        srand(now as u32);
+                    }
 
                     let sum = codegen
                         .run_code()
@@ -1398,17 +1359,17 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("{e}");
+                    eprintln!("{}", e);
                     std::process::exit(65);
                 }
             }
         }
         _ => {
-            eprintln!("Unknown command: {command}");
+            eprintln!("Unknown command: {}", command);
         }
     }
 }
-type SumFunc = unsafe extern "C" fn() -> u64;
+type SumFunc = unsafe extern "C" fn() -> f64;
 struct Compiler<'ctx> {
     context: &'ctx context::Context,
     module: Module<'ctx>,
@@ -1416,14 +1377,25 @@ struct Compiler<'ctx> {
     execution_engine: ExecutionEngine<'ctx>,
     instructions: Vec<Instruction>,
     vars: RefCell<HashMap<String, PointerValue<'ctx>>>,
+    var_types: RefCell<HashMap<String, BasicTypeEnum<'ctx>>>,
+    pctx: RefCell<PreCtx>,
 }
-use inkwell::types::BasicMetadataTypeEnum;
+use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
+use inkwell::types::BasicMetadataTypeEnum;
 impl<'ctx> Compiler<'ctx> {
+    /// Expose C rand() → i32
+    fn get_or_create_rand(&self) -> FunctionValue<'ctx> {
+        self.module.get_function("rand").unwrap_or_else(|| {
+            let fn_type = self.context.i32_type().fn_type(&[], false);
+            self.module.add_function("rand", fn_type, None)
+        })
+    }
+
     fn run_code(&self) -> Option<JitFunction<'_, SumFunc>> {
-        let i64_type = self.context.i64_type();
+        let f64_type = self.context.f64_type();
         // Match SumFunc signature: three u64 parameters
-        let fn_type = i64_type.fn_type(&[], false);
+        let fn_type = f64_type.fn_type(&[], false);
         let main_fn = self.module.add_function("main", fn_type, None);
         // Entry block and position builder
         let entry_bb = self.context.append_basic_block(main_fn, "entry");
@@ -1431,7 +1403,7 @@ impl<'ctx> Compiler<'ctx> {
         // 1) Compile all function definitions first
         for instr in &self.instructions {
             if let Instruction::FunctionDef { .. } = instr {
-                self.compile_instruction(main_fn, instr);
+                self.compile_instruction(main_fn, instr).unwrap();
             }
         }
         // Restore builder to main entry before compiling main instructions
@@ -1440,55 +1412,66 @@ impl<'ctx> Compiler<'ctx> {
         // 2) Compile non-function-definition instructions
         for instr in &self.instructions {
             if !matches!(instr, Instruction::FunctionDef { .. }) {
-                self.compile_instruction(main_fn, instr);
+                self.compile_instruction(main_fn, instr).unwrap();
             }
         }
         // Restore builder to main entry before inserting default return
-        self.builder.position_at_end(entry_bb);
-
-        // Default return if no explicit return was emitted
-        if self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_terminator()
-            .is_none()
-        {
-            self.builder
-                .build_return(Some(&i64_type.const_int(0, false)));
+        if let Some(last_block) = self.builder.get_insert_block() {
+            if last_block.get_terminator().is_none() {
+                self.builder
+                    .build_return(Some(&f64_type.const_float(0.0)))
+                    .unwrap();
+            }
         }
 
         // Ensure C library functions are resolved at runtime to prevent segfaults
-        unsafe {
-            let strcmp_fn = self.get_or_create_strcmp();
-            self.execution_engine
-                .add_global_mapping(&strcmp_fn, strcmp as usize);
-            let printf_fn = self.get_or_create_printf();
-            self.execution_engine
-                .add_global_mapping(&printf_fn, printf as usize);
-            let malloc_fn = self.get_or_create_malloc();
-            self.execution_engine
-                .add_global_mapping(&malloc_fn, malloc as usize);
-            let strcpy_fn = self.get_or_create_strcpy();
-            self.execution_engine
-                .add_global_mapping(&strcpy_fn, strcpy as usize);
-            let strcat_fn = self.get_or_create_strcat_c();
-            self.execution_engine
-                .add_global_mapping(&strcat_fn, strcat as usize);
-            let strlen_fn = self.get_or_create_strlen();
-            self.execution_engine
-                .add_global_mapping(&strlen_fn, strlen as usize);
-            let sprintf_fn = self.get_or_create_sprintf();
-            self.execution_engine
-                .add_global_mapping(&sprintf_fn, sprintf as usize);
-        }
+        let strcmp_fn = self.get_or_create_strcmp();
+        self.execution_engine
+            .add_global_mapping(&strcmp_fn, strcmp as usize);
+        let printf_fn = self.get_or_create_printf();
+        self.execution_engine
+            .add_global_mapping(&printf_fn, printf as usize);
+        let malloc_fn = self.get_or_create_malloc();
+        self.execution_engine
+            .add_global_mapping(&malloc_fn, malloc as usize);
+        let strcpy_fn = self.get_or_create_strcpy();
+        self.execution_engine
+            .add_global_mapping(&strcpy_fn, strcpy as usize);
+        let strcat_fn = self.get_or_create_strcat_c();
+        self.execution_engine
+            .add_global_mapping(&strcat_fn, strcat as usize);
+        let strlen_fn = self.get_or_create_strlen();
+        self.execution_engine
+            .add_global_mapping(&strlen_fn, strlen as usize);
+        let sprintf_fn = self.get_or_create_sprintf();
+        self.execution_engine
+            .add_global_mapping(&sprintf_fn, sprintf as usize);
+        let rand_fn = self.get_or_create_rand();
+        self.execution_engine
+            .add_global_mapping(&rand_fn, rand as usize);
+
+        let fopen_fn = self.get_or_create_fopen();
+        self.execution_engine
+            .add_global_mapping(&fopen_fn, fopen as usize);
+        let fread_fn = self.get_or_create_fread();
+        self.execution_engine
+            .add_global_mapping(&fread_fn, fread as usize);
+        let fwrite_fn = self.get_or_create_fwrite();
+        self.execution_engine
+            .add_global_mapping(&fwrite_fn, fwrite as usize);
+        let fclose_fn = self.get_or_create_fclose();
+        self.execution_engine
+            .add_global_mapping(&fclose_fn, fclose as usize);
 
         // Retrieve the JIT'd function
         unsafe { self.execution_engine.get_function("main").ok() }
     }
 
-    fn compile_instruction(&self, function: FunctionValue<'ctx>, instr: &Instruction) {
-        let i64_type = self.context.i64_type();
+    fn compile_instruction(
+        &self,
+        function: FunctionValue<'ctx>,
+        instr: &Instruction,
+    ) -> Result<(), BuilderError> {
         match instr {
             Instruction::If {
                 condition,
@@ -1500,15 +1483,15 @@ impl<'ctx> Compiler<'ctx> {
                 let else_bb = self.context.append_basic_block(function, "else");
                 let cont_bb = self.context.append_basic_block(function, "cont");
                 // Build branch on condition
-                let BasicValueEnum::IntValue(cond_val) = self.compile_expr(condition) else {
+                let BasicValueEnum::IntValue(cond_val) = self.compile_expr(condition)? else {
                     panic!()
                 };
                 self.builder
-                    .build_conditional_branch(cond_val, then_bb, else_bb);
+                    .build_conditional_branch(cond_val, then_bb, else_bb)?;
                 // Then block
                 self.builder.position_at_end(then_bb);
                 for stmt in then {
-                    self.compile_instruction(function, stmt);
+                    self.compile_instruction(function, stmt)?;
                 }
                 if self
                     .builder
@@ -1517,12 +1500,12 @@ impl<'ctx> Compiler<'ctx> {
                     .get_terminator()
                     .is_none()
                 {
-                    self.builder.build_unconditional_branch(cont_bb);
+                    self.builder.build_unconditional_branch(cont_bb)?;
                 }
                 // Else block
                 self.builder.position_at_end(else_bb);
                 if let Some(else_node) = elses {
-                    self.compile_instruction(function, else_node);
+                    self.compile_instruction(function, else_node)?;
                 }
                 if self
                     .builder
@@ -1531,49 +1514,50 @@ impl<'ctx> Compiler<'ctx> {
                     .get_terminator()
                     .is_none()
                 {
-                    self.builder.build_unconditional_branch(cont_bb);
+                    self.builder.build_unconditional_branch(cont_bb)?;
                 }
                 // Continue here
                 self.builder.position_at_end(cont_bb);
-                // Ensure the continuation block returns a value to avoid falling off the end
-                if self
-                    .builder
-                    .get_insert_block()
-                    .unwrap()
-                    .get_terminator()
-                    .is_none()
-                {
-                    let zero = self.context.i64_type().const_int(0, false);
-                    self.builder.build_return(Some(&zero));
-                }
+                Ok(())
             }
             Instruction::Return(expr) => {
                 // In 'main', treat expression statements (calls) as side effects rather than returns
                 let fn_name = function.get_name().to_str().unwrap();
                 if fn_name == "main" {
                     // Evaluate for side effects (e.g., calling functions, printing)
-                    let _ = self.compile_expr(expr);
+                    let _ = self.compile_expr(expr)?;
                 } else {
                     // True return inside a user-defined function
-                    let ret_val = self.compile_expr(expr);
-                    self.builder.build_return(Some(&ret_val));
+                    let ret_val = self.compile_expr(expr)?;
+                    self.builder.build_return(Some(&ret_val))?;
                 }
+                Ok(())
             }
             Instruction::Block(b) => {
                 for i in b {
-                    self.compile_instruction(function, i);
+                    self.compile_instruction(function, i)?;
                 }
+                Ok(())
             }
-            Instruction::Let {
-                name,
-                value,
-                type_hint,
-            } => {
-                println!("defining {name}");
-                let ptr = self.builder.build_alloca(i64_type, name).unwrap();
-                let init_val = self.compile_expr(value);
-                self.builder.build_store(ptr, init_val);
+            Instruction::Let { name, value, .. } => {
+                let init_val = self.compile_expr(value)?;
+                let elem_type = init_val.get_type();
+
+                // Hoist allocas to the entry block to avoid stack overflow in loops.
+                let entry = function.get_first_basic_block().unwrap();
+                let temp_builder = self.context.create_builder();
+                match entry.get_first_instruction() {
+                    Some(inst) => temp_builder.position_before(&inst),
+                    None => temp_builder.position_at_end(entry),
+                }
+
+                let ptr = temp_builder.build_alloca(elem_type, name).unwrap();
+                self.builder.build_store(ptr, init_val)?;
                 self.vars.borrow_mut().insert(name.clone(), ptr);
+                self.var_types
+                    .borrow_mut()
+                    .insert(name.clone(), elem_type.as_basic_type_enum());
+                Ok(())
             }
             Instruction::For {
                 init,
@@ -1581,13 +1565,13 @@ impl<'ctx> Compiler<'ctx> {
                 step,
                 body,
             } => {
-                // Carve out blocks for init, cond, body, and continuation
-                let init_bb = self.context.append_basic_block(function, "for.init");
                 let cond_bb = self.context.append_basic_block(function, "for.cond");
                 let body_bb = self.context.append_basic_block(function, "for.body");
+                let step_bb = self.context.append_basic_block(function, "for.step");
                 let cont_bb = self.context.append_basic_block(function, "for.cont");
 
-                // Unconditionally jump to init
+                // init
+                self.compile_instruction(function, init)?;
                 if self
                     .builder
                     .get_insert_block()
@@ -1595,29 +1579,20 @@ impl<'ctx> Compiler<'ctx> {
                     .get_terminator()
                     .is_none()
                 {
-                    self.builder.build_unconditional_branch(init_bb);
+                    self.builder.build_unconditional_branch(cond_bb)?;
                 }
 
-                // -- init block --
-                self.builder.position_at_end(init_bb);
-                self.compile_instruction(function, init);
-                self.builder.build_unconditional_branch(cond_bb);
-
-                // -- condition block --
+                // condition
                 self.builder.position_at_end(cond_bb);
-                let BasicValueEnum::IntValue(cond_val) = self.compile_expr(condition) else {
-                    panic!()
-                };
+                let cond_val = self.compile_expr(condition)?.into_int_value();
                 self.builder
-                    .build_conditional_branch(cond_val, body_bb, cont_bb);
+                    .build_conditional_branch(cond_val, body_bb, cont_bb)?;
 
-                // -- body block --
+                // body
                 self.builder.position_at_end(body_bb);
                 for stmt in body {
-                    self.compile_instruction(function, stmt);
+                    self.compile_instruction(function, stmt)?;
                 }
-                // execute step
-                self.compile_instruction(function, step);
                 if self
                     .builder
                     .get_insert_block()
@@ -1625,23 +1600,49 @@ impl<'ctx> Compiler<'ctx> {
                     .get_terminator()
                     .is_none()
                 {
-                    self.builder.build_unconditional_branch(cond_bb);
+                    self.builder.build_unconditional_branch(step_bb)?;
                 }
 
-                // -- continuation block --
+                // step
+                self.builder.position_at_end(step_bb);
+                self.compile_instruction(function, step)?;
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(cond_bb)?;
+                }
+
+                // continuation
                 self.builder.position_at_end(cont_bb);
+                Ok(())
             }
-            Instruction::Assign(name, new_val, typ) => {
-                let new_c = self.compile_expr(new_val);
+            Instruction::Assign(name, new_val, _typ) => {
+                // Check if this is a string concatenation assignment (var = var + something)
+                if let Expr::Binary(left_expr, BinOp::Plus, right_expr) = new_val {
+                    if let Expr::Variable(var_name) = left_expr.as_ref() {
+                        if var_name == name {
+                            // This is var = var + something, use optimized append
+                            return self.compile_safe_string_append(name, right_expr);
+                        }
+                    }
+                }
+
+                // Regular assignment
+                let new_c = self.compile_expr(new_val)?;
                 let binding = self.vars.borrow();
                 let ptr = binding
                     .get(name)
-                    .expect(format!("Variable not found: {name}").as_str());
-                self.builder.build_store(*ptr, new_c);
+                    .unwrap_or_else(|| panic!("Variable not found: {name}"));
+                self.builder.build_store(*ptr, new_c)?;
+                Ok(())
             }
             // in your compile_instruction:
             Instruction::Println(expr) => {
-                let val = self.compile_expr(expr);
+                let val = self.compile_expr(expr)?;
                 let printf_fn = self.get_or_create_printf();
 
                 match val {
@@ -1655,22 +1656,23 @@ impl<'ctx> Compiler<'ctx> {
                             printf_fn,
                             &[fmt.as_pointer_value().into(), p.into()],
                             "printf_str",
-                        );
+                        )?;
                     }
-                    BasicValueEnum::IntValue(i) => {
+                    BasicValueEnum::FloatValue(i) => {
                         // numeric case
                         let fmt = self
                             .builder
-                            .build_global_string_ptr("%ld\n\0", "fmt_d")
+                            .build_global_string_ptr("%f\n\0", "fmt_d")
                             .unwrap();
                         self.builder.build_call(
                             printf_fn,
                             &[fmt.as_pointer_value().into(), i.into()],
                             "printf_int",
-                        );
+                        )?;
                     }
                     _ => unreachable!(),
                 }
+                Ok(())
             }
             Instruction::FunctionDef {
                 name,
@@ -1681,21 +1683,20 @@ impl<'ctx> Compiler<'ctx> {
                 // Build LLVM function signature based on parameter and return types
                 // Map QuickLang types to LLVM types
                 let llvm_ret_type = match return_type {
-                    Type::Num => self.context.i64_type().as_basic_type_enum(),
+                    Type::Num => self.context.f64_type().as_basic_type_enum(),
                     Type::Bool => self.context.bool_type().as_basic_type_enum(),
                     Type::Str => self
                         .context
-                        .i8_type()
                         .ptr_type(AddressSpace::default())
                         .as_basic_type_enum(),
-                    Type::Nil => BasicTypeEnum::IntType(i64_type),
+                    Type::Nil => BasicTypeEnum::FloatType(self.context.f64_type()),
                     other => unimplemented!("Return type {:?} not supported", other),
                 };
 
                 let param_llvm_types: Vec<BasicTypeEnum> = params
                     .iter()
                     .map(|(_, ty)| match ty {
-                        Type::Num => self.context.i64_type().as_basic_type_enum(),
+                        Type::Num => self.context.f64_type().as_basic_type_enum(),
                         Type::Bool => self.context.bool_type().as_basic_type_enum(),
                         Type::Str => self
                             .context
@@ -1709,23 +1710,40 @@ impl<'ctx> Compiler<'ctx> {
                     param_llvm_types.iter().map(|&t| t.into()).collect();
 
                 // Create the function type (void vs non-void)
-                let fn_type = if llvm_ret_type.is_int_type() {
-                    llvm_ret_type.fn_type(param_metadata_types.as_slice(), false)
-                } else {
-                    llvm_ret_type
-                        .into_int_type()
-                        .fn_type(param_metadata_types.as_slice(), false)
+                // Build the LLVM function type based on the return type variant
+                let fn_type = match llvm_ret_type {
+                    BasicTypeEnum::IntType(int_ty) => {
+                        int_ty.fn_type(param_metadata_types.as_slice(), false)
+                    }
+                    BasicTypeEnum::PointerType(ptr_ty) => {
+                        ptr_ty.fn_type(param_metadata_types.as_slice(), false)
+                    }
+                    BasicTypeEnum::FloatType(float_ty) => {
+                        float_ty.fn_type(param_metadata_types.as_slice(), false)
+                    }
+                    BasicTypeEnum::ArrayType(array_ty) => {
+                        array_ty.fn_type(param_metadata_types.as_slice(), false)
+                    }
+                    BasicTypeEnum::ScalableVectorType(scvec_ty) => {
+                        scvec_ty.fn_type(param_metadata_types.as_slice(), false)
+                    }
+                    BasicTypeEnum::VectorType(vec_ty) => {
+                        vec_ty.fn_type(param_metadata_types.as_slice(), false)
+                    }
+                    BasicTypeEnum::StructType(struct_ty) => {
+                        struct_ty.fn_type(param_metadata_types.as_slice(), false)
+                    }
                 };
 
                 // Add the function to the module
-                let function = self.module.add_function(&name, fn_type, None);
+                let function = self.module.add_function(name, fn_type, None);
 
                 // Create entry block and position builder
                 let entry_bb = self.context.append_basic_block(function, "entry");
                 self.builder.position_at_end(entry_bb);
 
                 // Allocate space for each parameter and store the incoming values
-                for (i, (param_name, _)) in params.iter().enumerate() {
+                for (i, (param_name, typ)) in params.iter().enumerate() {
                     let arg = function.get_nth_param(i as u32).unwrap();
                     // Cast to basic value
                     //let arg_val = arg.into();
@@ -1733,13 +1751,27 @@ impl<'ctx> Compiler<'ctx> {
                         .builder
                         .build_alloca(arg.get_type(), param_name)
                         .unwrap();
-                    self.builder.build_store(ptr, arg);
+                    self.builder.build_store(ptr, arg)?;
                     self.vars.borrow_mut().insert(param_name.clone(), ptr);
+                    // Map AST Type to LLVM BasicTypeEnum for parameter
+                    let param_elem_type = match typ {
+                        Type::Num => self.context.f64_type().as_basic_type_enum(),
+                        Type::Bool => self.context.bool_type().as_basic_type_enum(),
+                        Type::Str => self
+                            .context
+                            .ptr_type(AddressSpace::default())
+                            .as_basic_type_enum(),
+                        Type::Nil => self.context.f64_type().as_basic_type_enum(),
+                        other => unimplemented!("Parameter type {:?} not supported", other),
+                    };
+                    self.var_types
+                        .borrow_mut()
+                        .insert(param_name.clone(), param_elem_type);
                 }
 
                 // Compile the body of the function
                 for instr in body {
-                    self.compile_instruction(function, instr);
+                    self.compile_instruction(function, instr)?;
                 }
 
                 // Ensure the function has a return instruction
@@ -1751,24 +1783,188 @@ impl<'ctx> Compiler<'ctx> {
                         .get_terminator()
                         .is_none()
                     {
-                        let zero = self.context.i64_type().const_int(0, false);
-                        self.builder.build_return(Some(&zero));
+                        let zero = self.context.f64_type().const_float(0.0);
+                        self.builder.build_return(Some(&zero))?;
                     }
-                } else {
-                    if self
-                        .builder
-                        .get_insert_block()
-                        .unwrap()
-                        .get_terminator()
-                        .is_none()
-                    {
-                        // Default return zero for numeric functions
-                        let zero = self.context.i64_type().const_int(0, false);
-                        self.builder.build_return(Some(&zero));
-                    }
+                } else if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    // Default return zero for numeric functions
+                    let zero = self.context.f64_type().const_float(0.0);
+                    self.builder.build_return(Some(&zero))?;
                 }
+                Ok(())
             }
-            l => unimplemented!("{l:#?}"),
+            Instruction::Maybe(maybe, block, otherwise) => {
+                // Evaluate the maybe expression
+                let val = self.compile_expr(maybe)?;
+                // Build a nil comparison: non-nil => true branch
+                let cond = match val {
+                    BasicValueEnum::PointerValue(ptr) => {
+                        // Null pointer for nil
+                        let null_ptr = self.context.ptr_type(AddressSpace::default()).const_null();
+                        self.builder
+                            .build_int_compare(IntPredicate::NE, ptr, null_ptr, "neq_nil")
+                    }
+                    BasicValueEnum::FloatValue(iv) => {
+                        // Zero integer for nil
+                        let zero = self.context.f64_type().const_float(0.0);
+                        self.builder
+                            .build_float_compare(FloatPredicate::ONE, iv, zero, "neq_nil")
+                    }
+                    _ => panic!("Unsupported type in maybe"),
+                }
+                .unwrap();
+                // Blocks for then, else, and continuation
+                let then_block = self.context.append_basic_block(function, "then");
+                let else_block = self.context.append_basic_block(function, "else");
+                let after_block = self.context.append_basic_block(function, "after");
+                // Branch on non-nil
+                self.builder
+                    .build_conditional_branch(cond, then_block, else_block)?;
+
+                // Then block (value is non-nil)
+                self.builder.position_at_end(then_block);
+                self.compile_instruction(function, block)?;
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(after_block)?;
+                }
+
+                // Else block (value is nil)
+                self.builder.position_at_end(else_block);
+                if let Some(else_node) = otherwise {
+                    self.compile_instruction(function, else_node)?;
+                }
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(after_block)?;
+                }
+
+                // Continue after maybe
+                self.builder.position_at_end(after_block);
+                Ok(())
+            }
+            Instruction::While { condition, body } => {
+                let cond_bb = self.context.append_basic_block(function, "while.cond");
+                let body_bb = self.context.append_basic_block(function, "while.body");
+                let cont_bb = self.context.append_basic_block(function, "while.cont");
+
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(cond_bb)?;
+                }
+
+                self.builder.position_at_end(cond_bb);
+                let BasicValueEnum::IntValue(cond_val) = self.compile_expr(condition)? else {
+                    panic!()
+                };
+                self.builder
+                    .build_conditional_branch(cond_val, body_bb, cont_bb)?;
+
+                self.builder.position_at_end(body_bb);
+                for stmt in body {
+                    self.compile_instruction(function, stmt)?;
+                }
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(cond_bb)?;
+                }
+
+                self.builder.position_at_end(cont_bb);
+                Ok(())
+            }
+            Instruction::Nothing => Ok(()),
+            l => unimplemented!("{:#?}", l),
+        }
+    }
+
+    fn get_or_create_fopen(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("fopen") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            // fopen signature: (i8*, i8*) -> void*
+            let fn_type = void_ptr.fn_type(&[i8ptr.into(), i8ptr.into()], false);
+            self.module.add_function("fopen", fn_type, None)
+        }
+    }
+
+    fn get_or_create_fread(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("fread") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let i64_type = self.context.i64_type();
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            // fread signature: (i8*, i64, i64, void*) -> i64
+            let fn_type = i64_type.fn_type(
+                &[
+                    i8ptr.into(),
+                    i64_type.into(),
+                    i64_type.into(),
+                    void_ptr.into(),
+                ],
+                false,
+            );
+            self.module.add_function("fread", fn_type, None)
+        }
+    }
+
+    fn get_or_create_fwrite(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("fwrite") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let i64_type = self.context.i64_type();
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            // fwrite signature: (i8*, i64, i64, void*) -> i64
+            let fn_type = i64_type.fn_type(
+                &[
+                    i8ptr.into(),
+                    i64_type.into(),
+                    i64_type.into(),
+                    void_ptr.into(),
+                ],
+                false,
+            );
+            self.module.add_function("fwrite", fn_type, None)
+        }
+    }
+
+    fn get_or_create_fclose(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("fclose") {
+            f
+        } else {
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            // fclose signature: (void*) -> i32
+            let fn_type = self.context.i32_type().fn_type(&[void_ptr.into()], false);
+            self.module.add_function("fclose", fn_type, None)
         }
     }
 
@@ -1776,7 +1972,7 @@ impl<'ctx> Compiler<'ctx> {
         if let Some(f) = self.module.get_function("sprintf") {
             f
         } else {
-            let i8ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
             // sprintf signature: (i8*, i8*, ...) -> i32
             let fn_type = self
                 .context
@@ -1795,148 +1991,450 @@ impl<'ctx> Compiler<'ctx> {
             self.module.add_function("printf", fn_type, None)
         }
     }
-    fn compile_expr(&self, expr: &Expr) -> BasicValueEnum<'ctx> {
+
+    fn get_or_create_free(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("free") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = self.context.i32_type().fn_type(&[i8ptr.into()], true);
+            self.module.add_function("free", fn_type, None)
+        }
+    }
+    fn compile_expr(&self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, BuilderError> {
         match expr {
+            Expr::Variable(var_name) => {
+                let ptr = *self.vars.borrow().get(var_name).unwrap();
+                let ty = *self.var_types.borrow().get(var_name).unwrap();
+                let loaded = self.builder.build_load(ty, ptr, var_name)?;
+                Ok(loaded)
+            }
+            // Handle io.random() as a call: io.random() → random integer < 1_000_000
+            Expr::Call(callee, args)
+                if args.is_empty()
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "random") =>
+            {
+                // call rand()
+                let rand_fn = self.get_or_create_rand();
+                let raw_i32 = self
+                    .builder
+                    .build_call(rand_fn, &[], "rand_call")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+
+                // convert rand's i32 to f64
+                let raw_f64 = self.builder.build_signed_int_to_float(
+                    raw_i32,
+                    self.context.f64_type(),
+                    "rand_f64",
+                )?;
+
+                // get RAND_MAX as f64
+                let rand_max = self.context.f64_type().const_float(2147483647.0); // RAND_MAX on mac/linux
+
+                // return rand_f64 / rand_max
+                let result = self
+                    .builder
+                    .build_float_div(raw_f64, rand_max, "rand_div")?;
+                Ok(result.as_basic_value_enum())
+            }
+            Expr::Call(callee, args)
+                if args.len() <= 1
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "input") =>
+            {
+                // Read a line from stdin
+                let malloc_fn = self.get_or_create_malloc();
+                let fgets_fn = self.get_or_create_fgets();
+                let stdin_fn = self.get_or_create_stdin();
+                let strlen_fn = self.get_or_create_strlen();
+
+                // If there's an argument, print it as a prompt
+                if !args.is_empty() {
+                    let prompt = self.compile_expr(&args[0])?;
+                    let printf_fn = self.get_or_create_printf();
+                    self.builder
+                        .build_call(printf_fn, &[prompt.into()], "prompt_print")?;
+                }
+
+                // Allocate buffer for input (256 bytes should be enough for most inputs)
+                let buffer_size = self.context.i64_type().const_int(256, false);
+                let buffer =
+                    self.builder
+                        .build_call(malloc_fn, &[buffer_size.into()], "input_buffer")?;
+                let buffer_ptr = buffer
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                // Get stdin file pointer
+                let stdin_ptr = self.builder.build_call(stdin_fn, &[], "stdin_ptr")?;
+                let stdin_file = stdin_ptr
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                // Read line from stdin using fgets
+                let size_i32 = self.context.i32_type().const_int(256, false);
+                let _result = self.builder.build_call(
+                    fgets_fn,
+                    &[buffer_ptr.into(), size_i32.into(), stdin_file.into()],
+                    "fgets_call",
+                )?;
+
+                // Remove trailing newline if present
+                let len_call =
+                    self.builder
+                        .build_call(strlen_fn, &[buffer_ptr.into()], "input_len")?;
+                let len = len_call
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+
+                // Check if length > 0 and last char is newline
+                let zero = self.context.i64_type().const_zero();
+                let one = self.context.i64_type().const_int(1, false);
+                let has_content = self.builder.build_int_compare(
+                    inkwell::IntPredicate::UGT,
+                    len,
+                    zero,
+                    "has_content",
+                )?;
+
+                // Get pointer to last character
+                let last_char_idx = self.builder.build_int_sub(len, one, "last_idx")?;
+                let last_char_ptr = unsafe {
+                    self.builder.build_gep(
+                        self.context.i8_type(),
+                        buffer_ptr,
+                        &[last_char_idx],
+                        "last_char_ptr",
+                    )?
+                };
+
+                // Load last character
+                let last_char =
+                    self.builder
+                        .build_load(self.context.i8_type(), last_char_ptr, "last_char")?;
+
+                // Check if it's a newline (ASCII 10)
+                let newline = self.context.i8_type().const_int(10, false);
+                let is_newline = self.builder.build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    last_char.into_int_value(),
+                    newline,
+                    "is_newline",
+                )?;
+
+                // If it's a newline, replace it with null terminator
+                let should_remove =
+                    self.builder
+                        .build_and(has_content, is_newline, "should_remove")?;
+                let null_char = self.context.i8_type().const_zero();
+
+                // Conditionally store null character
+                let current_bb = self.builder.get_insert_block().unwrap();
+                let function = current_bb.get_parent().unwrap();
+                let then_bb = self.context.append_basic_block(function, "remove_newline");
+                let cont_bb = self.context.append_basic_block(function, "input_done");
+
+                self.builder
+                    .build_conditional_branch(should_remove, then_bb, cont_bb)?;
+
+                // Then block: remove newline
+                self.builder.position_at_end(then_bb);
+                self.builder.build_store(last_char_ptr, null_char)?;
+                self.builder.build_unconditional_branch(cont_bb)?;
+
+                // Continue block
+                self.builder.position_at_end(cont_bb);
+
+                Ok(buffer_ptr.as_basic_value_enum())
+            }
+            Expr::Call(callee, args)
+                if !args.is_empty()
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "read") =>
+            {
+                let filename = self.compile_expr(&args[0])?;
+                let read_mode = self
+                    .builder
+                    .build_global_string_ptr("r\0", "read_mode")
+                    .unwrap();
+                let fopen_fn = self.get_or_create_fopen();
+                let file_ptr = self
+                    .builder
+                    .build_call(
+                        fopen_fn,
+                        &[filename.into(), read_mode.as_pointer_value().into()],
+                        "fopen_call",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                let buffer_size = self.context.i64_type().const_int(1024, false);
+                let buffer = self
+                    .builder
+                    .build_alloca(self.context.i8_type().array_type(1024), "read_buffer")
+                    .unwrap();
+                let fread_fn = self.get_or_create_fread();
+                self.builder
+                    .build_call(
+                        fread_fn,
+                        &[
+                            buffer.into(),
+                            buffer_size.into(),
+                            self.context.i64_type().const_int(1, false).into(),
+                            file_ptr.into(),
+                        ],
+                        "fread_call",
+                    )
+                    .unwrap();
+
+                let fclose_fn = self.get_or_create_fclose();
+                self.builder
+                    .build_call(fclose_fn, &[file_ptr.into()], "fclose_call")
+                    .unwrap();
+
+                Ok(buffer.as_basic_value_enum())
+            }
+            Expr::Call(callee, args)
+                if args.len() == 2
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "write") =>
+            {
+                let filename = self.compile_expr(&args[0])?;
+                let content = self.compile_expr(&args[1])?;
+                let write_mode = self
+                    .builder
+                    .build_global_string_ptr("w\0", "write_mode")
+                    .unwrap();
+                let fopen_fn = self.get_or_create_fopen();
+                let file_ptr = self
+                    .builder
+                    .build_call(
+                        fopen_fn,
+                        &[filename.into(), write_mode.as_pointer_value().into()],
+                        "fopen_call",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                let content_ptr = content.into_pointer_value();
+                let strlen_fn = self.get_or_create_strlen();
+                let len = self
+                    .builder
+                    .build_call(strlen_fn, &[content_ptr.into()], "strlen_call")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+
+                let fwrite_fn = self.get_or_create_fwrite();
+                self.builder
+                    .build_call(
+                        fwrite_fn,
+                        &[
+                            content_ptr.into(),
+                            len.into(),
+                            self.context.i64_type().const_int(1, false).into(),
+                            file_ptr.into(),
+                        ],
+                        "fwrite_call",
+                    )
+                    .unwrap();
+
+                let fclose_fn = self.get_or_create_fclose();
+                self.builder
+                    .build_call(fclose_fn, &[file_ptr.into()], "fclose_call")
+                    .unwrap();
+
+                Ok(self
+                    .context
+                    .i64_type()
+                    .const_int(0, false)
+                    .as_basic_value_enum())
+            }
+            Expr::Get(obj, method) if method == "str" => {
+                let compiled_obj = self.compile_expr(obj)?;
+                if let BasicValueEnum::FloatValue(float_val) = compiled_obj {
+                    let sprintf_fn = self.get_or_create_sprintf();
+                    let malloc_fn = self.get_or_create_malloc();
+
+                    // Allocate buffer for string (e.g., 64 bytes for float string representation)
+                    let buffer_size = self.context.i64_type().const_int(64, false);
+                    let buffer_ptr = self.builder.build_call(
+                        malloc_fn,
+                        &[buffer_size.into()],
+                        "str_buf_malloc",
+                    )?;
+                    let buffer_ptr = buffer_ptr
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_pointer_value();
+
+                    // Format string: "%f\0"
+                    let format_str = self
+                        .builder
+                        .build_global_string_ptr("%f\0", "float_fmt_str")
+                        .unwrap();
+
+                    // Call sprintf
+                    self.builder.build_call(
+                        sprintf_fn,
+                        &[
+                            buffer_ptr.into(),
+                            format_str.as_pointer_value().into(),
+                            float_val.into(),
+                        ],
+                        "sprintf_call",
+                    )?;
+
+                    Ok(buffer_ptr.as_basic_value_enum())
+                } else {
+                    panic!("Unsupported .str() call on non-numeric type");
+                }
+            }
             Expr::Literal(Value::Num(n)) => {
                 // Cast f64 to u64 for integer literal
-                self.context
-                    .i64_type()
-                    .const_int(*n as u64, false)
-                    .as_basic_value_enum()
+                Ok(self
+                    .context
+                    .f64_type()
+                    .const_float(*n)
+                    .as_basic_value_enum())
             }
             Expr::Literal(Value::Bool(b)) => {
                 let val = if *b { 1 } else { 0 };
-                self.context
-                    .i64_type()
+                Ok(self
+                    .context
+                    .bool_type()
                     .const_int(val, false)
-                    .as_basic_value_enum()
+                    .as_basic_value_enum())
+            }
+            Expr::Literal(Value::Nil) => {
+                // Represent nil as the C-string "nil"
+                let gs = self
+                    .builder
+                    .build_global_string_ptr("nil\0", "nil_literal")
+                    .unwrap();
+                Ok(gs.as_pointer_value().as_basic_value_enum())
             }
             Expr::Binary(left, op, right) => {
                 // Compile both sides
-                let lval = self.compile_expr(left);
-                let rval = self.compile_expr(right);
+                let lval = self.compile_expr(left)?;
+                let rval = self.compile_expr(right)?;
                 match (lval, rval) {
-                    (BasicValueEnum::IntValue(li), BasicValueEnum::IntValue(ri)) => {
+                    (BasicValueEnum::FloatValue(li), BasicValueEnum::FloatValue(ri)) => {
                         // Integer operations
-                        match op {
-                            BinOp::Plus => self
-                                .builder
-                                .build_int_add(li, ri, "addtmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
-                            BinOp::Minus => self
-                                .builder
-                                .build_int_sub(li, ri, "subtmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
-                            BinOp::Mult => self
-                                .builder
-                                .build_int_mul(li, ri, "multmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
-                            BinOp::Div => self
-                                .builder
-                                .build_int_signed_div(li, ri, "divtmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
+                        Ok(match op {
+                            BinOp::Plus => self.builder.build_float_add(li, ri, "addtmp")?.into(),
+                            BinOp::Minus => self.builder.build_float_sub(li, ri, "subtmp")?.into(),
+                            BinOp::Mult => self.builder.build_float_mul(li, ri, "multmp")?.into(),
+                            BinOp::Div => self.builder.build_float_div(li, ri, "divtmp")?.into(),
                             BinOp::EqEq => self
                                 .builder
-                                .build_int_compare(IntPredicate::EQ, li, ri, "eqtmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
+                                .build_float_compare(FloatPredicate::OEQ, li, ri, "eqtmp")?
+                                .into(),
                             BinOp::NotEq => self
                                 .builder
-                                .build_int_compare(IntPredicate::NE, li, ri, "netmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
+                                .build_float_compare(FloatPredicate::ONE, li, ri, "netmp")?
+                                .into(),
                             BinOp::Less => self
                                 .builder
-                                .build_int_compare(IntPredicate::SLT, li, ri, "lttmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
+                                .build_float_compare(FloatPredicate::OLT, li, ri, "lttmp")?
+                                .into(),
                             BinOp::LessEqual => self
                                 .builder
-                                .build_int_compare(IntPredicate::SLE, li, ri, "letmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
+                                .build_float_compare(FloatPredicate::OLE, li, ri, "letmp")?
+                                .into(),
                             BinOp::Greater => self
                                 .builder
-                                .build_int_compare(IntPredicate::SGT, li, ri, "gttmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
+                                .build_float_compare(FloatPredicate::OGT, li, ri, "gttmp")?
+                                .into(),
                             BinOp::GreaterEqual => self
                                 .builder
-                                .build_int_compare(IntPredicate::SGE, li, ri, "getmp")
-                                .unwrap()
-                                .as_basic_value_enum(),
-                        }
+                                .build_float_compare(FloatPredicate::OGE, li, ri, "getmp")?
+                                .into(),
+                        })
                     }
                     (BasicValueEnum::PointerValue(lp), BasicValueEnum::PointerValue(rp)) => {
                         // String case: call strcmp and compare its result or do concatenation
                         match op {
                             BinOp::Plus => {
-                                {
-                                    // String concatenation: allocate buffer and copy both strings
-                                    // Compute lengths
-                                    let strlen_fn = self.get_or_create_strlen();
-                                    let len1_call = self
-                                        .builder
-                                        .build_call(strlen_fn, &[lp.into()], "len1")
-                                        .unwrap()
-                                        .try_as_basic_value()
-                                        .left()
-                                        .unwrap()
-                                        .into_int_value();
-                                    let len2_call = self
-                                        .builder
-                                        .build_call(strlen_fn, &[rp.into()], "len2")
-                                        .unwrap()
-                                        .try_as_basic_value()
-                                        .left()
-                                        .unwrap()
-                                        .into_int_value();
-                                    // total_len = len1 + len2 + 1
-                                    let sum = self
-                                        .builder
-                                        .build_int_add(len1_call, len2_call, "len_sum")
-                                        .unwrap();
-                                    let one = self.context.i64_type().const_int(1, false);
-                                    let total_len =
-                                        self.builder.build_int_add(sum, one, "total_len").unwrap();
-                                    // malloc(buffer)
-                                    let malloc_fn = self.get_or_create_malloc();
-                                    let buf_ptr = self
-                                        .builder
-                                        .build_call(malloc_fn, &[total_len.into()], "malloc_buf")
-                                        .unwrap()
-                                        .try_as_basic_value()
-                                        .left()
-                                        .unwrap()
-                                        .into_pointer_value();
-                                    // strcpy(buf, lp)
-                                    let strcpy_fn = self.get_or_create_strcpy();
-                                    self.builder.build_call(
-                                        strcpy_fn,
-                                        &[buf_ptr.into(), lp.into()],
-                                        "strcpy_call",
-                                    );
-                                    // strcat(buf, rp)
-                                    let strcat_fn = self.get_or_create_strcat_c();
-                                    self.builder.build_call(
-                                        strcat_fn,
-                                        &[buf_ptr.into(), rp.into()],
-                                        "strcat_call",
-                                    );
-                                    buf_ptr.as_basic_value_enum()
-                                }
+                                // Simple but efficient string concatenation
+                                let strlen_fn = self.get_or_create_strlen();
+                                let malloc_fn = self.get_or_create_malloc();
+                                let strcpy_fn = self.get_or_create_strcpy();
+                                let strcat_fn = self.get_or_create_strcat_c();
+
+                                // Get lengths
+                                let len1_call =
+                                    self.builder.build_call(strlen_fn, &[lp.into()], "len1")?;
+                                let len1 = len1_call
+                                    .try_as_basic_value()
+                                    .left()
+                                    .unwrap()
+                                    .into_int_value();
+                                let len2_call =
+                                    self.builder.build_call(strlen_fn, &[rp.into()], "len2")?;
+                                let len2 = len2_call
+                                    .try_as_basic_value()
+                                    .left()
+                                    .unwrap()
+                                    .into_int_value();
+
+                                // total_len = len1 + len2 + 1
+                                let sum = self.builder.build_int_add(len1, len2, "len_sum")?;
+                                let one = self.context.i64_type().const_int(1, false);
+                                let total_len =
+                                    self.builder.build_int_add(sum, one, "total_len")?;
+
+                                // malloc(buffer)
+                                let buf_ptr = self.builder.build_call(
+                                    malloc_fn,
+                                    &[total_len.into()],
+                                    "malloc_buf",
+                                )?;
+                                let buf_ptr = buf_ptr
+                                    .try_as_basic_value()
+                                    .left()
+                                    .unwrap()
+                                    .into_pointer_value();
+
+                                // strcpy(buf, lp)
+                                self.builder.build_call(
+                                    strcpy_fn,
+                                    &[buf_ptr.into(), lp.into()],
+                                    "strcpy_call",
+                                )?;
+                                // strcat(buf, rp)
+                                self.builder.build_call(
+                                    strcat_fn,
+                                    &[buf_ptr.into(), rp.into()],
+                                    "strcat_call",
+                                )?;
+
+                                Ok(buf_ptr.as_basic_value_enum())
                             }
                             // String comparison cases
                             _ => {
                                 let strcmp_fn = self.get_or_create_strcmp();
-                                let cmp_call = self
-                                    .builder
-                                    .build_call(strcmp_fn, &[lp.into(), rp.into()], "strcmp_call")
-                                    .unwrap();
+                                let cmp_call = self.builder.build_call(
+                                    strcmp_fn,
+                                    &[lp.into(), rp.into()],
+                                    "strcmp_call",
+                                )?;
                                 let cmp = cmp_call
                                     .try_as_basic_value()
                                     .left()
@@ -1944,42 +2442,35 @@ impl<'ctx> Compiler<'ctx> {
                                     .into_int_value();
                                 // Zero constant for strcmp result
                                 let zero = self.context.i32_type().const_int(0, false);
-                                match op {
+                                Ok(match op {
                                     BinOp::EqEq => self
                                         .builder
-                                        .build_int_compare(IntPredicate::EQ, cmp, zero, "streq")
-                                        .unwrap()
-                                        .as_basic_value_enum(),
+                                        .build_int_compare(IntPredicate::EQ, cmp, zero, "streq")?
+                                        .into(),
                                     BinOp::NotEq => self
                                         .builder
-                                        .build_int_compare(IntPredicate::NE, cmp, zero, "strneq")
-                                        .unwrap()
-                                        .as_basic_value_enum(),
+                                        .build_int_compare(IntPredicate::NE, cmp, zero, "strneq")?
+                                        .into(),
                                     BinOp::Less => self
                                         .builder
-                                        .build_int_compare(IntPredicate::SLT, cmp, zero, "strlt")
-                                        .unwrap()
-                                        .as_basic_value_enum(),
+                                        .build_int_compare(IntPredicate::SLT, cmp, zero, "strlt")?
+                                        .into(),
                                     BinOp::LessEqual => self
                                         .builder
-                                        .build_int_compare(IntPredicate::SLE, cmp, zero, "strle")
-                                        .unwrap()
-                                        .as_basic_value_enum(),
+                                        .build_int_compare(IntPredicate::SLE, cmp, zero, "strle")?
+                                        .into(),
                                     BinOp::Greater => self
                                         .builder
-                                        .build_int_compare(IntPredicate::SGT, cmp, zero, "strgt")
-                                        .unwrap()
-                                        .as_basic_value_enum(),
+                                        .build_int_compare(IntPredicate::SGT, cmp, zero, "strgt")?
+                                        .into(),
                                     BinOp::GreaterEqual => self
                                         .builder
-                                        .build_int_compare(IntPredicate::SGE, cmp, zero, "strge")
-                                        .unwrap()
-                                        .as_basic_value_enum(),
-                                    _ => panic!(
-                                        "Unsupported operator for string comparison: {:?}",
-                                        op
-                                    ),
-                                }
+                                        .build_int_compare(IntPredicate::SGE, cmp, zero, "strge")?
+                                        .into(),
+                                    _ => {
+                                        panic!("Unsupported operator for string comparison: {op:?}")
+                                    }
+                                })
                             }
                         }
                     }
@@ -1990,33 +2481,126 @@ impl<'ctx> Compiler<'ctx> {
                 }
             }
 
-            Expr::Variable(var_name) => {
-                // … your existing ptr lookup …
-                let binding = self.vars.borrow();
-                let ptr = *binding
-                    .get(var_name.as_str())
-                    .expect(format!("undefined var `{}`", var_name).as_str());
-
-                // Tell LLVM “this is really an i64* slot”
-                let elem_type = self.context.i64_type().as_basic_type_enum();
-
-                // Now call the 3-arg load
-                let loaded = self
-                    .builder
-                    .build_load(elem_type, ptr, var_name.as_str())
-                    .unwrap();
-
-                // Return the loaded value
-                loaded
-            }
             Expr::Literal(Value::Str(s)) => {
-                // 1) stick a C⁠-string into the module
+                // 1) stick a C
+                // -string into the module
                 let gs = self
                     .builder
-                    .build_global_string_ptr(&format!("{s}\0"), "str_literal")
+                    .build_global_string_ptr(&format!("{}\0", s), "str_literal")
                     .unwrap();
                 // 2) cast the pointer to an i64
-                gs.as_basic_value_enum()
+                Ok(gs.as_basic_value_enum())
+            }
+            Expr::Object(type_name, fields) => {
+                // Allocate storage for a flat object
+                let slot_ty = self.context.ptr_type(AddressSpace::default());
+                let slot_bytes = self
+                    .context
+                    .i64_type()
+                    .const_int(mem::size_of::<u64>() as u64, false);
+                let count = self
+                    .context
+                    .i64_type()
+                    .const_int(fields.len() as u64, false);
+                let total_bytes = self
+                    .builder
+                    .build_int_mul(slot_bytes, count, "obj_size")
+                    .unwrap();
+                // Call malloc
+                let malloc_fn = self.get_or_create_malloc();
+                let raw_ptr = self
+                    .builder
+                    .build_call(malloc_fn, &[total_bytes.into()], "malloc_obj")
+                    .unwrap();
+                let raw_ptr = raw_ptr
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+                let obj_ptr = self
+                    .builder
+                    .build_pointer_cast(raw_ptr, slot_ty, "obj_ptr")?;
+                // Store each field at its index based on the declared type order
+                let binding = self.pctx.borrow();
+                let type_fields = binding.types.get(type_name).unwrap();
+                for (idx, field_name) in type_fields.keys().enumerate() {
+                    let expr = &fields[field_name];
+                    let val = self.compile_expr(expr)?;
+                    let idx_const = self.context.i64_type().const_int(idx as u64, false);
+                    let field_ptr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                slot_ty,
+                                obj_ptr,
+                                &[idx_const],
+                                &format!("field_{field_name}"),
+                            )
+                            .unwrap()
+                    };
+                    let _ = self.builder.build_store(field_ptr, val);
+                }
+                Ok(obj_ptr.as_basic_value_enum())
+            }
+            Expr::Get(obj_expr, prop) => {
+                // Compile the base object pointer
+                let base_val = self.compile_expr(obj_expr)?;
+                let obj_ptr = base_val.into_pointer_value();
+                // Determine the object's declared type by looking up the variable's static type
+                let var_name = if let Expr::Variable(name) = &**obj_expr {
+                    name
+                } else {
+                    panic!("Property access on non-variable object");
+                };
+                // Find the matching custom type definition
+                let binding = self.pctx.borrow();
+                let custom_type = match &binding.var_types[var_name] {
+                    Type::Custom(map) => map,
+                    _ => panic!("Variable {var_name} is not a custom object"),
+                };
+                let type_name = self
+                    .pctx
+                    .borrow()
+                    .types
+                    .iter()
+                    .find(|(_, def)| def == &custom_type)
+                    .map(|(k, _)| k.clone())
+                    .unwrap();
+                let field_defs = &self.pctx.borrow().types[&type_name];
+                // Find the index of this property
+                let index = field_defs.keys().position(|k| k == prop).unwrap() as u64;
+                let idx_const = self.context.i64_type().const_int(index, false);
+                let slot_ty = self.context.ptr_type(AddressSpace::default());
+                // Compute address and load
+                // Compute the address of the field
+                let field_ptr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(
+                            slot_ty,
+                            obj_ptr,
+                            &[idx_const],
+                            &format!("load_{}", prop),
+                        )
+                        .unwrap()
+                };
+                // Determine the field’s QuickLang type
+                let binding = self.pctx.borrow();
+                let field_ty = binding.types[&type_name][prop].clone();
+                // Pick the right LLVM type
+                let elem_basic = match field_ty {
+                    Type::Str => self
+                        .context
+                        .ptr_type(AddressSpace::default())
+                        .as_basic_type_enum(),
+                    Type::Num => self.context.f64_type().as_basic_type_enum(),
+                    Type::Bool => self.context.bool_type().as_basic_type_enum(),
+                    other => panic!("Unsupported field type {:?}", other),
+                };
+                // Load with the correct type
+                let loaded = self
+                    .builder
+                    .build_load(elem_basic, field_ptr, prop)
+                    .unwrap();
+                Ok(loaded)
             }
             Expr::Call(callee, args) => {
                 // Compile the function or method being called
@@ -2032,7 +2616,7 @@ impl<'ctx> Compiler<'ctx> {
                         // Compile each argument
                         let mut compiled_args = Vec::with_capacity(args.len());
                         for arg in args {
-                            compiled_args.push(self.compile_expr(arg));
+                            compiled_args.push(self.compile_expr(arg)?);
                         }
 
                         // Convert to metadata for build_call
@@ -2047,35 +2631,44 @@ impl<'ctx> Compiler<'ctx> {
 
                         // If it returns a value, pull it out; otherwise default to zero
                         if let Some(rv) = call_site.try_as_basic_value().left() {
-                            rv.as_basic_value_enum()
+                            Ok(rv.as_basic_value_enum())
                         } else {
-                            self.context
+                            Ok(self
+                                .context
                                 .i64_type()
                                 .const_int(0, false)
-                                .as_basic_value_enum()
+                                .as_basic_value_enum())
                         }
                     }
 
                     // Method call `.str()` on numeric values
                     Expr::Get(obj, method) if method == "str" => {
                         // Ensure the object compiles to an integer before converting
-                        let compiled_val = self.compile_expr(obj);
+                        let compiled_val = self.compile_expr(obj)?;
                         let num_val = match compiled_val {
-                            BasicValueEnum::IntValue(iv) => iv,
+                            BasicValueEnum::FloatValue(f) => f,
+                            BasicValueEnum::IntValue(iv) => {
+                                self.builder.build_signed_int_to_float(
+                                    iv,
+                                    self.context.f64_type(),
+                                    "int_to_float",
+                                )?
+                            }
                             other => panic!(".str() called on non-numeric object: {:?}", other),
                         };
                         // Prepare a "%ld" format string
                         let fmt = self
                             .builder
-                            .build_global_string_ptr("%ld\0", "fmt_str")
+                            .build_global_string_ptr("%f\0", "fmt_str")
                             .unwrap();
                         // Allocate a 32-byte buffer
-                        let size = self.context.i64_type().const_int(32, false);
+                        let size = self.context.i64_type().const_int(128, false);
                         let malloc_fn = self.get_or_create_malloc();
                         let buf_ptr = self
                             .builder
                             .build_call(malloc_fn, &[size.into()], "malloc_buf")
-                            .unwrap()
+                            .unwrap();
+                        let buf_ptr = buf_ptr
                             .try_as_basic_value()
                             .left()
                             .unwrap()
@@ -2090,46 +2683,153 @@ impl<'ctx> Compiler<'ctx> {
                                 num_val.into(),
                             ],
                             "sprintf_call",
-                        );
+                        )?;
                         // Return the string pointer
-                        buf_ptr.as_basic_value_enum()
+                        Ok(buf_ptr.as_basic_value_enum())
                     }
 
                     // 2) Method call `.len()` on a pointer value (string or later list)
                     Expr::Get(obj, method) if method == "len" => {
-                        let obj_val = self.compile_expr(obj);
+                        let obj_val = self.compile_expr(obj)?;
+                        // Get the original type of the object from pctx
+                        let obj_type = get_type_of_expr(obj, &self.pctx.borrow())
+                            .unwrap_or_else(|e| panic!("Type error: {}", e));
+
                         if let BasicValueEnum::PointerValue(ptr) = obj_val {
-                            // For strings, call strlen
-                            let strlen_fn = self.get_or_create_strlen();
-                            let result = self
-                                .builder
-                                .build_call(strlen_fn, &[ptr.into()], "strlen_call")
-                                .unwrap()
-                                .try_as_basic_value()
-                                .left()
-                                .unwrap()
-                                .into_int_value();
-                            result.as_basic_value_enum()
+                            match obj_type {
+                                Type::Str => {
+                                    // For strings, call strlen
+                                    let strlen_fn = self.get_or_create_strlen();
+                                    let result = self.builder.build_call(
+                                        strlen_fn,
+                                        &[ptr.into()],
+                                        "strlen_call",
+                                    )?;
+                                    let result = result
+                                        .try_as_basic_value()
+                                        .left()
+                                        .unwrap()
+                                        .into_int_value();
+                                    Ok(result.as_basic_value_enum())
+                                }
+                                Type::List(_) => {
+                                    // For lists, load length from the first element
+                                    let i64_ty = self.context.f64_type();
+                                    let len = self.builder.build_load(i64_ty, ptr, "len")?;
+                                    Ok(len.as_basic_value_enum())
+                                }
+                                _ => panic!("Unsupported type for .len() call: {:?}", obj_type),
+                            }
                         } else {
-                            // Future: extract length from a list representation
-                            unimplemented!("List `.len()` is not yet supported in JIT")
+                            panic!("Unsupported type for .len() call");
                         }
                     }
 
-                    // 3) Anything else isn’t handled yet
                     _ => {
                         panic!("Unsupported call expression: {:?}", callee);
                     }
                 }
             }
-            _ => panic!("Unsupported expression in compile_expr: {expr:?}"),
+            Expr::List(items) => {
+                let count = items.len() as u64;
+                let f64_ty = self.context.f64_type();
+                let f64_ptr_ty = self.context.ptr_type(AddressSpace::default());
+
+                // Allocate count + 1 elements to store the length at the beginning
+                let total_bytes = {
+                    let bytes_per = self
+                        .context
+                        .i64_type()
+                        .const_int(std::mem::size_of::<f64>() as u64, false);
+                    let num_elems = self.context.i64_type().const_int(count + 1, false);
+                    self.builder
+                        .build_int_mul(bytes_per, num_elems, "list_bytes")?
+                };
+
+                // Malloc buffer
+                let malloc_fn = self.get_or_create_malloc();
+                let raw_ptr =
+                    self.builder
+                        .build_call(malloc_fn, &[total_bytes.into()], "malloc")?;
+                let raw_ptr = raw_ptr
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+                let buf_ptr =
+                    self.builder
+                        .build_pointer_cast(raw_ptr, f64_ptr_ty, "list_buf_ptr")?;
+
+                // Store length at index 0
+                let len_val = f64_ty.const_float(count as f64);
+                let len_ptr = unsafe {
+                    self.builder.build_in_bounds_gep(
+                        f64_ptr_ty,
+                        buf_ptr,
+                        &[self.context.i64_type().const_int(0, false)],
+                        "len_ptr",
+                    )?
+                };
+                let _ = self.builder.build_store(len_ptr, len_val);
+
+                // Store each element starting from index 1
+                for (idx, item) in items.iter().enumerate() {
+                    let elem_val = self.compile_expr(item)?.into_float_value();
+                    let idx_val = self.context.i64_type().const_int((idx + 1) as u64, false);
+                    let gep = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            f64_ptr_ty,
+                            buf_ptr,
+                            &[idx_val],
+                            "elem_ptr",
+                        )?
+                    };
+                    let _ = self.builder.build_store(gep, elem_val);
+                }
+
+                Ok(buf_ptr.as_basic_value_enum())
+            }
+            Expr::Index(list, indexed_by) => {
+                let list_lit = self.compile_expr(list)?;
+                let index_lit = self.compile_expr(indexed_by)?;
+                // get the raw list pointer and index integer
+                let list_ptr = match list_lit {
+                    BasicValueEnum::PointerValue(p) => p,
+                    _ => panic!("Index on non-list pointer: {:?}", list_lit),
+                };
+                let idx = match index_lit {
+                    BasicValueEnum::IntValue(i) => i,
+                    _ => panic!("List index must be integer: {:?}", index_lit),
+                };
+                // skip the length slot at index 0
+                let one = self.context.i64_type().const_int(1, false);
+                let idx1 = self.builder.build_int_add(idx, one, "idx_plus1")?;
+                // compute element pointer and load
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(
+                            self.context.ptr_type(AddressSpace::default()),
+                            list_ptr,
+                            &[idx1],
+                            "list_index",
+                        )
+                        .unwrap()
+                };
+                let loaded = self
+                    .builder
+                    .build_load(self.context.f64_type(), elem_ptr, "load_elem")
+                    .unwrap();
+                Ok(loaded)
+            }
+
+            _ => panic!("Unsupported expression in compile_expr: {:?}", expr),
         }
     }
     fn get_or_create_strcmp(&self) -> FunctionValue<'ctx> {
         if let Some(f) = self.module.get_function("strcmp") {
             f
         } else {
-            let i8ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
             // strcmp signature: (i8*, i8*) -> i32
             let fn_type = self
                 .context
@@ -2139,66 +2839,11 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
-    fn get_or_create_concat(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function("concat_strings") {
-            return f;
-        }
-        let i8ptr = self.context.i8_type().ptr_type(AddressSpace::default());
-        // concat_strings signature: (i8*, i8*) -> i8*
-        let fn_type = i8ptr.fn_type(&[i8ptr.into(), i8ptr.into()], false);
-        let function = self.module.add_function("concat_strings", fn_type, None);
-        // Build function body with a fresh builder
-        let entry = self.context.append_basic_block(function, "entry");
-        let builder = self.context.create_builder();
-        builder.position_at_end(entry);
-        // Parameters
-        let s1 = function.get_nth_param(0).unwrap().into_pointer_value();
-        let s2 = function.get_nth_param(1).unwrap().into_pointer_value();
-        // Call strlen on both
-        let strlen_fn = self.get_or_create_strlen();
-        let len1 = builder
-            .build_call(strlen_fn, &[s1.into()], "len1")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let len2 = builder
-            .build_call(strlen_fn, &[s2.into()], "len2")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        // total = len1 + len2 + 1
-        let sum = builder.build_int_add(len1, len2, "sum").unwrap();
-        let one = self.context.i64_type().const_int(1, false);
-        let total = builder.build_int_add(sum, one, "totallen").unwrap();
-        // Allocate buffer
-        let malloc_fn = self.get_or_create_malloc();
-        let raw = builder
-            .build_call(malloc_fn, &[total.into()], "malloc")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
-        // Copy first string
-        let strcpy_fn = self.get_or_create_strcpy();
-        builder.build_call(strcpy_fn, &[raw.into(), s1.into()], "strcpy");
-        // Append second string
-        let strcat_fn = self.get_or_create_strcat_c();
-        builder.build_call(strcat_fn, &[raw.into(), s2.into()], "strcat");
-        // Return buffer
-        builder.build_return(Some(&raw));
-        function
-    }
-
     fn get_or_create_strlen(&self) -> FunctionValue<'ctx> {
         if let Some(f) = self.module.get_function("strlen") {
             f
         } else {
-            let i8ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
             // strlen signature: (i8*) -> i64
             let fn_type = self.context.i64_type().fn_type(&[i8ptr.into()], false);
             self.module.add_function("strlen", fn_type, None)
@@ -2209,9 +2854,10 @@ impl<'ctx> Compiler<'ctx> {
         if let Some(f) = self.module.get_function("malloc") {
             f
         } else {
-            // malloc signature: (i64) -> i8*
+            let i64_type = self.context.i64_type();
             let i8ptr = self.context.ptr_type(AddressSpace::default());
-            let fn_type = i8ptr.fn_type(&[self.context.i64_type().into()], false);
+            // malloc signature: (i64) -> i8*
+            let fn_type = i8ptr.fn_type(&[i64_type.into()], false);
             self.module.add_function("malloc", fn_type, None)
         }
     }
@@ -2231,11 +2877,83 @@ impl<'ctx> Compiler<'ctx> {
         if let Some(f) = self.module.get_function("strcat") {
             f
         } else {
-            let i8ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
             // strcat signature: (i8*, i8*) -> i8*
             let fn_type = i8ptr.fn_type(&[i8ptr.into(), i8ptr.into()], false);
             self.module.add_function("strcat", fn_type, None)
         }
+    }
+
+    fn get_or_create_realloc(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("realloc") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let i64_type = self.context.i64_type();
+            // realloc signature: (i8*, i64) -> i8*
+            let fn_type = i8ptr.fn_type(&[i8ptr.into(), i64_type.into()], false);
+            self.module.add_function("realloc", fn_type, None)
+        }
+    }
+
+    fn get_or_create_memcpy(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("memcpy") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let i64_type = self.context.i64_type();
+            // memcpy signature: (i8*, i8*, i64) -> i8*
+            let fn_type = i8ptr.fn_type(&[i8ptr.into(), i8ptr.into(), i64_type.into()], false);
+            self.module.add_function("memcpy", fn_type, None)
+        }
+    }
+
+    fn get_or_create_fgets(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("fgets") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let i32_type = self.context.i32_type();
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            // fgets signature: (i8*, i32, void*) -> i8*
+            let fn_type = i8ptr.fn_type(&[i8ptr.into(), i32_type.into(), void_ptr.into()], false);
+            self.module.add_function("fgets", fn_type, None)
+        }
+    }
+
+    fn get_or_create_stdin(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("stdin") {
+            f
+        } else {
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            // stdin signature: () -> void*
+            let fn_type = void_ptr.fn_type(&[], false);
+            self.module.add_function("stdin", fn_type, None)
+        }
+    }
+
+    fn compile_safe_string_append(
+        &self,
+        var_name: &str,
+        append_expr: &Expr,
+    ) -> Result<(), BuilderError> {
+        // For now, disable the optimization and fall back to regular concatenation
+        // The current approach is still O(n²) and causes performance issues
+        // TODO: Implement a true O(n) string builder with persistent buffer management
+
+        let new_c = self.compile_expr(&Expr::Binary(
+            Box::new(Expr::Variable(var_name.to_string())),
+            BinOp::Plus,
+            Box::new(append_expr.clone()),
+        ))?;
+
+        let binding = self.vars.borrow();
+        let var_ptr = binding
+            .get(var_name)
+            .unwrap_or_else(|| panic!("Variable not found: {var_name}"));
+        self.builder.build_store(*var_ptr, new_c)?;
+
+        Ok(())
     }
 
     fn jit_compile_sum(&self) -> Option<JitFunction<'_, SumFunc>> {
@@ -2267,7 +2985,7 @@ fn format_float(lexeme: &str) -> String {
         }
         s
     } else {
-        format!("{lexeme}.0")
+        format!("{}.0", lexeme)
     }
 }
 
@@ -2378,7 +3096,7 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
         // Handle two-character operators
         if index + 1 < chars.len() {
             let next_char = chars[index + 1];
-            let two_char = format!("{current_char}{next_char}");
+            let two_char = format!("{}{}", current_char, next_char);
 
             match two_char.as_str() {
                 "==" => {
@@ -2491,7 +3209,10 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
             _ => {
                 tokens.push(Token {
                     value: "".to_string(),
-                    kind: Error(line as u64, format!("Unexpected character: {current_char}")),
+                    kind: Error(
+                        line as u64,
+                        format!("Unexpected character: {}", current_char),
+                    ),
                     line,
                 });
             }
@@ -2516,500 +3237,19 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
 
     tokens
 }
-
-async fn quick_get_handler(
-    context: actix_web::web::Data<Arc<Context>>,
-    req: HttpRequest,
-) -> impl Responder {
-    let path = req.path();
-
-    let path_split = path.split("/").collect::<Vec<&str>>();
-    'outer: for (_, pat, fun) in context
-        .routes
-        .read()
-        .unwrap()
-        .iter()
-        .filter(move |o| matches!(o.0, Reqs::Get))
-    {
-        if pat.len() != path_split.len() {
-            continue;
-        }
-        let mut dynamic_parts = vec![];
-        for (i, part) in pat.iter().enumerate() {
-            match part {
-                PathPart::Static(s) => {
-                    if path_split[i] != s {
-                        dynamic_parts.clear();
-                        continue 'outer;
-                    }
-                }
-                PathPart::Dynamic => {
-                    dynamic_parts.push(path_split[i]);
-                }
-            }
-        }
-        return match fun.0(Arc::new(Context {
-            parent: Some(context.as_ref().clone()),
-            ..Default::default()
-        })) {
-            Value::Str(s) => HttpResponse::Ok().body(s),
-            Value::Bool(b) => HttpResponse::Ok().body(b.to_string()),
-            Value::Num(n) => HttpResponse::Ok().body(n.to_string()),
-            Value::Object(o) => HttpResponse::Ok().body(format!("{o:?}")),
-            Value::Nil => HttpResponse::NoContent().body(""),
-            _ => todo!(),
-        };
-    }
-    HttpResponse::NotFound().body("Not found (404)")
-}
-
-fn eval(ex: Expr, ctx: Arc<Context>) -> Value {
-    match ex {
-        Expr::Variable(name) => {
-            if name == "io" {
-                let io_object = DashMap::new();
-                io_object.insert(
-                    "random".to_string(),
-                    Value::Function(vec![], Function(Box::new(move |_| Value::Num(random())))),
-                );
-                io_object.insert(
-                    "listen".to_string(),
-                    Value::Function(
-                        vec![("port".to_string(), "Num".to_string())],
-                        Function(Box::new(move |ctx| {
-                            //Todo: implement http listener
-                            let port = match ctx.get("port").unwrap_or(Value::Num(8080.0)) {
-                                Value::Num(p) => p,
-                                _ => {
-                                    eprintln!("Port was not a number");
-                                    std::process::exit(70);
-                                }
-                            };
-                            // Only move the port (which is Copy) into the closure
-                            let sys = actix_web::rt::System::new();
-                            sys.block_on(async move {
-                                match HttpServer::new(move || {
-                                    App::new()
-                                        .app_data(actix_web::web::Data::new(ctx.clone()))
-                                        .route(
-                                            "/{tail:.*}",
-                                            actix_web::web::get().to(quick_get_handler),
-                                        )
-                                })
-                                .bind(("127.0.0.1", port as u16))
-                                {
-                                    Ok(server) => {
-                                        if let Err(e) = server.run().await {
-                                            eprintln!("Server error: {e}");
-                                            std::process::exit(70);
-                                        }
-                                    }
-                                    Err(_) => {
-                                        eprintln!("Port {port} was not available. Exiting...");
-                                        std::process::exit(70);
-                                    }
-                                }
-                            });
-                            Value::Nil
-                        })),
-                    ),
-                );
-                io_object.insert(
-                    "route".to_string(),
-                    Value::Function(
-                        vec![
-                            ("method".to_string(), "Str".to_string()),
-                            ("route".to_string(), "Str".to_string()),
-                            ("func".to_string(), "Function".to_string()),
-                        ],
-                        Function(Box::new(move |ctx| {
-                            let method =
-                                match ctx.variables.get("method").map(move |o| o.value().clone()) {
-                                    Some(o) => match o {
-                                        Value::Str(ref s) if s == "GET" => Reqs::Get,
-                                        Value::Str(ref s) if s == "POST" => Reqs::Post,
-                                        l => {
-                                            eprintln!(
-                                                "Request method must be GET or POST, found {l}"
-                                            );
-                                            std::process::exit(70);
-                                        }
-                                    },
-                                    None => {
-                                        eprintln!("Request method parameter not found.");
-                                        std::process::exit(70);
-                                    }
-                                };
-
-                            let path =
-                                match ctx.variables.get("route").map(move |o| o.value().clone()) {
-                                    Some(o) => match o {
-                                        Value::Str(ref s) => s
-                                            .split("/")
-                                            .map(move |o| {
-                                                if o.starts_with(":") {
-                                                    PathPart::Dynamic
-                                                } else {
-                                                    PathPart::Static(o.to_string())
-                                                }
-                                            })
-                                            .collect::<Vec<PathPart>>(),
-                                        l => {
-                                            eprintln!("Request route must be a string, found {l}");
-                                            std::process::exit(70);
-                                        }
-                                    },
-                                    None => {
-                                        eprintln!("Request route parameter not found.");
-                                        std::process::exit(70);
-                                    }
-                                };
-
-                            let func =
-                                match ctx.variables.get("func").map(move |o| o.value().clone()) {
-                                    Some(o) => match o {
-                                        Value::Function(_params, runs) => runs,
-                                        l => {
-                                            eprintln!(
-                                                "Request handler must be a function, found {l}"
-                                            );
-                                            std::process::exit(70);
-                                        }
-                                    },
-                                    None => {
-                                        eprintln!("Request function parameter not found.");
-                                        std::process::exit(70);
-                                    }
-                                };
-
-                            ctx.route(method, path, func);
-                            Value::Nil
-                        })),
-                    ),
-                );
-                Value::Object(io_object)
-            } else if let Some(v) = ctx.get(&name) {
-                v
-            } else {
-                eprintln!("Variable \"{name}\" not found");
-                std::process::exit(70);
-            }
-        }
-        Expr::Index(li, index) => {
-            let Value::List(actl) = eval(*li, ctx.clone()) else {
-                eprintln!("You can't index into a non-list object");
-                std::process::exit(70);
-            };
-            let Value::Num(actindex) = eval(*index, ctx.clone()) else {
-                eprintln!("Index was not a number");
-                std::process::exit(70);
-            };
-
-            if let Some(r) = actl.get(actindex as usize) {
-                r.clone()
-            } else {
-                Value::Nil
-            }
-        }
-        Expr::Object(o) => {
-            let new_map = DashMap::new();
-
-            for (name, exp) in o {
-                new_map.insert(name, eval(exp, ctx.clone()));
-            }
-            Value::Object(new_map)
-        }
-        Expr::List(exprs) => {
-            // evaluate each element into a Value
-            let values: Vec<Value> = exprs.into_iter().map(|e| eval(e, ctx.clone())).collect();
-            // wrap into a temporary identifier and insert into context?
-            // For now, represent the list as a global literal name
-            // We can return Nil or error until full runtime support is added.
-            Value::List(values)
-        }
-        Expr::Literal(l) => l,
-        Expr::Binary(l, o, r) => {
-            let left = eval(*l, ctx.clone());
-            let right = eval(*r, ctx.clone());
-            match o {
-                BinOp::Plus => match left {
-                    Value::Str(ref left_str) => match right {
-                        Value::Str(right_str) => Value::Str(format!("{left_str}{right_str}")),
-                        _ => {
-                            eprintln!("Adding must be two numbers or two strings");
-                            std::process::exit(70);
-                        }
-                    },
-                    Value::Num(left_num) => {
-                        if let Value::Num(right_num) = right {
-                            Value::Num(left_num + right_num)
-                        } else {
-                            eprintln!("Type Error: Cannot add a number to anything but a number");
-                            std::process::exit(70);
-                        }
-                    }
-                    l => {
-                        eprintln!("We haven't supported adding {l} and {right} yet");
-                        std::process::exit(70);
-                    }
-                },
-                BinOp::Minus => {
-                    if let Value::Num(left_num) = left {
-                        if let Value::Num(right_num) = right {
-                            Value::Num(left_num - right_num)
-                        } else {
-                            eprintln!(
-                                "We haven't supported subtracting {right:?} from {left_num} yet",
-                            );
-                            std::process::exit(70);
-                        }
-                    } else {
-                        eprintln!("We haven't supported subtracting {right} from {left} yet",);
-                        std::process::exit(70);
-                    }
-                }
-                BinOp::Mult => {
-                    if let Value::Num(left_num) = left {
-                        if let Value::Num(right_num) = right {
-                            Value::Num(left_num * right_num)
-                        } else {
-                            eprintln!(
-                                "We haven't supported multiplying {right} and {left_num} yet",
-                            );
-                            std::process::exit(70);
-                        }
-                    } else {
-                        eprintln!("We haven't supported multiplying {right} and {left} yet",);
-                        std::process::exit(70);
-                    }
-                }
-                BinOp::Div => {
-                    if let Value::Num(left_num) = left {
-                        if let Value::Num(right_num) = right {
-                            Value::Num(left_num / right_num)
-                        } else {
-                            eprintln!("We haven't supported dividing {right} by {left_num} yet",);
-                            std::process::exit(70);
-                        }
-                    } else {
-                        eprintln!("We haven't supported dividing {right} from {left} yet");
-                        std::process::exit(70);
-                    }
-                }
-                BinOp::Greater => {
-                    if let Value::Num(left_num) = left {
-                        if let Value::Num(right_num) = right {
-                            if left_num > right_num {
-                                Value::Bool(true)
-                            } else {
-                                Value::Bool(false)
-                            }
-                        } else {
-                            eprintln!(
-                                "We haven't supported coprarisons of {right} and {left_num} yet",
-                            );
-                            std::process::exit(70);
-                        }
-                    } else {
-                        eprintln!("We haven't supported coprarisons of {right} and {left} yet",);
-                        std::process::exit(70);
-                    }
-                }
-                BinOp::Less => {
-                    if let Value::Num(left_num) = left {
-                        if let Value::Num(right_num) = right {
-                            if left_num < right_num {
-                                Value::Bool(true)
-                            } else {
-                                Value::Bool(false)
-                            }
-                        } else {
-                            eprintln!(
-                                "We haven't supported coprarisons of {right} and {left_num} yet",
-                            );
-                            std::process::exit(70);
-                        }
-                    } else {
-                        eprintln!("We haven't supported coprarisons of {right} and {left} yet",);
-                        std::process::exit(70);
-                    }
-                }
-                BinOp::GreaterEqual => {
-                    if let Value::Num(left_num) = left {
-                        if let Value::Num(right_num) = right {
-                            if left_num >= right_num {
-                                Value::Bool(true)
-                            } else {
-                                Value::Bool(false)
-                            }
-                        } else {
-                            eprintln!(
-                                "We haven't supported coprarisons of {right} and {left_num} yet",
-                            );
-                            std::process::exit(70);
-                        }
-                    } else {
-                        eprintln!("We haven't supported coprarisons of {right} and {left} yet",);
-                        std::process::exit(70);
-                    }
-                }
-                BinOp::LessEqual => {
-                    if let Value::Num(left_num) = left {
-                        if let Value::Num(right_num) = right {
-                            if left_num <= right_num {
-                                Value::Bool(true)
-                            } else {
-                                Value::Bool(false)
-                            }
-                        } else {
-                            eprintln!(
-                                "We haven't supported coprarisons of {right} and {left_num} yet",
-                            );
-                            std::process::exit(70);
-                        }
-                    } else {
-                        eprintln!("We haven't supported coprarisons of {right} and {left} yet",);
-                        std::process::exit(70);
-                    }
-                }
-                BinOp::EqEq => {
-                    // Resolve identifiers to actual values before comparison
-
-                    if left == right {
-                        Value::Bool(true)
-                    } else {
-                        Value::Bool(false)
-                    }
-                }
-                BinOp::NotEq => {
-                    // Resolve identifiers to actual values before comparison
-
-                    if left != right {
-                        Value::Bool(true)
-                    } else {
-                        Value::Bool(false)
-                    }
-                }
-            }
-        }
-        Expr::Grouping(val) => eval(*val, ctx),
-        Expr::Unary(tolk, val) => match tolk {
-            Unary::Neg => {
-                let other_val = *val;
-                if let Value::Num(num) = eval(other_val, ctx) {
-                    Value::Num(-num)
-                } else {
-                    eprintln!("Operand must be a number.");
-
-                    std::process::exit(70);
-                }
-            }
-            Unary::Not => {
-                let evald = eval(*val, ctx);
-                if let Value::Bool(true) = evald {
-                    Value::Bool(false)
-                } else if let Value::Nil = evald {
-                    Value::Bool(true)
-                } else if let Value::Num(_) = evald {
-                    Value::Bool(false)
-                } else {
-                    Value::Bool(false)
-                }
-            }
-        },
-        Expr::Call(callee, args) => {
-            // Fallback for user-defined functions
-            let l_val = eval(*callee, ctx.clone());
-            if let Value::Function(params, body_fn) = l_val {
-                if args.len() != params.len() {
-                    eprintln!("Expected {} arguments but got {}", params.len(), args.len());
-                    std::process::exit(70);
-                }
-                // Create a nested context that shares routes and variables via clone
-                let new_ctx = Arc::new(Context {
-                    variables: ctx.variables.clone(),
-                    routes: ctx.routes.clone(),
-                    parent: Some(ctx.clone()),
-                });
-                for (i, expr) in args.into_iter().enumerate() {
-                    let val = eval(expr, ctx.clone());
-                    let name = &params[i].0;
-                    new_ctx.insert(name, val);
-                }
-                body_fn.0(new_ctx)
-            } else {
-                eprintln!("Identifier is not a function");
-                std::process::exit(70);
-            }
-        }
-        Expr::Get(obj, prop) => {
-            // Evaluate the object expression into a Value
-            let val = eval(*obj, ctx);
-            // // Runtime support for list.len on variables
-            if prop == "len" {
-                if let Value::List(items) = val {
-                    // return Value::Num(items.len() as f64);
-                    return Value::Function(
-                        vec![],
-                        Function(Box::new(move |_| Value::Num(items.len() as f64))),
-                    );
-                } else if let Value::Str(string) = val {
-                    return Value::Function(
-                        vec![],
-                        Function(Box::new(move |_| Value::Num(string.len() as f64))),
-                    );
-                }
-            }
-
-            if let Value::Object(ref o) = val {
-                if let Some(p) = o.get(&prop) {
-                    return p.clone();
-                } else {
-                    eprintln!("Couldn't find property {prop} on object {val}");
-                    std::process::exit(70);
-                }
-            }
-            if let Value::Num(n) = val {
-                if prop == "str" {
-                    return Value::Function(
-                        vec![],
-                        Function(Box::new(move |_| Value::Str(n.to_string()))),
-                    );
-                }
-            }
-            todo!("{}", val);
-        }
-        Expr::Block(fns) => {
-            let inner_ctx = Arc::new(Context {
-                variables: ctx.variables.clone(),
-                routes: ctx.routes.clone(),
-                parent: Some(ctx.clone()),
-            });
-            let last = Value::Nil;
-            todo!();
-            // for f in fns {
-            //     last = f.0(inner_ctx.clone());
-            // }
-            last
-        }
-    }
-}
-
 fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
     match expr {
         Expr::Variable(v) => match ctx.var_types.get(v) {
             Some(t) => Ok(t.clone()),
             None => {
-                eprintln!("Variable \"{v}\" not found");
+                eprintln!("Variable \"{}\" not found", v);
                 std::process::exit(70);
             }
         },
         Expr::Index(list, _) => get_type_of_expr(list, ctx),
-        Expr::Object(o) => {
-            let fields = DashMap::new();
-            for entry in o.iter() {
-                let name = entry.key();
-                let expr = entry.value();
+        Expr::Object(_name, o) => {
+            let mut fields = HashMap::new();
+            for (name, expr) in o.iter() {
                 let field_type = get_type_of_expr(expr, ctx)?;
                 fields.insert(name.clone(), field_type);
             }
@@ -3042,7 +3282,7 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                     if lt == Type::Num && rt == Type::Num {
                         Ok(Type::Num)
                     } else {
-                        Err(format!("Operator {op:?} requires two numbers"))
+                        Err(format!("Operator {:?} requires two numbers", op))
                     }
                 }
                 BinOp::EqEq | BinOp::NotEq => Ok(Type::Bool),
@@ -3050,11 +3290,12 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                     if lt == Type::Num && rt == Type::Num {
                         Ok(Type::Bool)
                     } else {
-                        Err(format!("Operator {op:?} requires two numbers"))
+                        Err(format!("Operator {:?} requires two numbers", op))
                     }
                 }
             }
         }
+
         Expr::Get(obj, prop) => {
             // Type-checking for field access
             let obj_type = get_type_of_expr(obj, ctx)?;
@@ -3063,7 +3304,7 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                     if prop == "len" {
                         Ok(Type::Function(vec![], Box::new(Type::Num)))
                     } else {
-                        Err(format!("Property '{prop}' not found on list type"))
+                        Err(format!("Property '{}' not found on list type", prop))
                     }
                 }
                 Type::Io => {
@@ -3071,6 +3312,10 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
 
                     match prop.as_str() {
                         "random" => Ok(Type::Function(vec![], Box::new(Type::Num))),
+                        "input" => Ok(Type::Function(
+                            vec![("prompt".to_string(), "Str".to_string())],
+                            Box::new(Type::Str),
+                        )),
                         "route" => Ok(Type::Function(
                             vec![
                                 ("method".to_string(), "Str".to_string()),
@@ -3083,22 +3328,39 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                             vec![("port".to_string(), "Num".to_string())],
                             Box::new(Type::Nil),
                         )),
-                        other => Err(format!("Unknown property '{other}' on io")),
+                        "read" => Ok(Type::Function(
+                            vec![("path".to_string(), "Str".to_string())],
+                            Box::new(Type::Str),
+                        )),
+                        "write" => Ok(Type::Function(
+                            vec![
+                                ("path".to_string(), "Str".to_string()),
+                                ("content".to_string(), "Str".to_string()),
+                            ],
+                            Box::new(Type::Nil),
+                        )),
+                        other => Err(format!("Unknown property '{}' on io", other)),
                     }
                 }
                 Type::Num => match prop.as_str() {
                     "str" => Ok(Type::Function(vec![], Box::new(Type::Str))),
-                    other => Err(format!("Unknown property '{other}' on type Num")),
+                    other => Err(format!("Unknown property '{}' on type Num", other)),
                 },
                 Type::Custom(fields) => {
                     // Look up property in custom type
                     if let Some(t) = fields.get(prop) {
                         Ok(t.clone())
                     } else {
-                        Err(format!("Property '{prop}' not found on type {fields:?}",))
+                        Err(format!(
+                            "Property '{}' not found on type {:?}",
+                            prop, fields,
+                        ))
                     }
                 }
-                other => Err(format!("Cannot access property '{prop}' on type {other:?}",)),
+                other => Err(format!(
+                    "Cannot access property '{}' on type {:?}",
+                    prop, other,
+                )),
             }
         }
         Expr::Block(_) => Ok(Type::Nil),
@@ -3112,7 +3374,7 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                         } else {
                             return Err(format!(
                                 "io.random() expects no arguments, got {}",
-                                args.len()
+                                args.len(),
                             ));
                         }
                     }
@@ -3125,7 +3387,7 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                     return Err(format!(
                         "Expected {} arguments but got {}",
                         params.len(),
-                        args.len()
+                        args.len(),
                     ));
                 }
                 // verify each arg’s inferred type against the declared parameter type
@@ -3137,7 +3399,8 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                             // OK
                         } else {
                             return Err(format!(
-                                "Parameter #{i} type mismatch: expected a function, got {arg_t:?}",
+                                "Parameter #{} type mismatch: expected a function, got {:?}",
+                                i, arg_t,
                             ));
                         }
                     } else {
@@ -3149,14 +3412,15 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                         };
                         if expected != arg_t {
                             return Err(format!(
-                                "Parameter #{i} type mismatch: expected {expected:?}, got {arg_t:?}",
+                                "Parameter #{} type mismatch: expected {:?}, got {:?}",
+                                i, expected, arg_t,
                             ));
                         }
                     }
                 }
                 Ok(*ret_type)
             } else {
-                Err(format!("Can only call functions, found {callee_type:?}"))
+                Err(format!("Can only call functions, found {:?}", callee_type))
             }
         }
     }
