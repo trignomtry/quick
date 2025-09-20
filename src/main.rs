@@ -1,23 +1,18 @@
-//! #![allow(unused_variables)]
-//! #![allow(dead_code)]
-//! #![allow(unused_mut)]
-//! #![allow(unused_imports)]
-
 use crate::TokenKind::*;
 unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
+    fn strncmp(a: *const i8, b: *const i8, c: i32) -> i32;
     fn printf(fmt: *const i8, ...) -> i32;
     fn malloc(size: usize) -> *mut std::ffi::c_void;
-    fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
-    fn memcpy(
-        dest: *mut std::ffi::c_void,
-        src: *const std::ffi::c_void,
-        n: usize,
-    ) -> *mut std::ffi::c_void;
+
     fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8;
     fn sprintf(buf: *mut i8, fmt: *const i8, ...) -> i32;
     fn strcat(dest: *mut i8, src: *const i8) -> *mut i8;
     fn strlen(s: *const i8) -> usize;
+    fn atoi(s: *const i8) -> usize;
+    // Correct strstr signature: returns pointer to match or NULL
+    fn strstr(s: *const i8, o: *const i8) -> *mut i8;
+
     fn rand() -> i32;
     fn time(t: *mut i64) -> i64;
     fn srand(seed: u32);
@@ -36,8 +31,61 @@ unsafe extern "C" {
     ) -> usize;
     fn fclose(stream: *mut std::ffi::c_void) -> i32;
     fn fgets(s: *mut i8, size: i32, stream: *mut std::ffi::c_void) -> *mut i8;
+    fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
 
 }
+// Provide a C-ABI function to obtain stdin as a raw pointer for JIT mappings
+#[unsafe(no_mangle)]
+pub extern "C" fn get_stdin() -> *mut std::ffi::c_void {
+    unsafe {
+        // Use fd 0 (STDIN) opened as a FILE* via fdopen("r")
+        let mode = b"r\0";
+        libc::fdopen(0, mode.as_ptr() as *const i8) as *mut std::ffi::c_void
+    }
+}
+// ───── Minimal KV Object Runtime (string -> string) ─────
+// Fast baseline using std HashMap; can swap to ahash/hashbrown later
+struct KvMap {
+    inner: HashMap<String, std::ffi::CString>,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_obj_new() -> *mut c_void {
+    let m = KvMap {
+        inner: HashMap::new(),
+    };
+    Box::into_raw(Box::new(m)) as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_obj_insert_str(
+    map: *mut c_void,
+    key: *const c_char,
+    val: *const c_char,
+) {
+    if map.is_null() || key.is_null() || val.is_null() {
+        return;
+    }
+    let m = &mut *(map as *mut KvMap);
+    // Key stays as Rust String for hashing; value is stored as owned CString
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    let cs = CStr::from_ptr(val).to_owned();
+    m.inner.insert(k, cs);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_obj_get_str(map: *mut c_void, key: *const c_char) -> *mut c_char {
+    if map.is_null() || key.is_null() {
+        return std::ptr::null_mut();
+    }
+    let m = &mut *(map as *mut KvMap);
+    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+    match m.inner.get(&k) {
+        Some(cs) => cs.as_ptr() as *mut c_char, // valid as long as it's in the map
+        None => std::ptr::null_mut(),
+    }
+}
+use hyper::body::Body;
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
 use inkwell::builder::{Builder, BuilderError};
@@ -52,19 +100,970 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
-use std::fs;
 use std::mem;
 use std::ptr;
 
-use libc::{c_void, FILE};
+use std::ptr::null_mut;
+use std::sync::Arc;
 
-unsafe extern "C" {
-    static mut stdin: *mut FILE;
+use libc::c_void;
+use std::convert::Infallible;
+use std::ffi::CStr;
+use std::future::Future;
+use std::os::raw::c_char;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+// Hyper (async HTTP server)
+use hyper::body::HttpBody as _;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
+
+// ───── High-Performance HTTP Runtime (Actix-style) ─────
+
+// Unique ID generator for anonymous functions to avoid name collisions
+static INLINE_FN_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
+
+unsafe fn cstr_to_string(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+}
+
+// Global Tokio runtime for blocking FFI helpers when no runtime is active
+static GLOBAL_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+// Dedicated server runtime to keep the HTTP server truly async and alive
+static SERVER_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn block_on_in_runtime<F: Future>(fut: F) -> F::Output {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(fut)
+    } else {
+        let rt = GLOBAL_RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("qs-global-rt")
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("Failed to build global tokio runtime")
+        });
+        rt.block_on(fut)
+    }
+}
+
+// Simple Request object representation for JIT
+#[repr(C)]
+pub struct RequestObject {
+    method: *mut c_char,
+    path: *mut c_char,
+    query: *mut c_char,
+    headers: *mut c_char,
+    body: *mut c_char,
+}
+
+// Response object for structured HTTP responses
+#[repr(C)]
+pub struct ResponseObject {
+    status_code: i32,
+    content_type: *mut c_char,
+    body: *mut c_char,
+    headers: *mut c_char,
+}
+
+// Web helper struct for creating responses
+#[repr(C)]
+pub struct WebHelper {
+    _dummy: u8, // Zero-sized structs aren't allowed in C ABI
+}
+
+#[repr(C)]
+pub struct RangeBuilder {
+    from: f64,
+    to: f64,
+    step: f64,
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn get_stdin() -> *mut c_void {
-    unsafe { stdin as *mut c_void }
+pub unsafe extern "C" fn create_request_object(
+    method: *const c_char,
+    path: *const c_char,
+    query: *const c_char,
+    headers: *const c_char,
+    body: *const c_char,
+) -> *mut RequestObject {
+    let request = Box::new(RequestObject {
+        method: if method.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                let s = CStr::from_ptr(method).to_string_lossy();
+                let c_str = std::ffi::CString::new(s.as_ref()).unwrap();
+                c_str.into_raw()
+            }
+        },
+        path: if path.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                let s = CStr::from_ptr(path).to_string_lossy();
+                let c_str = std::ffi::CString::new(s.as_ref()).unwrap();
+                c_str.into_raw()
+            }
+        },
+        query: if query.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                let s = CStr::from_ptr(query).to_string_lossy();
+                let c_str = std::ffi::CString::new(s.as_ref()).unwrap();
+                c_str.into_raw()
+            }
+        },
+        headers: if headers.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                let s = CStr::from_ptr(headers).to_string_lossy();
+                let c_str = std::ffi::CString::new(s.as_ref()).unwrap();
+                c_str.into_raw()
+            }
+        },
+        body: if body.is_null() || unsafe { CStr::from_ptr(body) }.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                let s = CStr::from_ptr(body).to_string_lossy();
+                let c_str = std::ffi::CString::new(s.as_ref()).unwrap();
+                c_str.into_raw()
+            }
+        },
+    });
+    Box::into_raw(request)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_request_method(request: *const RequestObject) -> *const c_char {
+    if request.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*request).method }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_request_path(request: *const RequestObject) -> *const c_char {
+    if request.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*request).path }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_request_body(request: *const RequestObject) -> *const c_char {
+    if request.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*request).body }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_request_query(request: *const RequestObject) -> *const c_char {
+    if request.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*request).query }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_request_headers(request: *const RequestObject) -> *const c_char {
+    if request.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*request).headers }
+}
+
+// Global storage for callback function pointer
+static CALLBACK_HANDLER: OnceLock<usize> = OnceLock::new();
+
+// ───── Web Helper Functions ─────
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_web_helper() -> *mut WebHelper {
+    Box::into_raw(Box::new(WebHelper { _dummy: 0 }))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_range_builder() -> *mut RangeBuilder {
+    Box::into_raw(Box::new(RangeBuilder {
+        from: 0.0,
+        to: 0.0,
+        step: 1.0,
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn range_builder_to(buil: *mut RangeBuilder, tua: f64) -> *mut RangeBuilder {
+    if buil.is_null() {
+        return Box::into_raw(Box::new(RangeBuilder {
+            from: 0.0,
+            to: tua,
+            step: 1.0,
+        }));
+    }
+    (*buil).to = tua;
+    buil
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn range_builder_from(
+    buil: *mut RangeBuilder,
+    tua: f64,
+) -> *mut RangeBuilder {
+    if buil.is_null() {
+        return Box::into_raw(Box::new(RangeBuilder {
+            from: tua,
+            to: 0.0,
+            step: 1.0,
+        }));
+    }
+    (*buil).from = tua;
+    buil
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn range_builder_step(
+    buil: *mut RangeBuilder,
+    tua: f64,
+) -> *mut RangeBuilder {
+    if buil.is_null() {
+        return Box::into_raw(Box::new(RangeBuilder {
+            from: 0.0,
+            to: 0.0,
+            step: if tua == 0.0 { 1.0 } else { tua },
+        }));
+    }
+    if tua == 0.0 {
+        (*buil).step = 1.0;
+    } else {
+        (*buil).step = tua;
+    }
+    buil
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn range_builder_get_from(buil: *const RangeBuilder) -> f64 {
+    if buil.is_null() {
+        return 0.0;
+    }
+    (*buil).from
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn range_builder_get_to(buil: *const RangeBuilder) -> f64 {
+    if buil.is_null() {
+        return 0.0;
+    }
+    (*buil).to
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn range_builder_get_step(buil: *const RangeBuilder) -> f64 {
+    if buil.is_null() {
+        return 1.0;
+    }
+    let step = (*buil).step;
+    if step == 0.0 { 1.0 } else { step }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text(content: *const c_char) -> *mut ResponseObject {
+    let content_str = if content.is_null() {
+        String::new()
+    } else {
+        unsafe { cstr_to_string(content) }
+    };
+
+    let response = Box::new(ResponseObject {
+        status_code: 200,
+        content_type: std::ffi::CString::new("text/plain; charset=utf-8")
+            .unwrap()
+            .into_raw(),
+        body: std::ffi::CString::new(content_str).unwrap().into_raw(),
+        headers: std::ffi::CString::new("").unwrap().into_raw(),
+    });
+    Box::into_raw(response)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_json(content: *const c_char) -> *mut ResponseObject {
+    let content_str = if content.is_null() {
+        String::new()
+    } else {
+        unsafe { cstr_to_string(content) }
+    };
+
+    let response = Box::new(ResponseObject {
+        status_code: 200,
+        content_type: std::ffi::CString::new("application/json; charset=utf-8")
+            .unwrap()
+            .into_raw(),
+        body: std::ffi::CString::new(content_str).unwrap().into_raw(),
+        headers: std::ffi::CString::new("").unwrap().into_raw(),
+    });
+    Box::into_raw(response)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_page(content: *const c_char) -> *mut ResponseObject {
+    let content_str = if content.is_null() {
+        String::new()
+    } else {
+        unsafe { cstr_to_string(content) }
+    };
+
+    let response = Box::new(ResponseObject {
+        status_code: 200,
+        content_type: std::ffi::CString::new("text/html; charset=utf-8")
+            .unwrap()
+            .into_raw(),
+        body: std::ffi::CString::new(content_str).unwrap().into_raw(),
+        headers: std::ffi::CString::new("").unwrap().into_raw(),
+    });
+    Box::into_raw(response)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_error_text(
+    status_code: i32,
+    content: *const c_char,
+) -> *mut ResponseObject {
+    let content_str = if content.is_null() {
+        String::new()
+    } else {
+        unsafe { cstr_to_string(content) }
+    };
+
+    let response = Box::new(ResponseObject {
+        status_code,
+        content_type: std::ffi::CString::new("text/plain; charset=utf-8")
+            .unwrap()
+            .into_raw(),
+        body: std::ffi::CString::new(content_str).unwrap().into_raw(),
+        headers: std::ffi::CString::new("").unwrap().into_raw(),
+    });
+    Box::into_raw(response)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_error_page(
+    status_code: i32,
+    content: *const c_char,
+) -> *mut ResponseObject {
+    let content_str = if content.is_null() {
+        String::new()
+    } else {
+        unsafe { cstr_to_string(content) }
+    };
+
+    let response = Box::new(ResponseObject {
+        status_code,
+        content_type: std::ffi::CString::new("text/html; charset=utf-8")
+            .unwrap()
+            .into_raw(),
+        body: std::ffi::CString::new(content_str).unwrap().into_raw(),
+        headers: std::ffi::CString::new("").unwrap().into_raw(),
+    });
+    Box::into_raw(response)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_redirect(
+    location: *const c_char,
+    permanent: bool,
+) -> *mut ResponseObject {
+    let location_str = if location.is_null() {
+        String::from("/")
+    } else {
+        unsafe { cstr_to_string(location) }
+    };
+
+    let status_code = if permanent { 301 } else { 302 };
+    let headers = format!("Location: {}", location_str);
+
+    let response = Box::new(ResponseObject {
+        status_code,
+        content_type: std::ffi::CString::new("text/plain; charset=utf-8")
+            .unwrap()
+            .into_raw(),
+        body: std::ffi::CString::new("").unwrap().into_raw(),
+        headers: std::ffi::CString::new(headers).unwrap().into_raw(),
+    });
+    Box::into_raw(response)
+}
+
+// Async file reading function for io.read() - now the default
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn io_read_file(filename: *const c_char) -> *mut c_char {
+    if filename.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let filename_str = unsafe { cstr_to_string(filename) };
+
+    let result = block_on_in_runtime(async {
+        tokio::fs::read_to_string(&filename_str)
+            .await
+            .unwrap_or_default()
+    });
+
+    let c_str = std::ffi::CString::new(result).unwrap();
+    c_str.into_raw()
+}
+
+// Async file writing function for io.write() - now the default
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn io_write_file(filename: *const c_char, content: *const c_char) -> f64 {
+    if filename.is_null() || content.is_null() {
+        return 0.0; // failure
+    }
+
+    let filename_str = unsafe { cstr_to_string(filename) };
+    let content_str = unsafe { cstr_to_string(content) };
+
+    block_on_in_runtime(async {
+        match tokio::fs::write(&filename_str, &content_str).await {
+            Ok(_) => 1.0,
+            Err(_) => 0.0,
+        }
+    })
+}
+
+// MIME type detection based on file extension
+fn get_mime_type(filename: &str) -> &'static str {
+    let extension = filename.split('.').last().unwrap_or("").to_lowercase();
+    match extension.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+// Serve static files with proper MIME types (sync FFI ABI)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObject {
+    if filename.is_null() {
+        return unsafe { web_error_text(404, b"File not found\0".as_ptr() as *const c_char) };
+    }
+
+    let mut filename_str = unsafe { cstr_to_string(filename) };
+    if filename_str.ends_with("/") {
+        filename_str.push_str("index.html");
+    }
+
+    // Read file contents using the runtime helper, but expose a sync C ABI
+    let read_result = block_on_in_runtime(async { tokio::fs::read_to_string(&filename_str).await });
+
+    match read_result {
+        Ok(content) => {
+            let mime_type = get_mime_type(&filename_str);
+            let response = Box::new(ResponseObject {
+                status_code: 200,
+                content_type: std::ffi::CString::new(mime_type).unwrap().into_raw(),
+                body: std::ffi::CString::new(content).unwrap().into_raw(),
+                headers: std::ffi::CString::new("").unwrap().into_raw(),
+            });
+            Box::into_raw(response)
+        }
+        Err(_) => unsafe { web_error_text(404, b"File not found\0".as_ptr() as *const c_char) },
+    }
+}
+
+// Helper to get response fields
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_response_status(response: *const ResponseObject) -> i32 {
+    if response.is_null() {
+        return 500;
+    }
+    unsafe { (*response).status_code }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_response_content_type(
+    response: *const ResponseObject,
+) -> *const c_char {
+    if response.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*response).content_type }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_response_body(response: *const ResponseObject) -> *const c_char {
+    if response.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*response).body }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_response_headers(response: *const ResponseObject) -> *const c_char {
+    if response.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*response).headers }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_listen_with_callback(port: i32, callback: *const c_void) {
+    let addr = format!("0.0.0.0:{port}");
+    let callback_addr = callback as usize;
+
+    // Store the callback function pointer
+    CALLBACK_HANDLER
+        .set(callback_addr)
+        .expect("Callback already set");
+
+    // Use same runtime configuration as original
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let worker_threads = (cpu_count * 2).min(16);
+
+    // Build task that runs a Hyper server
+    let server_task = async move {
+        eprintln!("HTTP server starting on http://{addr}");
+        let socket_addr: std::net::SocketAddr = match addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("Invalid bind address {addr}: {e}");
+                return;
+            }
+        };
+        SERVER_RUNNING.store(true, Ordering::Relaxed);
+
+        let make_svc = make_service_fn(move |_conn| {
+            let handler_addr = callback_addr;
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req| {
+                    handle_hyper_request(req, handler_addr)
+                }))
+            }
+        });
+
+        if let Err(e) = hyper::Server::bind(&socket_addr).serve(make_svc).await {
+            eprintln!("Server error: {e}");
+        }
+    };
+
+    // If we're already inside a Tokio runtime, spawn directly.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(server_task);
+        return;
+    }
+
+    // Otherwise, spin up (or reuse) a dedicated multi-thread runtime and spawn the server
+    let rt = SERVER_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("qs-worker")
+            .thread_stack_size(2 * 1024 * 1024)
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("Failed to build server runtime")
+    });
+    rt.spawn(server_task);
+}
+
+async fn handle_hyper_request(
+    req: HyperRequest<Body>,
+    handler_addr: usize,
+) -> Result<HyperResponse<Body>, Infallible> {
+    // Method and path
+    let method = req.method().as_str().to_string();
+    let uri = req.uri().clone();
+    let path = uri.path().to_string();
+    let raw_query = uri.query().unwrap_or("").to_string();
+
+    // Percent-decode util
+    fn percent_decode(input: &str) -> String {
+        let bytes = input.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b'%' if i + 2 < bytes.len() => {
+                    let h1 = bytes[i + 1] as char;
+                    let h2 = bytes[i + 2] as char;
+                    if let (Some(v1), Some(v2)) = (h1.to_digit(16), h2.to_digit(16)) {
+                        out.push(((v1 << 4) as u8) | (v2 as u8));
+                        i += 3;
+                    } else {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    // Normalize query (decode and join)
+    let query = if raw_query.is_empty() {
+        String::new()
+    } else {
+        let mut parts = Vec::new();
+        for pair in raw_query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            parts.push(format!("{}={}", percent_decode(k), percent_decode(v)));
+        }
+        parts.join("&")
+    };
+
+    // Headers: fold into Key: Value\r\n
+    let mut headers_raw = String::new();
+    for (name, value) in req.headers().iter() {
+        let val = value.to_str().unwrap_or("");
+        headers_raw.push_str(name.as_str());
+        headers_raw.push_str(": ");
+        headers_raw.push_str(val);
+        headers_raw.push_str("\r\n");
+    }
+
+    // Body (collect)
+    let whole = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(_) => Default::default(),
+    };
+    let body_str = String::from_utf8(whole.to_vec()).unwrap_or_default();
+
+    // Call the user callback on a blocking thread via FFI
+    let (status_code, content_type, body, extra_headers) =
+        match tokio::task::spawn_blocking(move || unsafe {
+            let method_cstr = std::ffi::CString::new(method).unwrap();
+            let path_cstr = std::ffi::CString::new(path).unwrap();
+            let query_cstr = std::ffi::CString::new(query)
+                .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+            let headers_cstr = std::ffi::CString::new(headers_raw)
+                .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+            let body_cstr = std::ffi::CString::new(body_str)
+                .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+
+            let request_obj = create_request_object(
+                method_cstr.as_ptr(),
+                path_cstr.as_ptr(),
+                query_cstr.as_ptr(),
+                headers_cstr.as_ptr(),
+                body_cstr.as_ptr(),
+            );
+
+            let func: extern "C" fn(*const RequestObject) -> *mut ResponseObject =
+                std::mem::transmute::<usize, _>(handler_addr);
+            let response_ptr = func(request_obj);
+
+            let out = if response_ptr.is_null() {
+                (
+                    404,
+                    "text/plain; charset=utf-8".to_string(),
+                    "Not Found".to_string(),
+                    String::new(),
+                )
+            } else {
+                let status = get_response_status(response_ptr);
+                let content_type = cstr_to_string(get_response_content_type(response_ptr));
+                let body = cstr_to_string(get_response_body(response_ptr));
+                let headers = cstr_to_string(get_response_headers(response_ptr));
+                let _ = Box::from_raw(response_ptr);
+                (status, content_type, body, headers)
+            };
+            let _ = Box::from_raw(request_obj);
+            out
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => (
+                500,
+                "text/plain; charset=utf-8".to_string(),
+                "Internal Server Error".to_string(),
+                String::new(),
+            ),
+        };
+
+    // Build Hyper response
+    let mut builder = HyperResponse::builder()
+        .status(StatusCode::from_u16(status_code as u16).unwrap_or(StatusCode::OK));
+    if !content_type.is_empty() {
+        builder = builder.header("Content-Type", content_type);
+    }
+    if !extra_headers.is_empty() {
+        for line in extra_headers.split('\n') {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                let name = k.trim();
+                let val = v.trim();
+                if !name.is_empty() && !val.is_empty() {
+                    builder = builder.header(name, val);
+                }
+            }
+        }
+    }
+    let resp = builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| HyperResponse::new(Body::from("Internal Server Error")));
+    Ok(resp)
+}
+
+// Callback-based connection handler
+async fn handle_connection_with_callback(socket: tokio::net::TcpStream) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::time::timeout;
+
+    let _ = socket.set_nodelay(true);
+
+    // Avoid aliasing a &mut borrow for read and then writing on the same socket.
+    // Split into owned read/write halves for safety.
+    let (read_half, mut write_half) = socket.into_split();
+    let mut reader = BufReader::with_capacity(8192, read_half);
+    let mut request_line = String::with_capacity(512);
+
+    let read_result = timeout(Duration::from_secs(5), reader.read_line(&mut request_line)).await;
+
+    if read_result.is_err() {
+        return;
+    }
+
+    let mut parts = request_line.split_ascii_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let full_path = parts.next().unwrap_or("/").to_string();
+
+    // Parse path and query
+    fn percent_decode(input: &str) -> String {
+        let bytes = input.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b'%' if i + 2 < bytes.len() => {
+                    let h1 = bytes[i + 1];
+                    let h2 = bytes[i + 2];
+                    let v1 = (h1 as char).to_digit(16);
+                    let v2 = (h2 as char).to_digit(16);
+                    if let (Some(v1), Some(v2)) = (v1, v2) {
+                        out.push(((v1 << 4) as u8) | (v2 as u8));
+                        i += 3;
+                    } else {
+                        // invalid, copy as-is
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    let (path, raw_query) = match full_path.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (full_path.clone(), String::new()),
+    };
+
+    // Build a normalized, decoded query string: key=value&key2=value2
+    let query = if raw_query.is_empty() {
+        String::new()
+    } else {
+        let mut parts = Vec::new();
+        for pair in raw_query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = match pair.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (pair, ""),
+            };
+            let dk = percent_decode(k);
+            let dv = percent_decode(v);
+            parts.push(format!("{}={}", dk, dv));
+        }
+        parts.join("&")
+    };
+
+    // Read headers until blank line
+    let mut headers_raw = String::new();
+    let mut header_line = String::new();
+    let mut content_length: usize = 0;
+    loop {
+        header_line.clear();
+        if timeout(Duration::from_secs(5), reader.read_line(&mut header_line))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        // Empty line ("\r\n") marks end of headers
+        if header_line == "\r\n" || header_line.is_empty() {
+            break;
+        }
+        // Accumulate raw headers
+        headers_raw.push_str(&header_line);
+
+        let lower = header_line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("content-length:") {
+            if let Ok(len) = rest.trim().parse::<usize>() {
+                content_length = len;
+            }
+        }
+    }
+
+    // Read body if Content-Length specified
+    let mut body_str = String::new();
+    if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        let _ = timeout(Duration::from_secs(5), reader.read_exact(&mut buf)).await;
+        // Best-effort UTF-8 decode; fall back to lossless using from_utf8_lossy
+        body_str = String::from_utf8(buf).unwrap_or_default();
+    }
+
+    // Get the callback handler address (stored as usize)
+    let handler_addr = *CALLBACK_HANDLER
+        .get()
+        .expect("Callback not set before handling connection");
+    let (status_code, content_type, body, headers) = {
+        let method = method.clone();
+        let path = path.clone();
+        let query = query.clone();
+        let headers_raw = headers_raw.clone();
+        let body_str = body_str.clone();
+        match tokio::task::spawn_blocking(move || {
+            unsafe {
+                // Create a Request object for the callback
+                let method_cstr = std::ffi::CString::new(method).unwrap();
+                let path_cstr = std::ffi::CString::new(path).unwrap();
+                let query_cstr = std::ffi::CString::new(query)
+                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+                let headers_cstr = std::ffi::CString::new(headers_raw)
+                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+                let body_cstr = std::ffi::CString::new(body_str)
+                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+
+                let request_obj = create_request_object(
+                    method_cstr.as_ptr(),
+                    path_cstr.as_ptr(),
+                    query_cstr.as_ptr(),   // query
+                    headers_cstr.as_ptr(), // headers
+                    body_cstr.as_ptr(),    // body
+                );
+
+                // Call the callback function - it should return a ResponseObject*
+                let func: extern "C" fn(*const RequestObject) -> *mut ResponseObject =
+                    std::mem::transmute::<usize, _>(handler_addr);
+                let response_ptr = func(request_obj);
+
+                let result = if response_ptr.is_null() {
+                    (
+                        404,
+                        "text/plain; charset=utf-8".to_string(),
+                        "Not Found".to_string(),
+                        "".to_string(),
+                    )
+                } else {
+                    let status = get_response_status(response_ptr);
+                    let content_type = cstr_to_string(get_response_content_type(response_ptr));
+                    let body = cstr_to_string(get_response_body(response_ptr));
+                    let headers = cstr_to_string(get_response_headers(response_ptr));
+
+                    // Clean up the response object
+                    let _ = Box::from_raw(response_ptr);
+
+                    (status, content_type, body, headers)
+                };
+
+                // Clean up the request object
+                let _ = Box::from_raw(request_obj);
+
+                result
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => (
+                500,
+                "text/plain; charset=utf-8".to_string(),
+                "Internal Server Error".to_string(),
+                "".to_string(),
+            ),
+        }
+    };
+
+    // Convert status code to status line
+    let status_line = match status_code {
+        200 => "200 OK",
+        301 => "301 Moved Permanently",
+        302 => "302 Found",
+        404 => "404 Not Found",
+        500 => "500 Internal Server Error",
+        _ => "200 OK", // Default fallback
+    };
+
+    // Build response with proper headers
+    let mut response = format!(
+        "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: keep-alive\r\nServer: QuickScript/1.0\r\n",
+        status_line,
+        body.len(),
+        content_type
+    );
+
+    // Add custom headers if any
+    if !headers.is_empty() {
+        response.push_str(&headers);
+        response.push_str("\r\n");
+    }
+
+    response.push_str("\r\n");
+    response.push_str(&body);
+
+    let _ = timeout(
+        Duration::from_secs(5),
+        write_half.write_all(response.as_bytes()),
+    )
+    .await;
+    let _ = write_half.flush().await;
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +1122,9 @@ enum TokenKind {
     Str(String),
     Identifier(String),
     And,
+    In,
     Object,
+    Enum,
     Maybe,
     Else,
     False,
@@ -140,6 +1141,7 @@ enum TokenKind {
     True,
     Let,
     While,
+    Use,
     Eof,
     Num(f64),
     Error(u64, std::string::String),
@@ -178,6 +1180,7 @@ enum Expr {
     List(Vec<Expr>),
     Object(String, HashMap<String, Expr>),
     Block(Vec<Instruction>),
+    Function(Vec<(String, Type)>, Type, Box<Instruction>),
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +1190,7 @@ enum Instruction {
         value: Expr,
         type_hint: Type,
     },
-    Assign(String, Expr, Option<Type>),
+    Assign(Expr, Expr, Option<Type>),
     Println(Expr),
     Return(Expr),
     If {
@@ -200,9 +1203,8 @@ enum Instruction {
         body: Vec<Instruction>,
     },
     For {
-        init: Box<Instruction>,
-        condition: Expr,
-        step: Box<Instruction>,
+        iterator: String,
+        range: Expr,
         body: Vec<Instruction>,
     },
     Block(Vec<Instruction>),
@@ -218,6 +1220,10 @@ enum Instruction {
         args: Vec<Expr>,
     },
     Maybe(Expr, Box<Instruction>, Option<Box<Instruction>>),
+    Use {
+        module_name: String,
+        mod_path: String,
+    },
     Nothing,
 }
 
@@ -257,6 +1263,7 @@ impl PartialEq for Value {
             (Value::Function(l, _), Value::Function(r, _)) => l == r,
             (Value::List(l), Value::List(r)) => l == r,
             (Value::Nil, Value::Nil) => true,
+
             _ => false,
         }
     }
@@ -328,10 +1335,51 @@ impl Value {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ModuleFunction {
+    name: String,
+    params: Vec<(String, Type)>,
+    return_type: Type,
+    body: Vec<Instruction>,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleInfo {
+    // functions and constants exported by the module
+    functions: HashMap<String, ModuleFunction>,
+    constants: HashMap<String, Expr>,
+    // type map for fields (functions -> Function types, constants -> concrete types)
+    field_types: HashMap<String, Type>,
+}
+
+impl Default for ModuleInfo {
+    fn default() -> Self {
+        Self {
+            functions: HashMap::new(),
+            constants: HashMap::new(),
+            field_types: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct PreCtx {
     var_types: HashMap<String, Type>,
-    types: HashMap<String, HashMap<String, Type>>,
+    types: HashMap<String, Custype>,
+    // Loaded modules and their exports (types only; no execution)
+    modules: HashMap<String, ModuleInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Custype {
+    Object(HashMap<String, Type>),
+    Enum(Vec<String>),
+}
+
+impl Default for Custype {
+    fn default() -> Self {
+        Custype::Enum(vec![])
+    }
 }
 
 struct Parser {
@@ -339,7 +1387,7 @@ struct Parser {
     current: usize, // index into `tokens`
     pctx: PreCtx,
     current_return_type: Option<Type>,
-    inside_maybe: bool,
+    inside_maybe: Option<String>,
     saw_non_nil_return: bool,
     saw_nil_return: bool,
 }
@@ -351,10 +1399,23 @@ enum Type {
     Bool,
     Nil,
     Io,
+    WebReturn,
+    RangeBuilder,
+    Kv(Box<Type>),
     List(Box<Type>),
     Option(Box<Type>),
-    Custom(HashMap<String, Type>),
-    Function(Vec<(String, String)>, Box<Type>),
+    Custom(Custype),
+    Function(Vec<(String, Type)>, Box<Type>),
+}
+
+impl Type {
+    fn unwrap(&self) -> Self {
+        if let Self::Option(l) = self {
+            l.unwrap()
+        } else {
+            self.clone()
+        }
+    }
 }
 
 impl PartialEq for Type {
@@ -364,7 +1425,8 @@ impl PartialEq for Type {
             | (Type::Str, Type::Str)
             | (Type::Bool, Type::Bool)
             | (Type::Nil, Type::Nil)
-            | (Type::Io, Type::Io) => true,
+            | (Type::Io, Type::Io)
+            | (Type::WebReturn, Type::WebReturn) => true,
 
             (Type::List(left), Type::List(right)) | (Type::Option(left), Type::Option(right)) => {
                 left == right
@@ -375,17 +1437,18 @@ impl PartialEq for Type {
             }
 
             (Type::Custom(map_l), Type::Custom(map_r)) => {
+                map_l == map_r
                 // Compare as maps: same length and all corresponding entries equal
-                if map_l.len() != map_r.len() {
-                    return false;
-                }
-                for (key, val_l) in map_l.iter() {
-                    match map_r.get(key) {
-                        Some(val_r) if *val_l == *val_r => continue,
-                        _ => return false,
-                    }
-                }
-                true
+                // if map_l.len() != map_r.len() {
+                //     return false;
+                // }
+                // for (key, val_l) in map_l.iter() {
+                //     match map_r.get(key) {
+                //         Some(val_r) if *val_l == *val_r => continue,
+                //         _ => return false,
+                //     }
+                // }
+                // true
             }
 
             _ => false,
@@ -400,7 +1463,7 @@ impl Parser {
             current: 0,
             pctx: PreCtx::default(),
             current_return_type: None,
-            inside_maybe: false,
+            inside_maybe: None,
             saw_non_nil_return: false,
             saw_nil_return: false,
         }
@@ -411,6 +1474,19 @@ impl Parser {
     fn parse_program(&mut self) -> Result<Vec<Instruction>, String> {
         let mut prgm = Vec::new();
         self.pctx.var_types.insert("io".to_string(), Type::Io);
+
+        // Add built-in Request object type
+        let mut request_fields = HashMap::new();
+        request_fields.insert("method".to_string(), Type::Str);
+        request_fields.insert("path".to_string(), Type::Str);
+        // Represent query and headers as strings (parsed, human-readable)
+        request_fields.insert("query".to_string(), Type::Str);
+        request_fields.insert("headers".to_string(), Type::Str);
+        request_fields.insert("body".to_string(), Type::Option(Box::new(Type::Str)));
+        self.pctx
+            .types
+            .insert("Request".to_string(), Custype::Object(request_fields));
+
         while !self.is_at_end() {
             prgm.push(self.parse_statement()?);
         }
@@ -438,8 +1514,7 @@ impl Parser {
                     &Type::Option(Box::new(old.clone()))
                 } else {
                     return Err(format!(
-                        "Mismatched return types in function: {:?} vs {:?}",
-                        old, ret_type,
+                        "Mismatched return types in function: {old:?} vs {ret_type:?}"
                     ));
                 }
             } else {
@@ -449,21 +1524,171 @@ impl Parser {
             self.match_kind(TokenKind::Semicolon);
             Ok(Instruction::Return(expr))
         } else if self.match_kind(TokenKind::For) {
-            let start = self.parse_statement()?;
-            let cond = self.expression()?;
-            self.consume(Semicolon, "Expected semicolon after condition")?;
-            let step = self.parse_statement()?;
-            let block = self.parse_statement()?;
+            let iterator = if let TokenKind::Identifier(name) = self.peek().kind.clone() {
+                self.advance();
+                name
+            } else {
+                return Err(format!(
+                    "Expected a loop variable after 'for', found {}",
+                    self.peek().kind
+                ));
+            };
+
+            self.consume(
+                TokenKind::In,
+                "Expected keyword 'in' in for loop declaration",
+            )?;
+
+            let range_expr = self.expression()?;
+            match get_type_of_expr(&range_expr, &self.pctx)? {
+                Type::RangeBuilder => {}
+                Type::List(_) => {
+                    return Err("For loops iterate over io.range(...) builders".to_string());
+                }
+                other => {
+                    return Err(format!(
+                        "Incorrect type in for loop range expression: expected io.range(...), found {other:?}"
+                    ));
+                }
+            }
+
+            // Loop variable is numeric; register for type checking before parsing body
+            self.pctx.var_types.insert(iterator.clone(), Type::Num);
+
+            let body_stmt = self.parse_statement()?;
+
             Ok(Instruction::For {
-                init: Box::new(start),
-                condition: cond,
-                step: Box::new(step),
-                body: vec![block],
+                iterator,
+                range: range_expr,
+                body: vec![body_stmt],
+            })
+        } else if self.match_kind(TokenKind::Use) {
+            let TokenKind::Identifier(modname) = self.peek().kind else {
+                return Err("Expected module name after 'use'".to_string());
+            };
+            self.advance();
+            self.consume(TokenKind::Colon, "Expected ':' after 'use'")?;
+
+            let TokenKind::Str(modfile) = self.peek().kind else {
+                return Err("Expected module file after ':' in use statement".to_string());
+            };
+            // Load and parse the module file, but DO NOT execute it.
+            let module_src_path = format!("./deps/{modfile}/lib.qx");
+            let module_src = match std::fs::read_to_string(&module_src_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error importing module {modfile}: {e}");
+                    std::process::exit(70);
+                }
+            };
+
+            // Tokenize and parse the module in isolation
+            let mod_tokens = tokenize(module_src.chars().collect());
+            if mod_tokens
+                .iter()
+                .any(|t| matches!(t.kind, TokenKind::Error(_, _)))
+            {
+                for t in mod_tokens {
+                    if let TokenKind::Error(_, _) = t.kind {
+                        t.print();
+                    }
+                }
+                return Err(format!("Failed to tokenize module: {modfile}"));
+            }
+
+            let mut mod_parser = Parser::new(mod_tokens);
+            let parsed = mod_parser
+                .parse_program()
+                .map_err(|e| format!("Failed to parse module {modfile}: {e}"))?;
+
+            // Build an export surface: only functions and constant variables.
+            let mut minfo = ModuleInfo::default();
+
+            for instr in parsed {
+                match instr {
+                    Instruction::FunctionDef {
+                        name,
+                        params,
+                        return_type,
+                        body,
+                    } => {
+                        // Record function signature in field types
+                        minfo.field_types.insert(
+                            name.clone(),
+                            Type::Function(params.clone(), Box::new(return_type.clone())),
+                        );
+                        // Save full function for codegen; DO NOT execute
+                        minfo.functions.insert(
+                            name.clone(),
+                            ModuleFunction {
+                                name,
+                                params,
+                                return_type,
+                                body,
+                            },
+                        );
+                    }
+                    Instruction::Let {
+                        name,
+                        value,
+                        type_hint,
+                    } => {
+                        // Only allow literal constants to avoid executing code
+                        let is_literal = matches!(
+                            value,
+                            Expr::Literal(Value::Num(_))
+                                | Expr::Literal(Value::Str(_))
+                                | Expr::Literal(Value::Bool(_))
+                                | Expr::Literal(Value::Nil)
+                        );
+                        if !is_literal {
+                            // Skip non-literal variables; they would require execution to evaluate
+                            continue;
+                        }
+                        // Determine type: prefer explicit type hint, else infer using module parser's context
+                        let vtype = if type_hint != Type::Nil {
+                            type_hint
+                        } else {
+                            get_type_of_expr(&value, &mod_parser.pctx).unwrap_or(Type::Nil)
+                        };
+                        minfo.field_types.insert(name.clone(), vtype);
+                        minfo.constants.insert(name, value);
+                    }
+                    _ => {
+                        // Ignore any other statements in modules
+                    }
+                }
+            }
+
+            // Prevent name collisions with existing variables/types
+            if self.pctx.var_types.contains_key(&modname) || self.pctx.types.contains_key(&modname)
+            {
+                return Err(format!(
+                    "Name '{}' already in use; cannot import module with this name",
+                    modname
+                ));
+            }
+
+            // Expose the module as a typed object on the global context for type checking
+            self.pctx.modules.insert(modname.clone(), minfo.clone());
+            self.pctx.var_types.insert(
+                modname.clone(),
+                Type::Custom(Custype::Object(minfo.field_types.clone())),
+            );
+
+            Ok(Instruction::Use {
+                module_name: modname,
+                mod_path: modfile,
             })
         } else if self.match_kind(TokenKind::Maybe) {
-            let prev_inside = self.inside_maybe;
-            self.inside_maybe = true;
+            let prev_inside = &self.inside_maybe.clone();
             let maybe = self.expression()?;
+            self.inside_maybe = if let Expr::Variable(ref v) = maybe {
+                Some(v.clone())
+            } else {
+                panic!();
+            };
+
             let block = self.parse_statement()?;
             let mut once_else = None;
             if self.match_kind(TokenKind::Else) {
@@ -471,7 +1696,7 @@ impl Parser {
             }
             let peekd = self.peek().line;
 
-            self.inside_maybe = prev_inside;
+            self.inside_maybe = prev_inside.clone();
             Ok(Instruction::Maybe(maybe, Box::new(block), once_else))
         } else if self.match_kind(TokenKind::LBrace) {
             // Static type scope for block: save outer types
@@ -491,13 +1716,17 @@ impl Parser {
             // Static type checking for print expression
             let _expr_type = get_type_of_expr(&expr, &self.pctx)?;
 
-            if !self.inside_maybe {
+            if let Some(var_name) = &self.inside_maybe {
                 match _expr_type {
                     Type::Nil | Type::Option(_) => {
-                        return Err(
+                        if let Expr::Variable(ref vname) = expr {
+                            if vname != var_name {
+                                return Err(
                             "Cannot use a value that might be nil outside of a `maybe` block."
                                 .into(),
                         );
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -532,48 +1761,46 @@ impl Parser {
                     )
                     .as_str(),
                 )?;
-                let act_typ = match self.peek().kind {
-                    Identifier(r) => match r.as_str() {
-                        "Str" => Type::Str,
-                        "Num" => Type::Num,
-                        "Bool" => Type::Bool,
-                        l => {
-                            let Some(a) = self.pctx.types.get(l) else {
-                                return Err(format!("Couldn't find type {l}"));
-                            };
-                            Type::Custom(a.clone())
-                        }
-                    },
-                    LBrack => {
-                        self.advance();
-                        let ret = match self.peek().kind {
-                            Identifier(r) => Type::List(Box::new(match r.as_str() {
-                                "Str" => Type::Str,
-                                "Num" => Type::Num,
-                                "Bool" => Type::Bool,
-                                l => {
-                                    let Some(a) = self.pctx.types.get(l) else {
-                                        return Err(format!("Couldn't find type {l}"));
-                                    };
-                                    Type::Custom(a.clone())
-                                }
-                            })),
-                            _ => Type::Nil,
-                        };
-                        self.advance();
-                        self.consume(TokenKind::RBrack, "Expected ] after type for list type")?;
-                        ret
-                    }
-                    l => return Err(format!("Expected valid type, found {l}")),
-                };
+                let act_typ = self.parse_type()?;
 
                 fields.insert(field, act_typ);
                 self.advance();
                 let _ = self.consume(Comma, "msg");
             }
 
-            self.pctx.types.insert(obj_name, fields);
+            self.pctx.types.insert(obj_name, Custype::Object(fields));
 
+            Ok(Instruction::Nothing)
+        } else if self.match_kind(TokenKind::Enum) {
+            let TokenKind::Identifier(ename) = self.peek().kind else {
+                return Err(format!(
+                    "Expected identifier for enum name, found {}",
+                    self.peek().kind
+                ));
+            };
+            self.advance();
+            self.consume(TokenKind::LBrace, "Expected '{' after enum name")?;
+            let mut variants = vec![];
+            while !self.match_kind(TokenKind::RBrace) {
+                let TokenKind::Identifier(variant_name) = self.peek().kind else {
+                    return Err(format!(
+                        "Expected identifier for enum variant, found {}",
+                        self.peek().kind
+                    ));
+                };
+                self.advance();
+                self.consume(
+                    TokenKind::Comma,
+                    format!(
+                        "Expected Comma after enum variant, found {}",
+                        self.peek().value
+                    )
+                    .as_str(),
+                )?;
+                variants.push(variant_name);
+            }
+            self.pctx.types.insert(ename, Custype::Enum(variants));
+            println!("{:?}", self.peek());
             Ok(Instruction::Nothing)
         } else if self.match_kind(TokenKind::Fun) {
             if self.is_at_end() {
@@ -591,86 +1818,9 @@ impl Parser {
             };
             self.advance();
             self.consume(LParen, "Expected '(' after function name")?;
-            let mut params = vec![];
-            while !self.is_at_end() && self.peek().kind != RParen {
-                let param_name = if let Identifier(i) = self.peek().kind {
-                    i
-                } else {
-                    return Err(format!(
-                        "[line {}] Expected parameter name after '(', got {}",
-                        self.peek().line,
-                        self.peek().value
-                    ));
-                };
-                self.advance();
-                self.consume(Colon, {
-                    if self.peek().kind == Comma {
-                        return Err(format!(
-                            "Function parameters must have types, try: {}: Str or {}: Num",
-                            param_name, param_name,
-                        ));
-                    } else {
-                        "Expected ':' after param name"
-                    }
-                })?;
-                let Identifier(typ) = self.peek().kind else {
-                    return Err(format!(
-                        "Expected tpe after ':', found {}",
-                        self.peek().kind
-                    ));
-                };
-                // consume the type token so we don't re-enter the loop on it
-                self.advance();
-                if self.peek().kind == Comma {
-                    self.advance();
-                }
-                params.push((param_name, typ));
-            }
-            self.advance();
 
-            // Insert parameter types into context for static type checking within function body
-            let mut new_params = vec![];
-            for (param_name, param_type_str) in &params {
-                let param_type = match param_type_str.as_str() {
-                    "Num" => Type::Num,
-                    "Str" => Type::Str,
-                    "Bool" => Type::Bool,
-                    _ => Type::Nil,
-                };
-                new_params.push((param_name.clone(), param_type.clone()));
-                self.pctx
-                    .var_types
-                    .insert(param_name.clone(), param_type.clone());
-            }
+            let (params, fn_ret_type, block) = self.parse_fn_params_body()?;
 
-            // Reset return type inference and flags for this new function
-            self.current_return_type = None;
-            self.saw_non_nil_return = false;
-            self.saw_nil_return = false;
-
-            let block = self.parse_statement()?;
-
-            // Compute function return type:
-            // - Mixed nil and non-nil ⇒ Option(inner)
-            // - Only non-nil ⇒ inner
-            // - No non-nil ⇒ Nil
-            let fn_ret_type = if self.saw_non_nil_return && self.saw_nil_return {
-                // Mixed returns: Option of inner non-nil type
-                match self.current_return_type.clone() {
-                    Some(Type::Option(inner)) => Type::Option(inner),
-                    Some(inner) if inner != Type::Nil => Type::Option(Box::new(inner)),
-                    _ => Type::Nil,
-                }
-            } else if self.saw_non_nil_return {
-                // Only non-nil returns: return that type
-                match self.current_return_type.clone() {
-                    Some(inner) if inner != Type::Nil => inner,
-                    _ => Type::Nil,
-                }
-            } else {
-                // No non-nil returns ⇒ always nil
-                Type::Nil
-            };
             // Store the function's type signature for strong typing on calls
             self.pctx.var_types.insert(
                 fun_name.clone(),
@@ -679,7 +1829,7 @@ impl Parser {
             Ok(Instruction::FunctionDef {
                 body: vec![block],
                 name: fun_name,
-                params: new_params,
+                params: params,
                 return_type: fn_ret_type,
             })
         } else if self.match_kind(TokenKind::If) {
@@ -726,6 +1876,9 @@ impl Parser {
                     break; // no more chaining after a plain else
                 }
             }
+            if get_type_of_expr(&condition, &self.pctx)? != Type::Bool {
+                return Err("If conditions must be booleans".to_string());
+            }
             Ok(Instruction::If {
                 condition,
                 then: vec![then_block_stmt],
@@ -754,7 +1907,7 @@ impl Parser {
                 self.advance();
                 n
             } else {
-                return Err("Expected a variable name after 'var'".into());
+                return Err("Expected a variable name after 'let'".into());
             };
             self.consume(TokenKind::Equal, "Expected = after variable name")?;
             let expr = self.expression()?;
@@ -795,50 +1948,86 @@ impl Parser {
                 value: expr,
                 type_hint: expr_type,
             })
-        } else if matches!(self.peek().kind, TokenKind::Identifier(_))
-            && self
-                .tokens
-                .get(self.current + 1)
-                .map(|t| matches!(t.kind, TokenKind::Equal))
-                .unwrap_or(false)
-        {
-            // Assignment statement: <name> = <expr>;
-            let name = if let TokenKind::Identifier(n) = self.peek().kind.clone() {
-                n
-            } else {
-                unreachable!();
-            };
-            self.advance(); // consume identifier
-            self.advance(); // consume '='
-            let expr = self.expression()?;
-            // Static type checking
-            let expr_type = get_type_of_expr(&expr, &self.pctx)?;
-            if let Some(existing) = self.pctx.var_types.get(&name) {
-                if *existing != expr_type && *existing != Type::Nil {
-                    return Err(format!(
-                        "Cannot assign to variable '{}' with different type. Previous: {:?}, New: {:?}",
-                        name, existing, expr_type,
-                    ));
-                }
-            } else {
-                return Err(format!("Variable '{}' used before declaration", name));
-            }
-            if let Some(existing) = self.pctx.var_types.get(&name) {
-                if *existing == Type::Nil {
-                    self.pctx.var_types.insert(name.clone(), expr_type.clone());
-                }
-            }
-            self.match_kind(TokenKind::Semicolon);
-            Ok(Instruction::Assign(name, expr, Some(expr_type)))
         } else {
-            // expression statement
+            // expression statement or assignment with complex left-hand side
             let expr: Expr = self.expression()?;
+
+            if self.match_kind(TokenKind::Equal) {
+                if !valid_left_hand(&expr) {
+                    return Err("Invalid assignment target".to_string());
+                }
+                let value_expr = self.expression()?;
+                let value_type = get_type_of_expr(&value_expr, &self.pctx)?;
+
+                // Perform type enforcement based on left-hand side kind
+                let types_compatible = |expected: &Type, value: &Type| -> bool {
+                    if expected == value {
+                        true
+                    } else if let Type::Option(inner) = expected {
+                        **inner == value.clone() || matches!(value, Type::Nil)
+                    } else {
+                        false
+                    }
+                };
+
+                match &expr {
+                    Expr::Variable(name) => {
+                        if let Some(existing) = self.pctx.var_types.get(name) {
+                            if !types_compatible(existing, &value_type) && *existing != Type::Nil {
+                                return Err(format!(
+                                    "Cannot assign to variable '{}' with different type. Previous: {:?}, New: {:?}",
+                                    name, existing, value_type,
+                                ));
+                            }
+                        } else {
+                            return Err(format!("Variable '{}' used before declaration", name));
+                        }
+                        if let Some(existing) = self.pctx.var_types.get(name) {
+                            if *existing == Type::Nil {
+                                self.pctx.var_types.insert(name.clone(), value_type.clone());
+                            }
+                        }
+                    }
+                    _ => {
+                        let target_type = get_type_of_expr(&expr, &self.pctx)?;
+                        if !types_compatible(&target_type, &value_type) {
+                            return Err(format!(
+                                "Assignment type mismatch: expected {:?}, got {:?}",
+                                target_type, value_type
+                            ));
+                        }
+                    }
+                }
+
+                self.match_kind(TokenKind::Semicolon);
+                return Ok(Instruction::Assign(expr, value_expr, Some(value_type)));
+            }
+
             let expr_type = get_type_of_expr(&expr, &self.pctx)?;
-            if !self.inside_maybe {
+            if self.inside_maybe.is_none() {
                 if let Type::Option(_) = expr_type {
                     return Err(
                         "Cannot use a value that might be nil outside of a `maybe` block.".into(),
                     );
+                }
+            }
+            // If this is a first insert into an Obj (Kv(Nil)), adopt the inserted value's type
+            if let Expr::Call(callee, args) = &expr {
+                if let Expr::Get(obj, method) = &**callee {
+                    if method == "insert" && args.len() == 2 {
+                        if let Expr::Variable(var_name) = &**obj {
+                            if let Some(Type::Kv(inner)) =
+                                self.pctx.var_types.get(var_name).cloned()
+                            {
+                                if *inner == Type::Nil {
+                                    let val_ty = get_type_of_expr(&args[1], &self.pctx)?;
+                                    self.pctx
+                                        .var_types
+                                        .insert(var_name.clone(), Type::Kv(Box::new(val_ty)));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             self.match_kind(TokenKind::Semicolon);
@@ -846,9 +2035,143 @@ impl Parser {
         }
     }
 
+    fn parse_type(&mut self) -> Result<Type, String> {
+        match self.peek().kind {
+            LBrack => {
+                self.advance();
+                let inside = self.parse_type()?;
+
+                self.consume(TokenKind::RBrack, "Expected ] after type for list type")?;
+                Ok(Type::List(Box::new(inside)))
+            }
+            TokenKind::Identifier(ident) => {
+                let st = match ident.as_str() {
+                    "Str" => Some(Type::Str),
+                    "Bool" => Some(Type::Bool),
+                    "Num" => Some(Type::Num),
+                    "Obj" => None,
+                    l => {
+                        if let Some(t) = self.pctx.types.get(l) {
+                            Some(Type::Custom(t.clone()))
+                        } else {
+                            return Err(format!("Type not found"));
+                        }
+                    }
+                };
+                self.advance();
+                let mut typarams = vec![];
+
+                if self.match_kind(TokenKind::LParen) {
+                    while !self.match_kind(RParen) {
+                        typarams.push(self.parse_type()?);
+                    }
+                }
+                match st {
+                    Some(r) => Ok(r),
+                    None => match ident.as_str() {
+                        "Obj" => Ok(Type::Kv(Box::new(typarams[0].clone()))),
+                        _ => return Err(format!("Type parameters not required for {ident}")),
+                    },
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
     // ───── recursive-descent grammar ─────
     fn expression(&mut self) -> Result<Expr, String> {
         self.equality()
+    }
+
+    fn parse_fn_params_body(&mut self) -> Result<(Vec<(String, Type)>, Type, Instruction), String> {
+        let mut params = vec![];
+        while !self.is_at_end() && self.peek().kind != RParen {
+            let param_name = if let Identifier(i) = self.peek().kind {
+                i
+            } else {
+                return Err(format!(
+                    "[line {}] Expected parameter name after '(', got {}",
+                    self.peek().line,
+                    self.peek().value
+                ));
+            };
+            self.advance();
+            self.consume(Colon, {
+                if self.peek().kind == Comma {
+                    return Err(format!(
+                        "Function parameters must have types, try: {}: Str or {}: Num",
+                        param_name, param_name,
+                    ));
+                } else {
+                    "Expected ':' after param name"
+                }
+            })?;
+            let Identifier(typ) = self.peek().kind else {
+                return Err(format!(
+                    "Expected tpe after ':', found {}",
+                    self.peek().kind
+                ));
+            };
+            // consume the type token so we don't re-enter the loop on it
+            self.advance();
+            if self.peek().kind == Comma {
+                self.advance();
+            }
+            params.push((param_name, typ));
+        }
+        self.advance();
+
+        // Insert parameter types into context for static type checking within function body
+        let mut new_params = vec![];
+        for (param_name, param_type_str) in &params {
+            let param_type = match param_type_str.as_str() {
+                "Num" => Type::Num,
+                "Str" => Type::Str,
+                "Bool" => Type::Bool,
+                custom_type => {
+                    // Check if it's a custom type (like Request)
+                    if let Some(type_def) = self.pctx.types.get(custom_type) {
+                        Type::Custom(type_def.clone())
+                    } else {
+                        Type::Nil
+                    }
+                }
+            };
+            new_params.push((param_name.clone(), param_type.clone()));
+            self.pctx
+                .var_types
+                .insert(param_name.clone(), param_type.clone());
+        }
+
+        // Reset return type inference and flags for this new function
+        self.current_return_type = None;
+        self.saw_non_nil_return = false;
+        self.saw_nil_return = false;
+
+        let block = self.parse_statement()?;
+
+        // Compute function return type:
+        // - Mixed nil and non-nil ⇒ Option(inner)
+        // - Only non-nil ⇒ inner
+        // - No non-nil ⇒ Nil
+        let fn_ret_type = if self.saw_non_nil_return && self.saw_nil_return {
+            // Mixed returns: Option of inner non-nil type
+            match self.current_return_type.clone() {
+                Some(Type::Option(inner)) => Type::Option(inner),
+                Some(inner) if inner != Type::Nil => Type::Option(Box::new(inner)),
+                _ => Type::Nil,
+            }
+        } else if self.saw_non_nil_return {
+            // Only non-nil returns: return that type
+            match self.current_return_type.clone() {
+                Some(inner) if inner != Type::Nil => inner,
+                _ => Type::Nil,
+            }
+        } else {
+            // No non-nil returns ⇒ always nil
+            Type::Nil
+        };
+        Ok((new_params, fn_ret_type, block))
     }
 
     fn equality(&mut self) -> Result<Expr, String> {
@@ -928,7 +2251,69 @@ impl Parser {
             let right = self.unary()?;
             return Ok(Expr::Unary(op, Box::new(right)));
         }
-        self.primary()
+        // Parse any postfix chain (calls, indexing, property access)
+        self.postfix()
+    }
+
+    // Parse a primary expression and then any number of postfix operators:
+    // - property access: .ident
+    // - indexing: [expr]
+    // - calls: (args, ...)
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut expr = self.primary()?;
+        loop {
+            if self.match_kind(TokenKind::Dot) {
+                if let TokenKind::Identifier(name) = &self.peek().kind {
+                    let prop = name.clone();
+                    self.advance();
+                    expr = Expr::Get(Box::new(expr), prop);
+                } else {
+                    return Err(format!(
+                        "Expected identifier after '.', found {}",
+                        self.peek().kind
+                    ));
+                }
+            } else if self.match_kind(TokenKind::LBrack) {
+                let index_pr = self.expression()?;
+                self.consume(RBrack, "Expected ']' after list index")?;
+                expr = Expr::Index(Box::new(expr), Box::new(index_pr));
+            } else if self.match_kind(TokenKind::LParen) {
+                let mut args = Vec::new();
+                while !self.check(&TokenKind::RParen) {
+                    args.push(self.expression()?);
+                    if !self.match_kind(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.consume(TokenKind::RParen, "Expected ')' after arguments.")?;
+
+                // If calling a direct variable function, keep existing type checks
+                if let Expr::Variable(ref name) = expr {
+                    if let Some(Type::Function(f, _)) = self.pctx.var_types.get(name).cloned() {
+                        if f.len() != args.len() {
+                            return Err(format!(
+                                "Function parameters incorrect, expected {} found {}",
+                                f.len(),
+                                args.len(),
+                            ));
+                        }
+                        for (i, arg) in args.iter().enumerate() {
+                            let ty = get_type_of_expr(arg, &self.pctx)?;
+                            let (_, te) = &f[i];
+                            if *te != ty {
+                                return Err(format!(
+                                    "Function parameters incorrect, expected {te:?} found {ty:?}",
+                                ));
+                            }
+                        }
+                    }
+                }
+                expr = Expr::Call(Box::new(expr), args);
+            } else {
+                break;
+            }
+        }
+        Ok(expr)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -946,10 +2331,12 @@ impl Parser {
 
         if let TokenKind::Num(n) = pekd.kind {
             self.advance();
-            return Ok(Expr::Literal(Value::Num(n)));
+            let expr = Expr::Literal(Value::Num(n));
+            return Ok(expr);
         } else if let TokenKind::Str(o) = &pekd.kind {
             self.advance();
-            return Ok(Expr::Literal(Value::Str(o.into())));
+            let expr = Expr::Literal(Value::Str(o.into()));
+            return Ok(expr);
         } else if let TokenKind::Identifier(i) = &pekd.kind {
             self.advance();
 
@@ -973,15 +2360,16 @@ impl Parser {
                     vals.insert(key, expr);
                 }
                 self.consume(TokenKind::RBrace, "Expected '}' after object literal")?;
-                if let Some(r) = self.pctx.types.get(i) {
+                if let Some(Custype::Object(r)) = self.pctx.types.get(i) {
                     let mut all_fields_present = true;
                     for (name, typ) in r.iter() {
                         if let Some(r_val) = vals.get(name) {
                             let real_type = get_type_of_expr(r_val, &self.pctx)?;
+
+                            println!("Typ: {typ:?}, Real: {real_type:?}");
                             if real_type != *typ {
                                 return Err(format!(
-                                    "Expected {} to be type {:?}, got {:?}",
-                                    name, typ, real_type
+                                    "Expected {name} to be type {typ:?}, got {real_type:?}",
                                 ));
                             }
                         } else {
@@ -990,109 +2378,21 @@ impl Parser {
                         }
                     }
                     if !all_fields_present {
-                        return Err(format!("{} object requires more fields", i));
+                        return Err(format!("{i} object requires more fields"));
                     }
                 }
                 return Ok(Expr::Object(i.clone(), vals));
             }
             // start with a variable reference
-            let mut expr = Expr::Variable(i.clone());
-            // handle chained field access: foo.bar.baz
-            while self.match_kind(TokenKind::Dot) {
-                if let TokenKind::Identifier(name) = &self.peek().kind {
-                    let prop = name.clone();
-                    self.advance();
-                    expr = Expr::Get(Box::new(expr), prop);
-                } else {
-                    return Err(format!(
-                        "Expected identifier after '.', found {}",
-                        self.peek().kind
-                    ));
-                }
-            }
-            if self.match_kind(TokenKind::LBrack) {
-                let indexpr = self.expression()?;
-                self.consume(RBrack, "Expected ']' after list index")?;
-                return Ok(Expr::Index(Box::new(expr), Box::new(indexpr)));
-            }
-
-            if self.match_kind(TokenKind::LParen) {
-                let mut args = Vec::new();
-                while !self.check(&TokenKind::RParen) {
-                    args.push(self.expression()?);
-                    if !self.match_kind(TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.consume(TokenKind::RParen, "Expected ')' after arguments.")?;
-                if let Some(Type::Function(f, _)) = self.pctx.var_types.get(i).cloned() {
-                    if f.len() != args.len() {
-                        return Err(format!(
-                            "Function parameters incorrect, expected {} found {}",
-                            f.len(),
-                            args.len(),
-                        ));
-                    }
-                }
-                for arg in &args {
-                    let ty = get_type_of_expr(arg, &self.pctx)?;
-                    if let Some(Type::Function(f, _)) = self.pctx.var_types.get(i).cloned() {
-                        for (_, t) in f {
-                            let te = match t.as_str() {
-                                "Str" => Type::Str,
-                                "Num" => Type::Num,
-                                "Bool" => Type::Bool,
-                                _ => Type::Nil,
-                            };
-                            if te != ty {
-                                return Err(format!(
-                                    "Function parameters incorrect, expected {} found {:?}",
-                                    t, ty,
-                                ));
-                            }
-                        }
-                    }
-                }
-                expr = Expr::Call(Box::new(expr), args);
-            }
+            let expr = Expr::Variable(i.clone());
+            // Continue in calling code (postfix) to allow chaining
             return Ok(expr);
         }
 
         if self.match_kind(TokenKind::LParen) {
             // parse grouped expression
-            let mut expr = self.expression()?;
+            let expr = self.expression()?;
             self.consume(TokenKind::RParen, "Expect ')' after expression.")?;
-            // allow property access, indexing, and calls on grouped expressions
-            loop {
-                if self.match_kind(TokenKind::Dot) {
-                    if let TokenKind::Identifier(name) = &self.peek().kind {
-                        let prop = name.clone();
-                        self.advance();
-                        expr = Expr::Get(Box::new(expr), prop);
-                    } else {
-                        return Err(format!(
-                            "Expected identifier after '.', found {}",
-                            self.peek().kind
-                        ));
-                    }
-                } else if self.match_kind(TokenKind::LBrack) {
-                    let index_pr = self.expression()?;
-                    self.consume(RBrack, "Expected ']' after list index")?;
-                    expr = Expr::Index(Box::new(expr), Box::new(index_pr));
-                } else if self.match_kind(TokenKind::LParen) {
-                    let mut args = Vec::new();
-                    while !self.check(&TokenKind::RParen) {
-                        args.push(self.expression()?);
-                        if !self.match_kind(TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                    self.consume(TokenKind::RParen, "Expected ')' after arguments.")?;
-                    expr = Expr::Call(Box::new(expr), args);
-                } else {
-                    break;
-                }
-            }
             return Ok(expr);
         }
 
@@ -1120,31 +2420,14 @@ impl Parser {
                     break;
                 }
             }
-            // allow property access on lists, e.g., list.len
-            let mut expr = Expr::List(items);
-            while self.match_kind(TokenKind::Dot) {
-                if let TokenKind::Identifier(name) = &self.peek().kind {
-                    self.advance();
-                    expr = Expr::Get(Box::new(expr), name.clone());
-                } else {
-                    return Err(format!(
-                        "Expected property name after '.', found {}",
-                        self.peek().kind
-                    ));
-                }
-            }
-            if self.match_kind(TokenKind::LParen) {
-                let mut args = Vec::new();
-                while !self.check(&TokenKind::RParen) {
-                    args.push(self.expression()?);
-                    if !self.match_kind(TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.consume(TokenKind::RParen, "Expected ')' after arguments.")?;
-                expr = Expr::Call(Box::new(expr), args);
-            }
+            let expr = Expr::List(items);
             return Ok(expr);
+        }
+
+        if self.match_kind(TokenKind::Fun) {
+            self.consume(TokenKind::LParen, "Expected '(' after keyword fun")?;
+            let (params, ret_type, body) = self.parse_fn_params_body()?;
+            return Ok(Expr::Function(params, ret_type, Box::new(body)));
         }
 
         Err(format!(
@@ -1196,12 +2479,11 @@ impl Parser {
         if self.current < self.tokens.len() {
             self.tokens[self.current].clone()
         } else {
-            let wow = Token {
+            Token {
                 kind: Eof,
                 value: "".into(),
                 line: self.previous().line,
-            };
-            wow
+            }
         }
     }
     fn previous(&self) -> &Token {
@@ -1239,6 +2521,7 @@ impl Display for TokenKind {
             Self::Identifier(_) => "IDENTIFIER",
             Self::And => "AND",
             Self::Object => "OBJECT",
+            Self::Enum => "ENUM",
             Self::Maybe => "MAYBE",
             Self::Else => "ELSE",
             Self::False => "FALSE",
@@ -1254,7 +2537,9 @@ impl Display for TokenKind {
             Self::This => "THIS",
             Self::True => "TRUE",
             Self::Let => "LET",
+            Self::In => "IN",
             Self::While => "WHILE",
+            Self::Use => "USE",
             Self::Eof => "EOF",
             Self::Error(line, error) => &format!("[line {line}] Error: {error}"),
         };
@@ -1283,13 +2568,15 @@ fn get_special_ident(val: String) -> TokenKind {
     match val.as_str() {
         "and" => And,
         "object" => Object,
+        "enum" => Enum,
         "maybe" => Maybe,
         "else" => Else,
         "false" => False,
         "for" => For,
+        "in" => In,
         "fun" => Fun,
         "if" => If,
-        "nil" => Nil,
+        "none" => Nil,
         "or" => Or,
         "print" => Print,
         "reprint" => Reprint,
@@ -1299,6 +2586,7 @@ fn get_special_ident(val: String) -> TokenKind {
         "true" => True,
         "let" => Let,
         "while" => While,
+        "use" => Use,
         _ => Identifier(val),
     }
 }
@@ -1307,78 +2595,184 @@ fn is_identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+fn returns_on_all_paths(block: Vec<Instruction>) -> bool {
+    for inst in block {
+        match inst {
+            Instruction::Return(_) => return true,
+            Instruction::Block(l) => {
+                if returns_on_all_paths(l) {
+                    return true;
+                } else {
+                    continue;
+                }
+            }
+            Instruction::If {
+                condition: _,
+                then,
+                elses,
+            } => {
+                let cert = returns_on_all_paths(then) && else_certifies(&elses); // recursive helper; never uses unwrap_or(Nothing)
+
+                if cert {
+                    return true;
+                } else {
+                    continue;
+                }
+            }
+            Instruction::Maybe(thing, body, elses) => {
+                let cert = returns_on_all_paths(vec![*body]) && else_certifies(&elses); // recursive helper; never uses unwrap_or(Nothing)
+
+                if cert {
+                    return true;
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+    }
+    false
+}
+
+fn valid_left_hand(left: &Expr) -> bool {
+    match left {
+        Expr::Get(ex, _) => valid_left_hand(ex),
+        Expr::Variable(_) => true,
+        Expr::Index(l, _) => valid_left_hand(l),
+        _ => false,
+    }
+}
+
+fn else_certifies(elses: &Option<Box<Instruction>>) -> bool {
+    match elses {
+        None => false, // no else branch => not guaranteed
+
+        Some(b) => match &**b {
+            Instruction::Block(inner) => {
+                // final else { ... }
+                returns_on_all_paths(inner.clone())
+            }
+
+            Instruction::If { then, elses, .. } => {
+                // OLD (too strict):
+                // returns_on_all_paths(then.clone()) && else_certifies(elses)
+
+                // NEW (treat elses: None as a final else):
+                if elses.is_none() {
+                    returns_on_all_paths(then.clone()) // acts like a final else-block
+                } else {
+                    returns_on_all_paths(then.clone()) && else_certifies(elses)
+                }
+            }
+
+            Instruction::Return(_) => {
+                // else { return ... }
+                true
+            }
+
+            _ => false, // any other shape, play it safe
+        },
+    }
+}
+
 fn main() {
     let args: Vec<std::string::String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} tokenize <filename>", args[0]);
+    if args.len() < 2 {
+        eprintln!("Usage: {} <filename>", args[0]);
         return;
     }
 
-    let command = &args[1];
-    let filename = &args[2];
+    let filename = &args[1];
 
-    match command.as_str() {
-        "run" => {
-            let file_contents = fs::read_to_string(filename).unwrap_or_else(|_| {
-                eprintln!("Failed to read file {}", filename);
-                std::string::String::new()
-            });
-            let tokens = tokenize(file_contents.chars().collect());
-            // Lexical error check
-            if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
-                for t in tokens {
-                    if let Error(_, _) = t.kind {
-                        t.print();
-                    }
-                }
-                std::process::exit(65);
-            }
-            let mut parser = Parser::new(tokens);
-            match parser.parse_program() {
-                Ok(p) => {
-                    let context = context::Context::create();
-                    let module = context.create_module("sum");
-                    let execution_engine = module
-                        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-                        .unwrap();
-                    let codegen = Compiler {
-                        context: &context,
-                        module,
-                        builder: context.create_builder(),
-                        execution_engine,
-                        instructions: p,
-                        vars: RefCell::new(HashMap::new()),
-                        var_types: RefCell::new(HashMap::new()),
-                        pctx: RefCell::new(parser.pctx),
-                    };
-
-                    // seed the C PRNG so io.random() varies each run
-                    unsafe {
-                        // get current epoch seconds
-                        let now = time(ptr::null_mut());
-                        srand(now as u32);
-                    }
-
-                    let sum = codegen
-                        .run_code()
-                        .ok_or("Unable to JIT compile code")
-                        .unwrap();
-
-                    unsafe {
-                        println!("Result: {}", sum.call());
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(65);
-                }
+    let file_contents = std::fs::read_to_string(filename).unwrap_or_else(|_| {
+        eprintln!("Failed to read file {filename}");
+        std::string::String::new()
+    });
+    let tokens = tokenize(file_contents.chars().collect());
+    // Lexical error check
+    if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
+        for t in tokens {
+            if let Error(_, _) = t.kind {
+                t.print();
             }
         }
-        _ => {
-            eprintln!("Unknown command: {}", command);
+        std::process::exit(65);
+    }
+    let mut parser = Parser::new(tokens);
+    match parser.parse_program() {
+        Ok(p) => {
+            for ins in p.clone() {
+                if let Instruction::FunctionDef {
+                    name,
+                    params: _,
+                    return_type: _,
+                    body,
+                } = ins
+                {
+                    if !returns_on_all_paths(body) {
+                        eprintln!(
+                            "Body of function '{name}' does not return a value every time. Try adding `return none` at the end of the function"
+                        );
+                        std::process::exit(70);
+                    }
+                }
+            }
+            let context = context::Context::create();
+            let module = context.create_module("sum");
+            let execution_engine = module
+                .create_jit_execution_engine(OptimizationLevel::Aggressive)
+                .unwrap();
+            let codegen = Compiler {
+                context: &context,
+                module,
+                builder: context.create_builder(),
+                execution_engine,
+                instructions: p,
+                vars: RefCell::new(HashMap::new()),
+                var_types: RefCell::new(HashMap::new()),
+                pctx: RefCell::new(parser.pctx),
+                current_module: RefCell::new(None),
+            };
+
+            // seed the C PRNG so io.random() varies each run
+            unsafe {
+                // get current epoch seconds
+                let now = time(ptr::null_mut());
+                srand(now as u32);
+            }
+
+            let sum = codegen
+                .run_code()
+                .ok_or("Unable to JIT compile code")
+                .unwrap();
+
+            unsafe {
+                let res = sum.call();
+                if res != 0.0 {
+                    std::process::exit(res as i32);
+                }
+            }
+
+            // If an HTTP server was started, keep the process alive.
+            // Wait briefly for the server to transition to running if needed.
+            let mut waited = 0u32;
+
+            while !SERVER_RUNNING.load(Ordering::Relaxed) && waited < 1 {
+                std::thread::sleep(Duration::from_millis(1));
+                waited += 1;
+            }
+            if SERVER_RUNNING.load(Ordering::Relaxed) {
+                // Park the main thread indefinitely. Ctrl+C will terminate the process.
+                std::thread::park();
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(65);
         }
     }
 }
+
 type SumFunc = unsafe extern "C" fn() -> f64;
 struct Compiler<'ctx> {
     context: &'ctx context::Context,
@@ -1389,6 +2783,8 @@ struct Compiler<'ctx> {
     vars: RefCell<HashMap<String, PointerValue<'ctx>>>,
     var_types: RefCell<HashMap<String, BasicTypeEnum<'ctx>>>,
     pctx: RefCell<PreCtx>,
+    // Active module namespace during module function compilation
+    current_module: RefCell<Option<String>>,
 }
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
@@ -1402,6 +2798,32 @@ impl<'ctx> Compiler<'ctx> {
         })
     }
 
+    fn qtype_to_llvm<'a>(&'a self, t: &Type) -> BasicTypeEnum<'a> {
+        match t {
+            Type::Num => self.context.f64_type().as_basic_type_enum(),
+            Type::Bool => self.context.bool_type().as_basic_type_enum(),
+            Type::Str
+            | Type::Custom(_)
+            | Type::WebReturn
+            | Type::Io
+            | Type::RangeBuilder
+            | Type::Kv(_)
+            | Type::List(_)
+            | Type::Option(_) => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
+            Type::Nil => self.context.f64_type().as_basic_type_enum(),
+            Type::Function(_, _) => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .as_basic_type_enum(),
+        }
+    }
+
+    // Module functions are compiled in run_code by synthesizing namespaced
+    // Instruction::FunctionDef entries and feeding them through compile_instruction.
+
     fn run_code(&self) -> Option<JitFunction<'_, SumFunc>> {
         let f64_type = self.context.f64_type();
         // Match SumFunc signature: three u64 parameters
@@ -1410,6 +2832,29 @@ impl<'ctx> Compiler<'ctx> {
         // Entry block and position builder
         let entry_bb = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry_bb);
+        // Compile module functions into the LLVM module first (no execution).
+        {
+            let modules: Vec<(String, ModuleInfo)> = self
+                .pctx
+                .borrow()
+                .modules
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (modname, minfo) in modules {
+                for (_fname, fdef) in minfo.functions {
+                    let instr = Instruction::FunctionDef {
+                        name: format!("{}__{}", modname, fdef.name),
+                        params: fdef.params.clone(),
+                        return_type: fdef.return_type.clone(),
+                        body: fdef.body.clone(),
+                    };
+                    *self.current_module.borrow_mut() = Some(modname.clone());
+                    self.compile_instruction(main_fn, &instr).unwrap();
+                    *self.current_module.borrow_mut() = None;
+                }
+            }
+        }
         // 1) Compile all function definitions first
         for instr in &self.instructions {
             if let Instruction::FunctionDef { .. } = instr {
@@ -1438,6 +2883,9 @@ impl<'ctx> Compiler<'ctx> {
         let strcmp_fn = self.get_or_create_strcmp();
         self.execution_engine
             .add_global_mapping(&strcmp_fn, strcmp as usize);
+        let strncmp_fn = self.get_or_create_strncmp();
+        self.execution_engine
+            .add_global_mapping(&strncmp_fn, strncmp as usize);
         let printf_fn = self.get_or_create_printf();
         self.execution_engine
             .add_global_mapping(&printf_fn, printf as usize);
@@ -1453,6 +2901,15 @@ impl<'ctx> Compiler<'ctx> {
         let strlen_fn = self.get_or_create_strlen();
         self.execution_engine
             .add_global_mapping(&strlen_fn, strlen as usize);
+        let realloc_fn = self.get_or_create_realloc();
+        self.execution_engine
+            .add_global_mapping(&realloc_fn, realloc as usize);
+        let atoi_fn = self.get_or_create_atoi();
+        self.execution_engine
+            .add_global_mapping(&atoi_fn, atoi as usize);
+        let strstr_fn = self.get_or_create_strstr();
+        self.execution_engine
+            .add_global_mapping(&strstr_fn, strstr as usize);
         let sprintf_fn = self.get_or_create_sprintf();
         self.execution_engine
             .add_global_mapping(&sprintf_fn, sprintf as usize);
@@ -1476,6 +2933,103 @@ impl<'ctx> Compiler<'ctx> {
         self.execution_engine
             .add_global_mapping(&get_stdin_fn, get_stdin as usize);
 
+        let qs_lst_cb = self.get_or_create_qs_listen_with_callback();
+        self.execution_engine
+            .add_global_mapping(&qs_lst_cb, qs_listen_with_callback as usize);
+
+        // Map Request object functions
+        let create_req = self.get_or_create_create_request_object();
+        self.execution_engine
+            .add_global_mapping(&create_req, create_request_object as usize);
+        let get_method = self.get_or_create_get_request_method();
+        self.execution_engine
+            .add_global_mapping(&get_method, get_request_method as usize);
+        let get_path = self.get_or_create_get_request_path();
+        self.execution_engine
+            .add_global_mapping(&get_path, get_request_path as usize);
+        // Additional Request getters
+        let get_body = self.get_or_create_get_request_body();
+        self.execution_engine
+            .add_global_mapping(&get_body, get_request_body as usize);
+        let get_query = self.get_or_create_get_request_query();
+        self.execution_engine
+            .add_global_mapping(&get_query, get_request_query as usize);
+        let get_headers = self.get_or_create_get_request_headers();
+        self.execution_engine
+            .add_global_mapping(&get_headers, get_request_headers as usize);
+
+        // Map Web helper functions
+        let web_helper = self.get_or_create_web_helper();
+        self.execution_engine
+            .add_global_mapping(&web_helper, create_web_helper as usize);
+        let range_builder = self.get_or_create_range_builder();
+        self.execution_engine
+            .add_global_mapping(&range_builder, create_range_builder as usize);
+        let create_range_builder_to = self.get_or_create_range_builder_to();
+        self.execution_engine
+            .add_global_mapping(&create_range_builder_to, range_builder_to as usize);
+        self.execution_engine
+            .add_global_mapping(&range_builder, create_range_builder as usize);
+        let create_range_builder_from = self.get_or_create_range_builder_from();
+        self.execution_engine
+            .add_global_mapping(&create_range_builder_from, range_builder_from as usize);
+
+        let create_range_builder_step = self.get_or_create_range_builder_step();
+        self.execution_engine
+            .add_global_mapping(&create_range_builder_step, range_builder_step as usize);
+
+        let range_get_from = self.get_or_create_range_builder_get_from();
+        self.execution_engine
+            .add_global_mapping(&range_get_from, range_builder_get_from as usize);
+        let range_get_to = self.get_or_create_range_builder_get_to();
+        self.execution_engine
+            .add_global_mapping(&range_get_to, range_builder_get_to as usize);
+        let range_get_step = self.get_or_create_range_builder_get_step();
+        self.execution_engine
+            .add_global_mapping(&range_get_step, range_builder_get_step as usize);
+
+        let io_read = self.get_or_create_io_read_file();
+        self.execution_engine
+            .add_global_mapping(&io_read, io_read_file as usize);
+
+        let io_write = self.get_or_create_io_write_file();
+        self.execution_engine
+            .add_global_mapping(&io_write, io_write_file as usize);
+        let web_text_fn = self.get_or_create_web_text();
+        self.execution_engine
+            .add_global_mapping(&web_text_fn, web_text as usize);
+        let web_page_fn = self.get_or_create_web_page();
+        self.execution_engine
+            .add_global_mapping(&web_page_fn, web_page as usize);
+        // Map web.file correctly (was incorrectly mapped to web_page symbol)
+        let web_file_fn = self.get_or_create_web_file();
+        self.execution_engine
+            .add_global_mapping(&web_file_fn, web_file as usize);
+        // Map web.json
+        let web_json_fn = self.get_or_create_web_json();
+        self.execution_engine
+            .add_global_mapping(&web_json_fn, web_json as usize);
+        let web_error_text_fn = self.get_or_create_web_error_text();
+        self.execution_engine
+            .add_global_mapping(&web_error_text_fn, web_error_text as usize);
+        let web_error_page_fn = self.get_or_create_web_error_page();
+        self.execution_engine
+            .add_global_mapping(&web_error_page_fn, web_error_page as usize);
+        let web_redirect_fn = self.get_or_create_web_redirect();
+        self.execution_engine
+            .add_global_mapping(&web_redirect_fn, web_redirect as usize);
+
+        // Map Obj (Kv) functions
+        let obj_new_fn = self.get_or_create_qs_obj_new();
+        self.execution_engine
+            .add_global_mapping(&obj_new_fn, qs_obj_new as usize);
+        let obj_insert_fn = self.get_or_create_qs_obj_insert_str();
+        self.execution_engine
+            .add_global_mapping(&obj_insert_fn, qs_obj_insert_str as usize);
+        let obj_get_fn = self.get_or_create_qs_obj_get_str();
+        self.execution_engine
+            .add_global_mapping(&obj_get_fn, qs_obj_get_str as usize);
+
         // Retrieve the JIT'd function
         unsafe { self.execution_engine.get_function("main").ok() }
     }
@@ -1497,7 +3051,7 @@ impl<'ctx> Compiler<'ctx> {
                 let cont_bb = self.context.append_basic_block(function, "cont");
                 // Build branch on condition
                 let BasicValueEnum::IntValue(cond_val) = self.compile_expr(condition)? else {
-                    panic!()
+                    panic!("{condition:?}")
                 };
                 self.builder
                     .build_conditional_branch(cond_val, then_bb, else_bb)?;
@@ -1573,18 +3127,69 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(())
             }
             Instruction::For {
-                init,
-                condition,
-                step,
+                iterator,
+                range,
                 body,
             } => {
+                let range_val = self.compile_expr(range)?;
+                let range_ptr = match range_val {
+                    BasicValueEnum::PointerValue(p) => p,
+                    other => {
+                        panic!("Range builder expression did not compile to a pointer: {other:?}")
+                    }
+                };
+
+                let get_from = self.get_or_create_range_builder_get_from();
+                let get_to = self.get_or_create_range_builder_get_to();
+                let get_step = self.get_or_create_range_builder_get_step();
+
+                let from_f = self
+                    .builder
+                    .build_call(get_from, &[range_ptr.into()], "range_from")?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_float_value();
+                let to_f = self
+                    .builder
+                    .build_call(get_to, &[range_ptr.into()], "range_to")?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_float_value();
+                let step_f = self
+                    .builder
+                    .build_call(get_step, &[range_ptr.into()], "range_step")?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_float_value();
+
+                let f64_ty = self.context.f64_type();
+
+                // Allocate loop variable in entry block
+                let entry = function.get_first_basic_block().unwrap();
+                let temp_builder = self.context.create_builder();
+                match entry.get_first_instruction() {
+                    Some(inst) => temp_builder.position_before(&inst),
+                    None => temp_builder.position_at_end(entry),
+                }
+                let iter_alloca = temp_builder
+                    .build_alloca(f64_ty.as_basic_type_enum(), iterator.as_str())
+                    .unwrap();
+                self.vars.borrow_mut().insert(iterator.clone(), iter_alloca);
+                self.var_types
+                    .borrow_mut()
+                    .insert(iterator.clone(), f64_ty.as_basic_type_enum());
+
+                // Initialize iterator
+                self.builder.build_store(iter_alloca, from_f)?;
+
                 let cond_bb = self.context.append_basic_block(function, "for.cond");
                 let body_bb = self.context.append_basic_block(function, "for.body");
                 let step_bb = self.context.append_basic_block(function, "for.step");
                 let cont_bb = self.context.append_basic_block(function, "for.cont");
 
-                // init
-                self.compile_instruction(function, init)?;
                 if self
                     .builder
                     .get_insert_block()
@@ -1595,13 +3200,61 @@ impl<'ctx> Compiler<'ctx> {
                     self.builder.build_unconditional_branch(cond_bb)?;
                 }
 
-                // condition
+                // condition block
                 self.builder.position_at_end(cond_bb);
-                let cond_val = self.compile_expr(condition)?.into_int_value();
-                self.builder
-                    .build_conditional_branch(cond_val, body_bb, cont_bb)?;
+                let current_val = self
+                    .builder
+                    .build_load(f64_ty, iter_alloca, "for_iter")?
+                    .into_float_value();
+                let zero = f64_ty.const_float(0.0);
+                let step_positive = self.builder.build_float_compare(
+                    FloatPredicate::OGT,
+                    step_f,
+                    zero,
+                    "step_pos",
+                )?;
+                let step_negative = self.builder.build_float_compare(
+                    FloatPredicate::OLT,
+                    step_f,
+                    zero,
+                    "step_neg",
+                )?;
+                let cond_pos = self.builder.build_float_compare(
+                    FloatPredicate::OLT,
+                    current_val,
+                    to_f,
+                    "for_lt",
+                )?;
+                let cond_neg = self.builder.build_float_compare(
+                    FloatPredicate::OGT,
+                    current_val,
+                    to_f,
+                    "for_gt",
+                )?;
 
-                // body
+                let bool_ty = self.context.bool_type();
+                let cond_neg_or_zero = self
+                    .builder
+                    .build_select(
+                        step_negative,
+                        cond_neg.as_basic_value_enum(),
+                        bool_ty.const_zero().as_basic_value_enum(),
+                        "cond_neg_or_zero",
+                    )?
+                    .into_int_value();
+                let cond = self
+                    .builder
+                    .build_select(
+                        step_positive,
+                        cond_pos.as_basic_value_enum(),
+                        cond_neg_or_zero.as_basic_value_enum(),
+                        "for_cond_sel",
+                    )?
+                    .into_int_value();
+                self.builder
+                    .build_conditional_branch(cond, body_bb, cont_bb)?;
+
+                // body block
                 self.builder.position_at_end(body_bb);
                 for stmt in body {
                     self.compile_instruction(function, stmt)?;
@@ -1616,42 +3269,190 @@ impl<'ctx> Compiler<'ctx> {
                     self.builder.build_unconditional_branch(step_bb)?;
                 }
 
-                // step
+                // step block
                 self.builder.position_at_end(step_bb);
-                self.compile_instruction(function, step)?;
-                if self
+                let iter_val = self
                     .builder
-                    .get_insert_block()
-                    .unwrap()
-                    .get_terminator()
-                    .is_none()
-                {
-                    self.builder.build_unconditional_branch(cond_bb)?;
-                }
+                    .build_load(f64_ty, iter_alloca, "for_iter_step")?
+                    .into_float_value();
+                let next_val = self
+                    .builder
+                    .build_float_add(iter_val, step_f, "for_iter_next")?;
+                self.builder.build_store(iter_alloca, next_val)?;
+                self.builder.build_unconditional_branch(cond_bb)?;
 
                 // continuation
                 self.builder.position_at_end(cont_bb);
                 Ok(())
             }
-            Instruction::Assign(name, new_val, _typ) => {
-                // Check if this is a string concatenation assignment (var = var + something)
-                if let Expr::Binary(left_expr, BinOp::Plus, right_expr) = new_val {
-                    if let Expr::Variable(var_name) = left_expr.as_ref() {
-                        if var_name == name {
-                            // This is var = var + something, use optimized append
-                            return self.compile_safe_string_append(name, right_expr);
+            Instruction::Assign(target, new_val, _typ) => {
+                match target {
+                    Expr::Variable(name) => {
+                        // Optimization: var = var + something
+                        if let Expr::Binary(left_expr, BinOp::Plus, right_expr) = new_val {
+                            if let Expr::Variable(var_name) = left_expr.as_ref() {
+                                if var_name == name {
+                                    return self.compile_safe_string_append(name, right_expr);
+                                }
+                            }
                         }
-                    }
-                }
 
-                // Regular assignment
-                let new_c = self.compile_expr(new_val)?;
-                let binding = self.vars.borrow();
-                let ptr = binding
-                    .get(name)
-                    .unwrap_or_else(|| panic!("Variable not found: {name}"));
-                self.builder.build_store(*ptr, new_c)?;
-                Ok(())
+                        let new_c = self.compile_expr(new_val)?;
+                        let binding = self.vars.borrow();
+                        let ptr = binding
+                            .get(name)
+                            .unwrap_or_else(|| panic!("Variable not found: {name}"));
+                        self.builder.build_store(*ptr, new_c)?;
+                        Ok(())
+                    }
+                    Expr::Get(obj_expr, prop) => {
+                        let obj_val = self.compile_expr(obj_expr)?;
+                        let obj_ptr = match obj_val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!("Property assignment on non-pointer value: {other:?}"),
+                        };
+
+                        let var_name = if let Expr::Variable(name) = &**obj_expr {
+                            name
+                        } else {
+                            panic!("Property assignment requires variable receiver");
+                        };
+
+                        let binding = self.pctx.borrow();
+                        let Type::Custom(custom_type) = binding
+                            .var_types
+                            .get(var_name)
+                            .unwrap_or_else(|| panic!("Unknown type for object {var_name}"))
+                            .clone()
+                        else {
+                            panic!("Property assignment supported only on custom objects");
+                        };
+
+                        let type_name = binding
+                            .types
+                            .iter()
+                            .find(|(_, def)| def == &&custom_type)
+                            .map(|(k, _)| k.clone())
+                            .unwrap();
+                        let Custype::Object(field_defs) = &binding.types[&type_name] else {
+                            panic!("Expected object type");
+                        };
+                        let field_index = field_defs
+                            .keys()
+                            .position(|k| k == prop)
+                            .unwrap_or_else(|| panic!("Unknown property {prop} on {type_name}"))
+                            as u64;
+
+                        drop(binding);
+
+                        let idx_const = self.context.i64_type().const_int(field_index, false);
+                        let field_ptr = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(
+                                    self.context.i64_type(),
+                                    obj_ptr,
+                                    &[idx_const],
+                                    &format!("store_{}", prop),
+                                )?
+                        };
+
+                        let value = self.compile_expr(new_val)?;
+                        let field_type = get_type_of_expr(&Expr::Get(obj_expr.clone(), prop.clone()), &self.pctx.borrow())
+                            .unwrap();
+                        match field_type.unwrap() {
+                            Type::Num => {
+                                let val = match value {
+                                    BasicValueEnum::FloatValue(f) => f,
+                                    BasicValueEnum::IntValue(i) => self.builder.build_signed_int_to_float(
+                                        i,
+                                        self.context.f64_type(),
+                                        "prop_num_cast",
+                                    )?,
+                                    other => panic!("Cannot assign non-number {other:?} to numeric field"),
+                                };
+                                self.builder.build_store(field_ptr, val)?;
+                            }
+                            Type::Str | Type::List(_) | Type::Custom(_) => {
+                                let ptr_val = match value {
+                                    BasicValueEnum::PointerValue(p) => p,
+                                    other => panic!("Expected pointer value for property {prop}, got {other:?}"),
+                                };
+                                self.builder.build_store(field_ptr, ptr_val)?;
+                            }
+                            Type::Bool => {
+                                let bool_val = match value {
+                                    BasicValueEnum::IntValue(i) => i,
+                                    other => panic!("Expected boolean value for property {prop}, got {other:?}"),
+                                };
+                                self.builder.build_store(field_ptr, bool_val)?;
+                            }
+                            other => panic!("Unsupported property assignment type: {other:?}"),
+                        }
+                        Ok(())
+                    }
+                    Expr::Index(list_expr, idx_expr) => {
+                        let list_val = self.compile_expr(list_expr)?;
+                        let list_ptr = match list_val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!("Index assignment on non-pointer value: {other:?}"),
+                        };
+
+                        let index_val = self.compile_expr(idx_expr)?;
+                        let i64_ty = self.context.i64_type();
+                        let idx_i64 = match index_val {
+                            BasicValueEnum::IntValue(i) => i,
+                            BasicValueEnum::FloatValue(f) => self.builder.build_float_to_signed_int(
+                                f,
+                                i64_ty,
+                                "index_cast",
+                            )?,
+                            other => panic!("Index must be numeric, got {other:?}"),
+                        };
+
+                        let list_type = get_type_of_expr(list_expr, &self.pctx.borrow())
+                            .unwrap_or_else(|e| panic!("{e}"));
+                        let Type::List(inner) = list_type else {
+                            panic!("Index assignment only supported on lists");
+                        };
+
+                        let one = i64_ty.const_int(1, false);
+                        let idx_with_offset = self.builder.build_int_add(idx_i64, one, "idx_plus1")?;
+                        let elem_ptr = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                self.context.f64_type(),
+                                list_ptr,
+                                &[idx_with_offset],
+                                "list_store",
+                            )?
+                        };
+
+                        let value = self.compile_expr(new_val)?;
+                        match inner.unwrap() {
+                            Type::Num => {
+                                let val = match value {
+                                    BasicValueEnum::FloatValue(f) => f,
+                                    BasicValueEnum::IntValue(i) => self.builder.build_signed_int_to_float(
+                                        i,
+                                        self.context.f64_type(),
+                                        "list_num_cast",
+                                    )?,
+                                    other => panic!("Cannot assign {other:?} to numeric list element"),
+                                };
+                                self.builder.build_store(elem_ptr, val)?;
+                            }
+                            Type::Str => {
+                                let ptr_val = match value {
+                                    BasicValueEnum::PointerValue(p) => p,
+                                    other => panic!("Cannot assign non-pointer {other:?} to string list element"),
+                                };
+                                self.builder.build_store(elem_ptr, ptr_val)?;
+                            }
+                            other => panic!("List assignment not supported for inner type {other:?}"),
+                        }
+                        Ok(())
+                    }
+                    other => panic!("Unsupported assignment target: {other:?}"),
+                }
             }
             // in your compile_instruction:
             Instruction::Println(expr) => {
@@ -1683,7 +3484,8 @@ impl<'ctx> Compiler<'ctx> {
                             "printf_int",
                         )?;
                     }
-                    _ => unreachable!(),
+
+                    l => panic!("{l}"),
                 }
                 Ok(())
             }
@@ -1693,6 +3495,10 @@ impl<'ctx> Compiler<'ctx> {
                 return_type,
                 body,
             } => {
+                // Save current variable scopes to avoid leaking anon-fn parameters into caller
+                let saved_vars = self.vars.borrow().clone();
+                let saved_var_types = self.var_types.borrow().clone();
+
                 // Build LLVM function signature based on parameter and return types
                 // Map QuickLang types to LLVM types
                 let llvm_ret_type = match return_type {
@@ -1703,6 +3509,14 @@ impl<'ctx> Compiler<'ctx> {
                         .ptr_type(AddressSpace::default())
                         .as_basic_type_enum(),
                     Type::Nil => BasicTypeEnum::FloatType(self.context.f64_type()),
+                    Type::Custom(_) => self
+                        .context
+                        .ptr_type(AddressSpace::default())
+                        .as_basic_type_enum(),
+                    Type::WebReturn => self
+                        .context
+                        .ptr_type(AddressSpace::default())
+                        .as_basic_type_enum(),
                     other => unimplemented!("Return type {:?} not supported", other),
                 };
 
@@ -1715,12 +3529,19 @@ impl<'ctx> Compiler<'ctx> {
                             .context
                             .ptr_type(AddressSpace::default())
                             .as_basic_type_enum(),
+                        Type::Custom(_) => self
+                            .context
+                            .ptr_type(AddressSpace::default())
+                            .as_basic_type_enum(),
+
                         other => unimplemented!("Parameter type {:?} not supported", other),
                     })
                     .collect();
 
-                let param_metadata_types: Vec<BasicMetadataTypeEnum> =
-                    param_llvm_types.iter().map(|&t| t.into()).collect();
+                // Inkwell expects parameter types as BasicMetadataTypeEnum when building
+                // function types; convert from BasicTypeEnum accordingly.
+                let param_metadata_types: Vec<inkwell::types::BasicMetadataTypeEnum> =
+                    param_llvm_types.iter().map(|t| (*t).into()).collect();
 
                 // Create the function type (void vs non-void)
                 // Build the LLVM function type based on the return type variant
@@ -1774,6 +3595,10 @@ impl<'ctx> Compiler<'ctx> {
                             .context
                             .ptr_type(AddressSpace::default())
                             .as_basic_type_enum(),
+                        Type::Custom(_) => self
+                            .context
+                            .ptr_type(AddressSpace::default())
+                            .as_basic_type_enum(),
                         Type::Nil => self.context.f64_type().as_basic_type_enum(),
                         other => unimplemented!("Parameter type {:?} not supported", other),
                     };
@@ -1810,6 +3635,10 @@ impl<'ctx> Compiler<'ctx> {
                     let zero = self.context.f64_type().const_float(0.0);
                     self.builder.build_return(Some(&zero))?;
                 }
+
+                // Restore previous variable scopes
+                *self.vars.borrow_mut() = saved_vars;
+                *self.var_types.borrow_mut() = saved_var_types;
                 Ok(())
             }
             Instruction::Maybe(maybe, block, otherwise) => {
@@ -1829,9 +3658,21 @@ impl<'ctx> Compiler<'ctx> {
                         self.builder
                             .build_float_compare(FloatPredicate::ONE, iv, zero, "neq_nil")
                     }
-                    _ => panic!("Unsupported type in maybe"),
-                }
-                .unwrap();
+                    BasicValueEnum::IntValue(i) => {
+                        let zero = self.context.f64_type().const_float(0.0);
+                        self.builder.build_float_compare(
+                            FloatPredicate::ONE,
+                            self.builder.build_signed_int_to_float(
+                                i,
+                                self.context.f64_type(),
+                                "int_to_float",
+                            )?,
+                            zero,
+                            "neq_nil",
+                        )
+                    }
+                    _ => panic!("Unsupported type in maybe: {val}"),
+                }?;
                 // Blocks for then, else, and continuation
                 let then_block = self.context.append_basic_block(function, "then");
                 let else_block = self.context.append_basic_block(function, "else");
@@ -1911,6 +3752,10 @@ impl<'ctx> Compiler<'ctx> {
                 self.builder.position_at_end(cont_bb);
                 Ok(())
             }
+            Instruction::Use {
+                module_name,
+                mod_path,
+            } => Ok(()),
             Instruction::Nothing => Ok(()),
             l => unimplemented!("{:#?}", l),
         }
@@ -2009,8 +3854,10 @@ impl<'ctx> Compiler<'ctx> {
         if let Some(f) = self.module.get_function("free") {
             f
         } else {
-            let i8ptr = self.context.ptr_type(AddressSpace::default());
-            let fn_type = self.context.i32_type().fn_type(&[i8ptr.into()], true);
+            // Correct C signature: void free(void*)
+            let void_ty = self.context.void_type();
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = void_ty.fn_type(&[void_ptr.into()], false);
             self.module.add_function("free", fn_type, None)
         }
     }
@@ -2020,9 +3867,11 @@ impl<'ctx> Compiler<'ctx> {
                 let ptr = *self.vars.borrow().get(var_name).unwrap();
                 let ty = *self.var_types.borrow().get(var_name).unwrap();
                 let loaded = self.builder.build_load(ty, ptr, var_name)?;
-                Ok(loaded)
+                 Ok(loaded)
             }
-            // Handle io.random() as a call: io.random() → random integer < 1_000_000
+
+
+            // Handle io.random() as a call: io.ran"dom() → random integer < 1
             Expr::Call(callee, args)
                 if args.is_empty()
                     && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "random") =>
@@ -2052,7 +3901,341 @@ impl<'ctx> Compiler<'ctx> {
                 let result = self
                     .builder
                     .build_float_div(raw_f64, rand_max, "rand_div")?;
-                Ok(result.as_basic_value_enum())
+                return Ok(result.as_basic_value_enum());
+            }
+
+            // io.listen(port: Num, callback: Function)
+            Expr::Call(callee, args)
+                if (args.len() == 2)
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "listen") =>
+            {
+                let port_f = self.compile_expr(&args[0])?.into_float_value();
+                let i32t = self.context.i32_type();
+                let port_i = self
+                    .builder
+                    .build_float_to_signed_int(port_f, i32t, "port_i")?;
+
+                // New two-argument version with callback
+                let callback_ptr = match &args[1] {
+                    Expr::Variable(fname) => {
+                        let bo = self.pctx.borrow();
+                        let func_na = bo.var_types.get(fname);
+                        match func_na {
+                            Some(f) => match f {
+                                Type::Function(params, ret) if **ret == Type::WebReturn => {
+                                    // Enforce a single Request parameter to match server callback ABI
+                                    if params.len() != 1 {
+                                        eprintln!(
+                                            "io.listen callback must take exactly one parameter (req). Update your handler to 'fun(req: Request) {{ ... }}'."
+                                        );
+                                        std::process::exit(70);
+                                    }
+                                            let mut request_fields = HashMap::new();
+        request_fields.insert("method".to_string(), Type::Str);
+        request_fields.insert("path".to_string(), Type::Str);
+        // Represent query and headers as strings (parsed, human-readable)
+        request_fields.insert("query".to_string(), Type::Str);
+        request_fields.insert("headers".to_string(), Type::Str);
+        request_fields.insert("body".to_string(), Type::Option(Box::new(Type::Str)));
+                                                            if params[0].1 != Type::Custom(Custype::Object(request_fields)) {
+                                          eprintln!(
+                                "Type error: io.listen callback must take exactly one parameter (req). Found {:?} Update your handler to 'fun(req: Request) {{ ... }}'.", params[0].1
+                            );
+                            std::process::exit(70);
+                        }
+                                }
+                                Type::WebReturn => {}
+                                l => {
+                                    eprintln!(
+                                        "Expected handler function for io.listen to return a web return, found {l:?}"
+                                    );
+                                    std::process::exit(70);
+                                }
+                            },
+                            None => {
+                                if let Err(e) = get_type_of_expr(&args[1], &self.pctx.borrow()) {
+                                    eprintln!("{e}");
+                                    std::process::exit(70);
+                                }
+                            }
+                        }
+
+                        if let Some(func) = self.module.get_function(fname) {
+                            let fn_ptr_val = func.as_global_value().as_pointer_value();
+                            self.builder.build_pointer_cast(
+                                fn_ptr_val,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "fn_ptr_cast",
+                            )?
+                        } else {
+                            self.compile_expr(&args[1])?.into_pointer_value()
+                        }
+                    }
+                    // Inline function passed directly: enforce it returns WebReturn
+                    Expr::Function(params, ret_ty, _body) => {
+                        if *ret_ty != Type::WebReturn {
+                            eprintln!(
+                                "io.listen callback must return a web response (e.g., io.web().text(...)). Add an explicit 'return ...' in the handler."
+                            );
+                            std::process::exit(70);
+                        }
+                        if params.len() != 1 {
+                            eprintln!(
+                                "io.listen callback must take exactly one parameter (req). Update your handler to 'fun(req) {{ ... }}'."
+                            );
+                            std::process::exit(70);
+                        }
+                                let mut request_fields = HashMap::new();
+        request_fields.insert("method".to_string(), Type::Str);
+        request_fields.insert("path".to_string(), Type::Str);
+        // Represent query and headers as strings (parsed, human-readable)
+        request_fields.insert("query".to_string(), Type::Str);
+        request_fields.insert("headers".to_string(), Type::Str);
+        request_fields.insert("body".to_string(), Type::Option(Box::new(Type::Str)));
+                         if params[0].1 != Type::Custom(Custype::Object(request_fields)) {
+                                          eprintln!(
+                                "Type error: io.listen callback must take exactly one parameter (req). Found {:?} Update your handler to 'fun(req: Request) {{ ... }}'.", params[0].1
+                            );
+                            std::process::exit(70);
+                        }
+                        self.compile_expr(&args[1])?.into_pointer_value()
+                    }
+                    _ => self.compile_expr(&args[1])?.into_pointer_value(),
+                };
+
+                let listen_cb = self.get_or_create_qs_listen_with_callback();
+                self.builder.build_call(
+                    listen_cb,
+                    &[port_i.into(), callback_ptr.into()],
+                    "qs_listen_cb_call",
+                )?;
+
+                return Ok(self
+                    .context
+                    .f64_type()
+                    .const_float(0.0)
+                    .as_basic_value_enum());
+            }
+            // io.web() - returns a web helper object
+            Expr::Call(callee, args)
+                if args.is_empty()
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "web") =>
+            {
+                let web_helper_fn = self.get_or_create_web_helper();
+                let web_obj = self
+                    .builder
+                    .build_call(web_helper_fn, &[], "web_helper_call")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                return Ok(web_obj);
+            }
+            // io.read(filename: Str) - reads file content as string (async by default)
+            Expr::Call(callee, args)
+                if args.len() == 1
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "read") =>
+            {
+                let filename_ptr = self.compile_expr(&args[0])?.into_pointer_value();
+                let read_file_fn = self.get_or_create_io_read_file();
+                let result = self
+                    .builder
+                    .build_call(read_file_fn, &[filename_ptr.into()], "io_read_call")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                return Ok(result);
+            }
+            // io.write(filename: Str, content: Str) - writes content to file (async by default)
+            Expr::Call(callee, args)
+                if args.len() == 2
+                    && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "write") =>
+            {
+                let filename_ptr = self.compile_expr(&args[0])?.into_pointer_value();
+                let content_ptr = self.compile_expr(&args[1])?.into_pointer_value();
+                let write_file_fn = self.get_or_create_io_write_file();
+                let result = self
+                    .builder
+                    .build_call(
+                        write_file_fn,
+                        &[filename_ptr.into(), content_ptr.into()],
+                        "io_write_call",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                return Ok(result);
+            }
+            // web.text(content: Str), web.page(content: Str), web.file(name: Str), web.json(content: Str)
+            // Guard by receiver type (web helper), not just method name
+            Expr::Call(callee, args)
+                if args.len() == 1
+                    && matches!(&**callee, Expr::Get(obj, method) if {
+                        if let Ok(Type::Custom(Custype::Object(fields))) =
+                            get_type_of_expr(obj, &self.pctx.borrow())
+                        {
+                            match method.as_str() {
+                                "text" => matches!(fields.get("text"), Some(Type::Function(params, ret))
+                                    if params == &vec![("content".into(), Type::Str)] && **ret == Type::WebReturn),
+                                "page" => matches!(fields.get("page"), Some(Type::Function(params, ret))
+                                    if params == &vec![("content".into(), Type::Str)] && **ret == Type::WebReturn),
+                                "file" => matches!(fields.get("file"), Some(Type::Function(params, ret))
+                                    if params == &vec![("name".into(), Type::Str)] && **ret == Type::WebReturn),
+                                "json" => matches!(fields.get("json"), Some(Type::Function(params, ret))
+                                    if params == &vec![("content".into(), Type::Str)] && **ret == Type::WebReturn),
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        }
+                    }) =>
+            {
+                if let Expr::Get(_obj, method) = &**callee {
+                    let arg_ptr = self.compile_expr(&args[0])?.into_pointer_value();
+                    let callee_fn = match method.as_str() {
+                        "text" => Some(self.get_or_create_web_text()),
+                        "page" => Some(self.get_or_create_web_page()),
+                        "file" => Some(self.get_or_create_web_file()),
+                        "json" => Some(self.get_or_create_web_json()),
+                        _ => None,
+                    };
+                    if let Some(f) = callee_fn {
+                        let result = self
+                            .builder
+                            .build_call(f, &[arg_ptr.into()], "web_call")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap();
+                        return Ok(result);
+                    }
+                    unreachable!("guard ensures known method");
+                }
+                unreachable!("guard ensures Expr::Get");
+            }
+
+            // Fallback: allow calling web helper methods by method name when
+            // static type inference doesn't recognize the variable as the web helper.
+            // This prevents panics like: Get(Variable("skib"), "file") when `skib = io.web()`.
+            Expr::Call(callee, args)
+                if args.len() == 1
+                    && matches!(&**callee, Expr::Get(_obj, method) if matches!(method.as_str(), "text" | "page" | "file" | "json")) =>
+            {
+                if let Expr::Get(_obj, method) = &**callee {
+                    let arg_ptr = self.compile_expr(&args[0])?.into_pointer_value();
+                    let callee_fn = match method.as_str() {
+                        "text" => Some(self.get_or_create_web_text()),
+                        "page" => Some(self.get_or_create_web_page()),
+                        "file" => Some(self.get_or_create_web_file()),
+                        "json" => Some(self.get_or_create_web_json()),
+                        _ => None,
+                    };
+                    if let Some(f) = callee_fn {
+                        let result = self
+                            .builder
+                            .build_call(f, &[arg_ptr.into()], "web_call_fallback")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap();
+                        return Ok(result);
+                    } else {
+                        unreachable!("matched known web method name");
+                    }
+                } else {
+                    unreachable!("guard ensures Expr::Get");
+                }
+                // If it's not one of the known methods, let later arms handle it.
+            }
+            // web.redirect(location: Str, permanent: Bool)
+            // Guard by receiver type (web helper), not just method name
+            Expr::Call(callee, args)
+                if args.len() == 2
+                    && matches!(&**callee, Expr::Get(obj, method) if method == "redirect" && {
+                        if let Ok(Type::Custom(Custype::Object(fields))) =
+                            get_type_of_expr(obj, &self.pctx.borrow())
+                        {
+                            matches!(fields.get("redirect"), Some(Type::Function(params, ret))
+                                if params == &vec![("location".into(), Type::Str), ("permanent".into(), Type::Bool)]
+                                    && **ret == Type::WebReturn)
+                        } else {
+                            false
+                        }
+                    }) =>
+            {
+                let location_ptr = self.compile_expr(&args[0])?.into_pointer_value();
+                let permanent_bool = self.compile_expr(&args[1])?.into_int_value();
+                let web_redirect_fn = self.get_or_create_web_redirect();
+                let result = self
+                    .builder
+                    .build_call(
+                        web_redirect_fn,
+                        &[location_ptr.into(), permanent_bool.into()],
+                        "web_redirect_call",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                return Ok(result);
+            }
+            Expr::Call(callee, args)
+                // web.error.text(status: Num, content: Str) and web.error.page(...), web.error.file(status: Num, name: Str)
+                // Guard by receiver type shape, not only method names
+                if args.len() == 2
+                    && matches!(&**callee, Expr::Get(obj, method) if {
+                        if let Expr::Get(inner_obj, prop) = &**obj {
+                            if prop != "error" { false } else {
+                                if let Ok(Type::Custom(Custype::Object(fields))) =
+                                    get_type_of_expr(inner_obj, &self.pctx.borrow())
+                                {
+                                    if let Some(Type::Custom(Custype::Object(efields))) = fields.get("error") {
+                                        match method.as_str() {
+                                            "text" => matches!(efields.get("text"), Some(Type::Function(params, ret))
+                                                if params == &vec![("status".into(), Type::Num), ("content".into(), Type::Str)] && **ret == Type::WebReturn),
+                                            "page" => matches!(efields.get("page"), Some(Type::Function(params, ret))
+                                                if params == &vec![("status".into(), Type::Num), ("content".into(), Type::Str)] && **ret == Type::WebReturn),
+                                            "file" => matches!(efields.get("file"), Some(Type::Function(params, ret))
+                                                if params == &vec![("status".into(), Type::Num), ("name".into(), Type::Str)] && **ret == Type::WebReturn),
+                                            _ => false,
+                                        }
+                                    } else { false }
+                                } else { false }
+                            }
+                        } else { false }
+                    }) =>
+            {
+                if let Expr::Get(_obj, method) = &**callee {
+                    let status_f = self.compile_expr(&args[0])?.into_float_value();
+                    let i32t = self.context.i32_type();
+                    let status_i = self
+                        .builder
+                        .build_float_to_signed_int(status_f, i32t, "status_i")?;
+                    let content_ptr = self.compile_expr(&args[1])?.into_pointer_value();
+                    let web_error_fn = match method.as_str() {
+                        "text" => Some(self.get_or_create_web_error_text()),
+                        "page" => Some(self.get_or_create_web_error_page()),
+                        // "file" could be added here when implemented
+                        _ => None,
+                    };
+                    if let Some(f) = web_error_fn {
+                        let result = self
+                            .builder
+                            .build_call(
+                                f,
+                                &[status_i.into(), content_ptr.into()],
+                                "web_error_call",
+                            )
+                            .unwrap()
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap();
+                        return Ok(result);
+                    }
+                }
+                unreachable!("guard ensures web.error method");
             }
             Expr::Call(callee, args)
                 if args.len() <= 1
@@ -2341,12 +4524,28 @@ impl<'ctx> Compiler<'ctx> {
                     .builder
                     .build_global_string_ptr("nil\0", "nil_literal")
                     .unwrap();
-                Ok(gs.as_pointer_value().as_basic_value_enum())
+                //Ok(gs.as_pointer_value().as_basic_value_enum());
+                Ok(BasicValueEnum::PointerValue(
+                    self.context.ptr_type(AddressSpace::default()).const_null(),
+                ))
             }
             Expr::Binary(left, op, right) => {
                 // Compile both sides
-                let lval = self.compile_expr(left)?;
-                let rval = self.compile_expr(right)?;
+                let lval = match self.compile_expr(left)? {
+                    BasicValueEnum::IntValue(i) => self
+                        .builder
+                        .build_signed_int_to_float(i, self.context.f64_type(), "number_value")?
+                        .as_basic_value_enum(),
+                    o => o,
+                };
+                let rval = match self.compile_expr(right)? {
+                    BasicValueEnum::IntValue(i) => self
+                        .builder
+                        .build_signed_int_to_float(i, self.context.f64_type(), "number_value")?
+                        .as_basic_value_enum(),
+                    o => o,
+                };
+
                 match (lval, rval) {
                     (BasicValueEnum::FloatValue(li), BasicValueEnum::FloatValue(ri)) => {
                         // Integer operations
@@ -2487,10 +4686,7 @@ impl<'ctx> Compiler<'ctx> {
                             }
                         }
                     }
-                    _ => panic!(
-                        "Type mismatch in binary expression: {:?} vs {:?}",
-                        lval, rval
-                    ),
+                    _ => panic!("Type mismatch in binary expression: {lval} vs {rval}",),
                 }
             }
 
@@ -2499,7 +4695,7 @@ impl<'ctx> Compiler<'ctx> {
                 // -string into the module
                 let gs = self
                     .builder
-                    .build_global_string_ptr(&format!("{}\0", s), "str_literal")
+                    .build_global_string_ptr(&format!("{s}\0"), "str_literal")
                     .unwrap();
                 // 2) cast the pointer to an i64
                 Ok(gs.as_basic_value_enum())
@@ -2535,15 +4731,18 @@ impl<'ctx> Compiler<'ctx> {
                     .build_pointer_cast(raw_ptr, slot_ty, "obj_ptr")?;
                 // Store each field at its index based on the declared type order
                 let binding = self.pctx.borrow();
-                let type_fields = binding.types.get(type_name).unwrap();
+                let Custype::Object(type_fields) = binding.types.get(type_name).unwrap() else {
+                    panic!()
+                };
                 for (idx, field_name) in type_fields.keys().enumerate() {
                     let expr = &fields[field_name];
                     let val = self.compile_expr(expr)?;
                     let idx_const = self.context.i64_type().const_int(idx as u64, false);
                     let field_ptr = unsafe {
+                        // Treat each slot as an i64-sized cell for indexing
                         self.builder
                             .build_in_bounds_gep(
-                                slot_ty,
+                                self.context.i64_type(),
                                 obj_ptr,
                                 &[idx_const],
                                 &format!("field_{field_name}"),
@@ -2555,6 +4754,102 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(obj_ptr.as_basic_value_enum())
             }
             Expr::Get(obj_expr, prop) => {
+                // Module constant access: module_name.CONST
+                if let Expr::Variable(var_name) = &**obj_expr {
+                    if let Some(minfo) = self.pctx.borrow().modules.get(var_name) {
+                        if let Some(c_expr) = minfo.constants.get(prop) {
+                            // Compile the constant expression (literal only)
+                            return self.compile_expr(c_expr);
+                        }
+                    }
+                }
+
+                // io.range – create a fresh RangeBuilder
+                if matches!(&**obj_expr, Expr::Variable(name) if name == "io")
+                    && prop == "range"
+                {
+                    let ctor = self.get_or_create_range_builder();
+                    let builder = self
+                        .builder
+                        .build_call(ctor, &[], "create_range_builder")?
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap();
+                    return Ok(builder);
+                }
+
+                // Special case for Request object property access
+                if let Expr::Variable(var_name) = &**obj_expr {
+                    let binding = self.pctx.borrow();
+                    if let Some(Type::Custom(Custype::Object(type_map))) =
+                        binding.var_types.get(var_name)
+                    {
+                        // Check if this is a Request object by looking for Request fields
+                        if type_map.contains_key("method") && type_map.contains_key("path") {
+                            // This is a Request object - use the actual Request object pointer
+                            let request_ptr = self.compile_expr(obj_expr)?.into_pointer_value();
+                            match prop.as_str() {
+                                "method" => {
+                                    let get_method_fn = self.get_or_create_get_request_method();
+                                    let result = self.builder.build_call(
+                                        get_method_fn,
+                                        &[request_ptr.into()],
+                                        "get_method_call",
+                                    )?;
+                                    return Ok(result.try_as_basic_value().left().unwrap());
+                                }
+                                "path" => {
+                                    let get_path_fn = self.get_or_create_get_request_path();
+                                    let result = self.builder.build_call(
+                                        get_path_fn,
+                                        &[request_ptr.into()],
+                                        "get_path_call",
+                                    )?;
+                                    return Ok(result.try_as_basic_value().left().unwrap());
+                                }
+                                "body" => {
+                                    let get_body_fn = self.get_or_create_get_request_body();
+                                    let result = self.builder.build_call(
+                                        get_body_fn,
+                                        &[request_ptr.into()],
+                                        "get_body_call",
+                                    )?;
+                                    return Ok(result.try_as_basic_value().left().unwrap());
+                                }
+                                "query" => {
+                                    let get_query_fn = self.get_or_create_get_request_query();
+                                    let result = self.builder.build_call(
+                                        get_query_fn,
+                                        &[request_ptr.into()],
+                                        "get_query_call",
+                                    )?;
+                                    return Ok(result.try_as_basic_value().left().unwrap());
+                                }
+                                "headers" => {
+                                    let get_headers_fn = self.get_or_create_get_request_headers();
+                                    let result = self.builder.build_call(
+                                        get_headers_fn,
+                                        &[request_ptr.into()],
+                                        "get_headers_call",
+                                    )?;
+                                    return Ok(result.try_as_basic_value().left().unwrap());
+                                }
+                                _ => {
+                                    // Fall through to regular property access
+                                }
+                            }
+                        }
+                        // Check if this is a Web helper object
+                        else if var_name == "web" {
+                            // Return a function pointer for web methods
+                            // This will be handled in Call expressions
+                            let web_ptr = self.compile_expr(obj_expr)?.into_pointer_value();
+                            return Ok(web_ptr.as_basic_value_enum());
+                        }
+                    }
+                }
+
+                // Regular property access for other objects
                 // Compile the base object pointer
                 let base_val = self.compile_expr(obj_expr)?;
                 let obj_ptr = base_val.into_pointer_value();
@@ -2578,7 +4873,9 @@ impl<'ctx> Compiler<'ctx> {
                     .find(|(_, def)| def == &custom_type)
                     .map(|(k, _)| k.clone())
                     .unwrap();
-                let field_defs = &self.pctx.borrow().types[&type_name];
+                let Custype::Object(field_defs) = &self.pctx.borrow().types[&type_name] else {
+                    panic!()
+                };
                 // Find the index of this property
                 let index = field_defs.keys().position(|k| k == prop).unwrap() as u64;
                 let idx_const = self.context.i64_type().const_int(index, false);
@@ -2586,9 +4883,10 @@ impl<'ctx> Compiler<'ctx> {
                 // Compute address and load
                 // Compute the address of the field
                 let field_ptr = unsafe {
+                    // Index by 8-byte slots (i64) for opaque pointer arrays
                     self.builder
                         .build_in_bounds_gep(
-                            slot_ty,
+                            self.context.i64_type(),
                             obj_ptr,
                             &[idx_const],
                             &format!("load_{}", prop),
@@ -2597,16 +4895,19 @@ impl<'ctx> Compiler<'ctx> {
                 };
                 // Determine the field’s QuickLang type
                 let binding = self.pctx.borrow();
-                let field_ty = binding.types[&type_name][prop].clone();
+                let Custype::Object(binding) = binding.types[&type_name].clone() else {
+                    panic!()
+                };
+                let field_ty = binding[prop].clone();
                 // Pick the right LLVM type
-                let elem_basic = match field_ty {
-                    Type::Str => self
+                let elem_basic = match field_ty.unwrap() {
+                    Type::Str | Type::List(_) => self
                         .context
                         .ptr_type(AddressSpace::default())
                         .as_basic_type_enum(),
                     Type::Num => self.context.f64_type().as_basic_type_enum(),
                     Type::Bool => self.context.bool_type().as_basic_type_enum(),
-                    other => panic!("Unsupported field type {:?}", other),
+                    other => panic!("Unsupported field type {other:?}"),
                 };
                 // Load with the correct type
                 let loaded = self
@@ -2616,10 +4917,247 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(loaded)
             }
             Expr::Call(callee, args) => {
+                // Special case: module_name.func(...)
+                if let Expr::Get(obj, method) = &**callee {
+                    if let Expr::Variable(modname) = &**obj {
+                        if self.pctx.borrow().modules.contains_key(modname) {
+                            let compiled_args: Vec<BasicMetadataValueEnum> = args
+                                .iter()
+                                .map(|a| self.compile_expr(a).unwrap().into())
+                                .collect();
+                            let ns = format!("{}__{}", modname, method);
+                            let function = self
+                                .module
+                                .get_function(&ns)
+                                .unwrap_or_else(|| panic!(
+                                    "Undefined module function `{}` in `{}`",
+                                    method, modname
+                                ));
+                            let call_site = self
+                                .builder
+                                .build_call(function, &compiled_args, &format!("call_{}", ns))
+                                .unwrap();
+                            if let Some(rv) = call_site.try_as_basic_value().left() {
+                                return Ok(rv.as_basic_value_enum());
+                            } else {
+                                return Ok(self
+                                    .context
+                                    .i64_type()
+                                    .const_int(0, false)
+                                    .as_basic_value_enum());
+                            }
+                        }
+                    }
+                }
                 // Compile the function or method being called
                 match &**callee {
+                    // Obj.new()
+                    Expr::Get(inner, method)
+                        if method == "new"
+                            && matches!(&**inner, Expr::Variable(n) if n == "Obj")
+                            && args.is_empty() =>
+                    {
+                        let fnv = self.get_or_create_qs_obj_new();
+                        let call = self.builder.build_call(fnv, &[], "obj_new").unwrap();
+                        Ok(call.try_as_basic_value().left().unwrap().as_basic_value_enum())
+                    }
+
+                    // RangeBuilder builder methods: `.to()`, `.from()`, `.step()`
+                    Expr::Get(receiver, method)
+                        if args.len() == 1
+                            && matches!(
+                                get_type_of_expr(receiver, &self.pctx.borrow()),
+                                Ok(Type::RangeBuilder)
+                            )
+                            && matches!(method.as_str(), "to" | "from" | "step") =>
+                    {
+                        let builder_val = self.compile_expr(receiver)?;
+                        let builder_ptr = match builder_val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!(
+                                "RangeBuilder methods expect a pointer receiver, got {other:?}"
+                            ),
+                        };
+
+                        let raw_arg = self.compile_expr(&args[0])?;
+                        let f64_ty = self.context.f64_type();
+                        let arg_f64 = match raw_arg {
+                            BasicValueEnum::FloatValue(f) => f,
+                            BasicValueEnum::IntValue(i) => self
+                                .builder
+                                .build_signed_int_to_float(
+                                    i,
+                                    f64_ty,
+                                    "range_arg_cast",
+                                )?,
+                            other => panic!(
+                                "RangeBuilder setter expected numeric argument, got {other:?}"
+                            ),
+                        };
+
+                        let setter = match method.as_str() {
+                            "to" => self.get_or_create_range_builder_to(),
+                            "from" => self.get_or_create_range_builder_from(),
+                            "step" => self.get_or_create_range_builder_step(),
+                            _ => unreachable!("guard ensures known method"),
+                        };
+
+                        let call = self.builder.build_call(
+                            setter,
+                            &[builder_ptr.into(), arg_f64.into()],
+                            "range_builder_set",
+                        )?;
+
+                        Ok(call.try_as_basic_value().left().unwrap())
+                    }
+
+                    // obj.insert(key, val)
+                    Expr::Get(obj, method)
+                        if method == "insert"
+                            && matches!(
+                                get_type_of_expr(obj, &self.pctx.borrow()),
+                                Ok(Type::Kv(_))
+                            ) =>
+                    {
+                        let map_ptr = self.compile_expr(obj)?;
+                        let key = self.compile_expr(&args[0])?;
+                        let raw_val = self.compile_expr(&args[1])?;
+
+                        // Ensure value argument is an i8* (C string). If it's numeric/bool,
+                        // convert to string efficiently.
+                        let val_as_ptr: BasicMetadataValueEnum = match raw_val {
+                            BasicValueEnum::PointerValue(p) => p.into(),
+                            BasicValueEnum::FloatValue(fv) => {
+                                // Allocate buffer and sprintf "%f"
+                                let fmt = self
+                                    .builder
+                                    .build_global_string_ptr("%f\0", "fmt_insert_f")
+                                    .unwrap();
+                                let malloc_fn = self.get_or_create_malloc();
+                                let size = self.context.i64_type().const_int(64, false);
+                                let buf = self
+                                    .builder
+                                    .build_call(malloc_fn, &[size.into()], "malloc_fbuf")
+                                    .unwrap()
+                                    .try_as_basic_value()
+                                    .left()
+                                    .unwrap()
+                                    .into_pointer_value();
+                                let sprintf_fn = self.get_or_create_sprintf();
+                                self.builder
+                                    .build_call(
+                                        sprintf_fn,
+                                        &[buf.into(), fmt.as_pointer_value().into(), fv.into()],
+                                        "sprintf_f",
+                                    )
+                                    .unwrap();
+                                buf.into()
+                            }
+                            BasicValueEnum::IntValue(iv) => {
+                                // Treat 1-bit ints as bool; 8+/32/64 as integer via %ld
+                                if iv.get_type().get_bit_width() == 1 {
+                                    // Build pointers to "true" and "false"
+                                    let t = self
+                                        .builder
+                                        .build_global_string_ptr("true\0", "bool_true")
+                                        .unwrap()
+                                        .as_pointer_value();
+                                    let f = self
+                                        .builder
+                                        .build_global_string_ptr("false\0", "bool_false")
+                                        .unwrap()
+                                        .as_pointer_value();
+                                    let sel = self
+                                        .builder
+                                        .build_select(iv, t, f, "bool_sel")
+                                        .unwrap()
+                                        .into_pointer_value();
+                                    sel.into()
+                                } else {
+                                    // Generic integer: sprintf with "%ld"
+                                    let fmt = self
+                                        .builder
+                                        .build_global_string_ptr("%ld\0", "fmt_insert_i")
+                                        .unwrap();
+                                    let malloc_fn = self.get_or_create_malloc();
+                                    let size = self.context.i64_type().const_int(64, false);
+                                    let buf = self
+                                        .builder
+                                        .build_call(malloc_fn, &[size.into()], "malloc_ibuf")
+                                        .unwrap()
+                                        .try_as_basic_value()
+                                        .left()
+                                        .unwrap()
+                                        .into_pointer_value();
+                                    let sprintf_fn = self.get_or_create_sprintf();
+                                    self.builder
+                                        .build_call(
+                                            sprintf_fn,
+                                            &[buf.into(), fmt.as_pointer_value().into(), iv.into()],
+                                            "sprintf_i",
+                                        )
+                                        .unwrap();
+                                    buf.into()
+                                }
+                            }
+                            other => panic!("Unsupported value type for Obj.insert: {:?}", other),
+                        };
+
+                        let fnv = self.get_or_create_qs_obj_insert_str();
+                        let _ = self
+                            .builder
+                            .build_call(
+                                fnv,
+                                &[map_ptr.into(), key.into(), val_as_ptr],
+                                "obj_ins",
+                            )
+                            .unwrap();
+                        // return 0.0 as Nil placeholder
+                        Ok(self.context.f64_type().const_float(0.0).as_basic_value_enum())
+                    }
+
+                    // a = obj.get(key)
+                    Expr::Get(obj, method)
+                        if method == "get"
+                            && matches!(
+                                get_type_of_expr(obj, &self.pctx.borrow()),
+                                Ok(Type::Kv(_))
+                            ) =>
+                    {
+                        let map_ptr = self.compile_expr(obj)?;
+                        let key = self.compile_expr(&args[0])?;
+                        let fnv = self.get_or_create_qs_obj_get_str();
+                        let call = self
+                            .builder
+                            .build_call(fnv, &[map_ptr.into(), key.into()], "obj_get")
+                            .unwrap();
+                        Ok(call.try_as_basic_value().left().unwrap().as_basic_value_enum())
+                    }
                     // 1) Direct function call: foo(arg1, arg2, ...)
                     Expr::Variable(name) => {
+                        // If compiling inside a module, prefer namespaced function resolution
+                        if let Some(cur_mod) = self.current_module.borrow().clone() {
+                            let ns = format!("{}__{}", cur_mod, name);
+                            if let Some(function) = self.module.get_function(&ns) {
+                                let compiled_args: Vec<BasicMetadataValueEnum> = args
+                                    .iter()
+                                    .map(|a| self.compile_expr(a).unwrap().into())
+                                    .collect();
+                                let call_site = self
+                                    .builder
+                                    .build_call(function, &compiled_args, &format!("call_{}", ns))
+                                    .unwrap();
+                                if let Some(rv) = call_site.try_as_basic_value().left() {
+                                    return Ok(rv.as_basic_value_enum());
+                                } else {
+                                    return Ok(self
+                                        .context
+                                        .i64_type()
+                                        .const_int(0, false)
+                                        .as_basic_value_enum());
+                                }
+                            }
+                        }
                         // Look up the JIT-compiled function in the module
                         let function = self
                             .module
@@ -2655,7 +5193,7 @@ impl<'ctx> Compiler<'ctx> {
                     }
 
                     // Method call `.str()` on numeric values
-                    Expr::Get(obj, method) if method == "str" => {
+                    Expr::Get(obj, method) if method == "str" &&matches!(& get_type_of_expr(obj, &self.pctx.borrow()).unwrap(), Type::Num) => {
                         // Ensure the object compiles to an integer before converting
                         let compiled_val = self.compile_expr(obj)?;
                         let num_val = match compiled_val {
@@ -2701,12 +5239,12 @@ impl<'ctx> Compiler<'ctx> {
                         Ok(buf_ptr.as_basic_value_enum())
                     }
 
-                    // 2) Method call `.len()` on a pointer value (string or later list)
-                    Expr::Get(obj, method) if method == "len" => {
+                    // 2) Method call `.len()` on a pointer value (string or list)
+                    Expr::Get(obj, method) if method == "len" && matches!(get_type_of_expr(obj, &self.pctx.borrow()).unwrap(), Type::List(_) | Type::Str) => {
                         let obj_val = self.compile_expr(obj)?;
                         // Get the original type of the object from pctx
                         let obj_type = get_type_of_expr(obj, &self.pctx.borrow())
-                            .unwrap_or_else(|e| panic!("Type error: {}", e));
+                            .unwrap_or_else(|e| panic!("Type error: {e}"));
 
                         if let BasicValueEnum::PointerValue(ptr) = obj_val {
                             match obj_type {
@@ -2737,16 +5275,383 @@ impl<'ctx> Compiler<'ctx> {
                             panic!("Unsupported type for .len() call");
                         }
                     }
+                    Expr::Get(obj, method)
+                        if method == "num"
+                            && get_type_of_expr(obj, &self.pctx.borrow())
+                                .unwrap_or_else(|e| panic!("Type error: {e}"))
+                                == Type::Str =>
+                    {
+                        let obj_val = match self.compile_expr(obj)? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => panic!(),
+                        };
+
+                        // Get the original type of the object from pctx
+                        let atoi_fn = self.get_or_create_atoi();
+                        let result =
+                            self.builder
+                                .build_call(atoi_fn, &[obj_val.into()], "atoi_call")?;
+                        let result = self.builder.build_signed_int_to_float(
+                            result.try_as_basic_value().left().unwrap().into_int_value(),
+                            self.context.f64_type(),
+                            "int_to_float",
+                        )?;
+                        Ok(result.as_basic_value_enum())
+                    }
+
+                    Expr::Get(obj, method)
+                        if method == "contains"
+                            && get_type_of_expr(obj, &self.pctx.borrow())
+                                .unwrap_or_else(|e| panic!("Type error: {e}"))
+                                == Type::Str
+                            && args.len() == 1 =>
+                    {
+                        let obj_val = match self.compile_expr(obj)? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => panic!(),
+                        };
+
+                        let find = self.compile_expr(&args[0])?;
+
+                        // Get the original type of the object from pctx
+                        let strstr_fn = self.get_or_create_strstr();
+                        let result = self
+                            .builder
+                            .build_call(strstr_fn, &[obj_val.into(), find.into()], "strstr_call")?
+                            .try_as_basic_value()
+                            .unwrap_left();
+                        let cond = match result {
+                            BasicValueEnum::PointerValue(ptr) => {
+                                // Null pointer for nil
+                                let null_ptr =
+                                    self.context.ptr_type(AddressSpace::default()).const_null();
+                                self.builder.build_int_compare(
+                                    IntPredicate::NE,
+                                    ptr,
+                                    null_ptr,
+                                    "neq_nil",
+                                )
+                            }
+                            BasicValueEnum::FloatValue(iv) => {
+                                // Zero integer for nil
+                                let zero = self.context.f64_type().const_float(0.0);
+                                self.builder.build_float_compare(
+                                    FloatPredicate::ONE,
+                                    iv,
+                                    zero,
+                                    "neq_nil",
+                                )
+                            }
+                            BasicValueEnum::IntValue(i) => {
+                                let zero = self.context.f64_type().const_float(0.0);
+                                self.builder.build_float_compare(
+                                    FloatPredicate::ONE,
+                                    self.builder.build_signed_int_to_float(
+                                        i,
+                                        self.context.f64_type(),
+                                        "int_to_float",
+                                    )?,
+                                    zero,
+                                    "neq_nil",
+                                )
+                            }
+                            _ => panic!("Unsupported type in maybe: {result}"),
+                        }?;
+                        Ok(cond.as_basic_value_enum())
+                    }
+
+                    Expr::Get(obj, method)
+                        if method == "starts_with"
+                            && get_type_of_expr(obj, &self.pctx.borrow())
+                                .unwrap_or_else(|e| panic!("Type error: {e}"))
+                                == Type::Str =>
+                    {
+                        let obj_val = match self.compile_expr(obj)? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => panic!(),
+                        };
+
+                        // Call C strncmp(s, needle, needle_len) and compare result to 0.
+                        // strncmp returns 0 when the prefix matches, so we EQ against zero to get a boolean.
+                        let strncmp_fn = self.get_or_create_strncmp();
+
+                        // Argument 1: the needle string
+                        let finding = self.compile_expr(&args[0])?;
+
+                        // Argument 2: the needle length (i64 from .len()) cast to i32 expected by strncmp
+                        let finding_len_val = self
+                            .compile_expr(&Expr::Call(
+                                Box::new(Expr::Get(Box::new(args[0].clone()), "len".to_string())),
+                                vec![],
+                            ))?
+                            .into_int_value();
+                        let finding_len_i32 = self.builder.build_int_truncate(
+                            finding_len_val,
+                            self.context.i32_type(),
+                            "needle_len_i32",
+                        )?;
+
+                        // Call strncmp and compare to zero for a proper boolean
+                        let call = self.builder.build_call(
+                            strncmp_fn,
+                            &[obj_val.into(), finding.into(), finding_len_i32.into()],
+                            "strncmp_call",
+                        )?;
+                        let cmp = call
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap()
+                            .into_int_value();
+                        let zero = self.context.i32_type().const_int(0, false);
+                        let is_prefix = self.builder.build_int_compare(
+                            IntPredicate::EQ,
+                            cmp,
+                            zero,
+                            "starts_with_bool",
+                        )?;
+                        Ok(is_prefix.as_basic_value_enum())
+                    }
+
+                    Expr::Get(obj, method)
+                        if method == "ends_with"
+                            && get_type_of_expr(obj, &self.pctx.borrow())
+                                .unwrap_or_else(|e| panic!("Type error: {e}"))
+                                == Type::Str =>
+                    {
+                        // haystack pointer
+                        let obj_ptr = match self.compile_expr(obj)? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => panic!(),
+                        };
+
+                        // needle pointer
+                        let needle_ptr = self.compile_expr(&args[0])?;
+
+                        // Compute lengths (i64)
+                        let needle_len_i64 = self
+                            .compile_expr(&Expr::Call(
+                                Box::new(Expr::Get(Box::new(args[0].clone()), "len".to_string())),
+                                vec![],
+                            ))?
+                            .into_int_value();
+                        let hay_len_i64 = self
+                            .compile_expr(&Expr::Call(
+                                Box::new(Expr::Get(obj.clone(), "len".to_string())),
+                                vec![],
+                            ))?
+                            .into_int_value();
+
+                        // If needle is longer than haystack, ends_with is false. Compute offset = hay_len - needle_len
+                        let offset = self
+                            .builder
+                            .build_int_sub(hay_len_i64, needle_len_i64, "ends_offset")?;
+
+                        // Compute pointer to haystack end: hay + offset (byte-wise)
+                        let i8_ty = self.context.i8_type();
+                        let end_ptr = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(i8_ty, obj_ptr, &[offset], "hay_end_ptr")?
+                        };
+
+                        // Compare suffix using strncmp(end_ptr, needle, needle_len)
+                        let strncmp_fn = self.get_or_create_strncmp();
+                        let needle_len_i32 = self.builder.build_int_truncate(
+                            needle_len_i64,
+                            self.context.i32_type(),
+                            "needle_len_i32",
+                        )?;
+                        let call = self.builder.build_call(
+                            strncmp_fn,
+                            &[end_ptr.into(), needle_ptr.into(), needle_len_i32.into()],
+                            "strncmp_suffix",
+                        )?;
+                        let cmp = call
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap()
+                            .into_int_value();
+                        let zero = self.context.i32_type().const_int(0, false);
+                        let is_suffix = self.builder.build_int_compare(
+                            IntPredicate::EQ,
+                            cmp,
+                            zero,
+                            "ends_with_bool",
+                        )?;
+                        Ok(is_suffix.as_basic_value_enum())
+                    }
+
+                    Expr::Get(obj, method)
+                        if method == "push"
+                            && matches!(get_type_of_expr(obj, &self.pctx.borrow())
+                                .unwrap_or_else(|e| panic!("Type error: {e}"))
+                                ,Type::List(_)) =>
+                    {
+                        // Resolve list inner type to determine supported behavior
+                        let inner_ty = match get_type_of_expr(obj, &self.pctx.borrow()) {
+                            Ok(Type::List(inner)) => *inner,
+                            Ok(other) => panic!(".push() called on non-list type: {:?}", other),
+                            Err(e) => panic!("Type error: {e}"),
+                        };
+
+                        // Obtain the underlying buffer pointer
+                        let buf_ptr = match self.compile_expr(obj)? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => panic!("List object not a pointer value"),
+                        };
+
+                        match inner_ty {
+                            // Numeric lists: elements are f64 stored after length slot
+                            Type::Num => {
+                                let f64_ty = self.context.f64_type();
+                                let i64_ty = self.context.i64_type();
+
+                                // Load current length from slot 0 (stored as f64)
+                                let cur_len_f = self
+                                    .builder
+                                    .build_load(f64_ty, buf_ptr, "len_load")?
+                                    .into_float_value();
+                                let cur_len_i = self
+                                    .builder
+                                    .build_float_to_signed_int(cur_len_f, i64_ty, "len_to_i64")?;
+
+                                // Reallocate buffer to fit one more element: bytes = 8 * (len + 2)
+                                let bytes_per = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
+                                let needed_slots = self
+                                    .builder
+                                    .build_int_add(cur_len_i, i64_ty.const_int(2, false), "needed_slots")?; // len + header + 1 new elem
+                                let total_bytes = self
+                                    .builder
+                                    .build_int_mul(bytes_per, needed_slots, "push_bytes")?;
+                                let realloc_fn = self.get_or_create_realloc();
+                                let new_raw = self
+                                    .builder
+                                    .build_call(realloc_fn, &[buf_ptr.into(), total_bytes.into()], "realloc_list_num")?
+                                    .try_as_basic_value()
+                                    .left()
+                                    .unwrap()
+                                    .into_pointer_value();
+                                // Update the source variable if `obj` is a variable name
+                                if let Expr::Variable(ref vname) = **obj {
+                                    if let Some(var_ptr) = self.vars.borrow().get(vname) {
+                                        let _ = self.builder.build_store(*var_ptr, new_raw);
+                                    }
+                                }
+                                let buf_ptr = new_raw;
+
+                                // Compute insertion index = len + 1 (skip length slot at index 0)
+                                let one = i64_ty.const_int(1, false);
+                                let idx = self.builder.build_int_add(cur_len_i, one, "push_idx")?;
+
+                                // Compute element pointer using f64 element type
+                                let elem_ptr = unsafe {
+                                    self.builder
+                                        .build_in_bounds_gep(f64_ty, buf_ptr, &[idx], "push_elem_ptr")?
+                                };
+
+                                // Compile value and ensure it's an f64
+                                let mut val = self.compile_expr(&args[0])?;
+                                let val_f = match val {
+                                    BasicValueEnum::FloatValue(f) => f,
+                                    BasicValueEnum::IntValue(iv) => self
+                                        .builder
+                                        .build_signed_int_to_float(iv, f64_ty, "int_to_float_push")?,
+                                    other => panic!("Attempted to push non-numeric value into numeric list: {:?}", other),
+                                };
+
+                                let _ = self.builder.build_store(elem_ptr, val_f);
+
+                                // Update length in slot 0: len += 1
+                                let new_len_i = self.builder.build_int_add(cur_len_i, one, "len_inc")?;
+                                let new_len_f = self.builder.build_signed_int_to_float(new_len_i, f64_ty, "len_to_f64")?;
+                                let _ = self.builder.build_store(buf_ptr, new_len_f);
+
+                                Ok(f64_ty.const_float(0.0).as_basic_value_enum())
+                            }
+                            // String lists: elements are pointers; store pointer values
+                            Type::Str => {
+                                let f64_ty = self.context.f64_type();
+                                let i64_ty = self.context.i64_type();
+
+                                // Load current length from slot 0 (as f64)
+                                let cur_len_f = self
+                                    .builder
+                                    .build_load(f64_ty, buf_ptr, "len_load")?
+                                    .into_float_value();
+                                let cur_len_i = self
+                                    .builder
+                                    .build_float_to_signed_int(cur_len_f, i64_ty, "len_to_i64")?;
+
+                                // Reallocate buffer to fit one more element: bytes = 8 * (len + 2)
+                                let bytes_per = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
+                                let needed_slots = self
+                                    .builder
+                                    .build_int_add(cur_len_i, i64_ty.const_int(2, false), "needed_slots")?; // len + header + 1 new elem
+                                let total_bytes = self
+                                    .builder
+                                    .build_int_mul(bytes_per, needed_slots, "push_bytes")?;
+                                let realloc_fn = self.get_or_create_realloc();
+                                let new_raw = self
+                                    .builder
+                                    .build_call(realloc_fn, &[buf_ptr.into(), total_bytes.into()], "realloc_list_str")?
+                                    .try_as_basic_value()
+                                    .left()
+                                    .unwrap()
+                                    .into_pointer_value();
+                                // Update the source variable if `obj` is a variable name
+                                if let Expr::Variable(ref vname) = **obj {
+                                    if let Some(var_ptr) = self.vars.borrow().get(vname) {
+                                        let _ = self.builder.build_store(*var_ptr, new_raw);
+                                    }
+                                }
+                                let buf_ptr = new_raw;
+
+                                let one = i64_ty.const_int(1, false);
+                                let idx = self.builder.build_int_add(cur_len_i, one, "push_idx")?;
+
+                                // Compute element address using 8-byte slots (f64 stride)
+                                let elem_ptr = unsafe {
+                                    self.builder.build_in_bounds_gep(
+                                        f64_ty,
+                                        buf_ptr,
+                                        &[idx],
+                                        "push_elem_ptr",
+                                    )?
+                                };
+
+                                // Compile value and ensure it's a pointer (C string)
+                                let val = self.compile_expr(&args[0])?;
+                                let ptr_val = match val {
+                                    BasicValueEnum::PointerValue(p) => p,
+                                    other => panic!(
+                                        "Attempted to push non-string into string list: {:?}",
+                                        other
+                                    ),
+                                };
+                                let _ = self.builder.build_store(elem_ptr, ptr_val);
+
+                                // Increment length in slot 0
+                                let new_len_i = self.builder.build_int_add(cur_len_i, one, "len_inc")?;
+                                let new_len_f = self
+                                    .builder
+                                    .build_signed_int_to_float(new_len_i, f64_ty, "len_to_f64")?;
+                                let _ = self.builder.build_store(buf_ptr, new_len_f);
+
+                                Ok(f64_ty.const_float(0.0).as_basic_value_enum())
+                            }
+                            // TODO: Support other element types (bool, objects). For now, no-op.
+                            _ => Ok(self.context.f64_type().const_float(0.0).as_basic_value_enum()),
+                        }
+                    }
+
 
                     _ => {
-                        panic!("Unsupported call expression: {:?}", callee);
+                        panic!("Unsupported call expression: {callee:?}");
                     }
                 }
             }
             Expr::List(items) => {
                 let count = items.len() as u64;
                 let f64_ty = self.context.f64_type();
-                let f64_ptr_ty = self.context.ptr_type(AddressSpace::default());
 
                 // Allocate count + 1 elements to store the length at the beginning
                 let total_bytes = {
@@ -2769,6 +5674,7 @@ impl<'ctx> Compiler<'ctx> {
                     .left()
                     .unwrap()
                     .into_pointer_value();
+                let f64_ptr_ty = self.context.ptr_type(AddressSpace::default());
                 let buf_ptr =
                     self.builder
                         .build_pointer_cast(raw_ptr, f64_ptr_ty, "list_buf_ptr")?;
@@ -2776,8 +5682,9 @@ impl<'ctx> Compiler<'ctx> {
                 // Store length at index 0
                 let len_val = f64_ty.const_float(count as f64);
                 let len_ptr = unsafe {
+                    // GEP by element type (f64) to scale correctly under opaque pointers
                     self.builder.build_in_bounds_gep(
-                        f64_ptr_ty,
+                        f64_ty,
                         buf_ptr,
                         &[self.context.i64_type().const_int(0, false)],
                         "len_ptr",
@@ -2787,15 +5694,12 @@ impl<'ctx> Compiler<'ctx> {
 
                 // Store each element starting from index 1
                 for (idx, item) in items.iter().enumerate() {
-                    let elem_val = self.compile_expr(item)?.into_float_value();
+                    let elem_val = self.compile_expr(item)?;
                     let idx_val = self.context.i64_type().const_int((idx + 1) as u64, false);
                     let gep = unsafe {
-                        self.builder.build_in_bounds_gep(
-                            f64_ptr_ty,
-                            buf_ptr,
-                            &[idx_val],
-                            "elem_ptr",
-                        )?
+                        // Index using f64 element type for correct scaling
+                        self.builder
+                            .build_in_bounds_gep(f64_ty, buf_ptr, &[idx_val], "elem_ptr")?
                     };
                     let _ = self.builder.build_store(gep, elem_val);
                 }
@@ -2803,39 +5707,185 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(buf_ptr.as_basic_value_enum())
             }
             Expr::Index(list, indexed_by) => {
-                let list_lit = self.compile_expr(list)?;
-                let index_lit = self.compile_expr(indexed_by)?;
-                // get the raw list pointer and index integer
-                let list_ptr = match list_lit {
-                    BasicValueEnum::PointerValue(p) => p,
-                    _ => panic!("Index on non-list pointer: {:?}", list_lit),
+                // Determine the static type of the left-hand side to decide behavior
+                let lhs_type = {
+                    let pctx = self.pctx.borrow();
+                    get_type_of_expr(list, &pctx).expect("Unable to resolve type for indexing")
                 };
-                let idx = match index_lit {
+
+                let lhs_val = self.compile_expr(list)?;
+                let index_val = self.compile_expr(indexed_by)?;
+
+                // Index must be integer (or numeric convertible)
+                let idx = match index_val { 
                     BasicValueEnum::IntValue(i) => i,
-                    _ => panic!("List index must be integer: {:?}", index_lit),
+                    BasicValueEnum::FloatValue(f) => self.builder.build_float_to_signed_int(
+                        f,
+                        self.context.i64_type(),
+                        "number",
+                    )?,
+                    _ => panic!("Index must be integer: {:?}", index_val),
                 };
-                // skip the length slot at index 0
-                let one = self.context.i64_type().const_int(1, false);
-                let idx1 = self.builder.build_int_add(idx, one, "idx_plus1")?;
-                // compute element pointer and load
-                let elem_ptr = unsafe {
-                    self.builder
-                        .build_in_bounds_gep(
+
+                match lhs_type {
+                    // String indexing -> return a new 1-character C-string
+                    Type::Str => {
+                        let str_ptr = match lhs_val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => panic!("String index on non-pointer value: {:?}", lhs_val),
+                        };
+
+                        // Compute address of the target character: &str[idx]
+                        let i8_ty = self.context.i8_type();
+                        let i8_ptr_ty = i8_ty.ptr_type(AddressSpace::default());
+                        let char_ptr = unsafe {
+                            // Use i8 element type for byte-wise indexing
+                            self.builder
+                                .build_in_bounds_gep(i8_ty, str_ptr, &[idx], "char_ptr")?
+                        };
+
+                        // Load the byte at that index
+                        let ch = self
+                            .builder
+                            .build_load(i8_ty, char_ptr, "load_char")
+                            .unwrap()
+                            .into_int_value();
+
+                        // Allocate a 2-byte buffer: character + null terminator
+                        let malloc_fn = self.get_or_create_malloc();
+                        let two = self.context.i64_type().const_int(2, false);
+                        let buf_raw = self
+                            .builder
+                            .build_call(malloc_fn, &[two.into()], "malloc_char")?
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap()
+                            .into_pointer_value();
+                        let buf_ptr =
+                            self.builder
+                                .build_pointer_cast(buf_raw, i8_ptr_ty, "char_buf_ptr")?;
+
+                        // Store the character and the null terminator
+                        let zero = i8_ty.const_int(0, false);
+                        let first_ptr = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                i8_ty,
+                                buf_ptr,
+                                &[self.context.i64_type().const_int(0, false)],
+                                "buf_0",
+                            )?
+                        };
+                        let second_ptr = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                i8_ty,
+                                buf_ptr,
+                                &[self.context.i64_type().const_int(1, false)],
+                                "buf_1",
+                            )?
+                        };
+                        let _ = self.builder.build_store(first_ptr, ch);
+                        let _ = self.builder.build_store(second_ptr, zero);
+
+                        Ok(buf_ptr.as_basic_value_enum())
+                    }
+                    // List indexing: load element based on inner type
+                    Type::List(inner) => {
+                        let list_ptr = match lhs_val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => panic!("Index on non-list pointer: {:?}", lhs_val),
+                        };
+
+                        // skip the length slot at index 0
+                        let one = self.context.i64_type().const_int(1, false);
+                        let idx1 = self.builder.build_int_add(idx, one, "idx_plus1")?;
+
+                        // address of element slot using 8-byte stride (f64)
+                        let f64_ty = self.context.f64_type();
+                        let elem_ptr = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                f64_ty,
+                                list_ptr,
+                                &[idx1],
+                                "list_index",
+                            )?
+                        };
+
+                        match *inner {
+                            Type::Num => {
+                                let loaded = self
+                                    .builder
+                                    .build_load(self.context.f64_type(), elem_ptr, "load_num_elem")
+                                    .unwrap();
+                                Ok(loaded)
+                            }
+                            Type::Str => {
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let loaded = self
+                                    .builder
+                                    .build_load(ptr_ty, elem_ptr, "load_str_elem")
+                                    .unwrap();
+                                Ok(loaded)
+                            }
+                            _ => panic!("Indexing not supported on list inner type"),
+                        }
+                    }
+                    other => panic!("Indexing not supported on type: {:?}", other),
+                }
+            }
+            Expr::Function(params, ret_type, body) => {
+                // Generate a unique name for each anonymous function and compile it in isolation
+                let id = INLINE_FN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let name = format!("inline_fn_{}", id);
+
+                // Remember current insertion point so we can restore it after compiling the anon fn
+                let saved_insert_block = self.builder.get_insert_block();
+                let parent_fn = saved_insert_block.and_then(|bb| bb.get_parent());
+
+                // Compile as a proper function definition
+                self.compile_instruction(
+                    parent_fn.unwrap_or_else(|| self.module.get_last_function().unwrap()),
+                    &Instruction::FunctionDef {
+                        name: name.clone(),
+                        params: params.to_vec(),
+                        return_type: ret_type.clone(),
+                        body: vec![body.as_ref().clone()],
+                    },
+                )?;
+
+                // Restore builder insertion point for the caller function
+                if let Some(bb) = saved_insert_block {
+                    self.builder.position_at_end(bb);
+                }
+
+                if let Some(func) = self.module.get_function(&name) {
+                    let fn_ptr_val = func.as_global_value().as_pointer_value();
+                    Ok(self
+                        .builder
+                        .build_pointer_cast(
+                            fn_ptr_val,
                             self.context.ptr_type(AddressSpace::default()),
-                            list_ptr,
-                            &[idx1],
-                            "list_index",
+                            "fn_ptr_cast",
                         )
                         .unwrap()
-                };
-                let loaded = self
-                    .builder
-                    .build_load(self.context.f64_type(), elem_ptr, "load_elem")
-                    .unwrap();
-                Ok(loaded)
+                        .as_basic_value_enum())
+                } else {
+                    panic!()
+                }
             }
 
-            _ => panic!("Unsupported expression in compile_expr: {:?}", expr),
+            Expr::Unary(op, ex) => {
+                match op {
+                    Unary::Not => {
+                        let val = self.compile_expr(ex)?;
+                        Ok(self.builder.build_int_compare(IntPredicate::EQ, val.into_int_value(), self.context.bool_type().const_int(0, false), "not_op")?.as_basic_value_enum())
+                    }
+                    Unary::Neg => {
+                        let val = self.compile_expr(ex)?;
+                        Ok(self.builder.build_float_neg(val.into_float_value(), "negative")?.as_basic_value_enum())
+                    }
+                }
+            }
+            _ => panic!("Unsupported expression in compile_expr: {expr:?}"),
         }
     }
     fn get_or_create_strcmp(&self) -> FunctionValue<'ctx> {
@@ -2851,6 +5901,19 @@ impl<'ctx> Compiler<'ctx> {
             self.module.add_function("strcmp", fn_type, None)
         }
     }
+    fn get_or_create_strncmp(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("strncmp") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            // strcmp signature: (i8*, i8*) -> i32
+            let fn_type = self.context.i32_type().fn_type(
+                &[i8ptr.into(), i8ptr.into(), self.context.i32_type().into()],
+                false,
+            );
+            self.module.add_function("strncmp", fn_type, None)
+        }
+    }
 
     fn get_or_create_strlen(&self) -> FunctionValue<'ctx> {
         if let Some(f) = self.module.get_function("strlen") {
@@ -2860,6 +5923,28 @@ impl<'ctx> Compiler<'ctx> {
             // strlen signature: (i8*) -> i64
             let fn_type = self.context.i64_type().fn_type(&[i8ptr.into()], false);
             self.module.add_function("strlen", fn_type, None)
+        }
+    }
+
+    fn get_or_create_atoi(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("atoi") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            // strlen signature: (i8*) -> i64
+            let fn_type = self.context.i64_type().fn_type(&[i8ptr.into()], false);
+            self.module.add_function("atoi", fn_type, None)
+        }
+    }
+
+    fn get_or_create_strstr(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("strstr") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            // strstr signature: (i8*, i8*) -> i8*
+            let fn_type = i8ptr.fn_type(&[i8ptr.into(), i8ptr.into()], false);
+            self.module.add_function("strstr", fn_type, None)
         }
     }
 
@@ -2942,6 +6027,358 @@ impl<'ctx> Compiler<'ctx> {
             // stdin signature: () -> void*
             let fn_type = void_ptr.fn_type(&[], false);
             self.module.add_function("get_stdin", fn_type, None)
+        }
+    }
+
+    fn get_or_create_qs_listen_with_callback(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("qs_listen_with_callback") {
+            f
+        } else {
+            let i32t = self.context.i32_type();
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = self
+                .context
+                .void_type()
+                .fn_type(&[i32t.into(), void_ptr.into()], false);
+            self.module
+                .add_function("qs_listen_with_callback", fn_type, None)
+        }
+    }
+
+    fn get_or_create_create_request_object(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("create_request_object") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(
+                &[
+                    i8ptr.into(),
+                    i8ptr.into(),
+                    i8ptr.into(),
+                    i8ptr.into(),
+                    i8ptr.into(),
+                ],
+                false,
+            );
+            self.module
+                .add_function("create_request_object", fn_type, None)
+        }
+    }
+
+    fn get_or_create_get_request_method(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_request_method") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module
+                .add_function("get_request_method", fn_type, None)
+        }
+    }
+
+    fn get_or_create_get_request_path(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_request_path") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("get_request_path", fn_type, None)
+        }
+    }
+
+    fn get_or_create_get_request_body(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_request_body") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("get_request_body", fn_type, None)
+        }
+    }
+
+    fn get_or_create_get_request_query(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_request_query") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("get_request_query", fn_type, None)
+        }
+    }
+
+    fn get_or_create_get_request_headers(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_request_headers") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module
+                .add_function("get_request_headers", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_helper(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("create_web_helper") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[], false);
+            self.module.add_function("create_web_helper", fn_type, None)
+        }
+    }
+
+    fn get_or_create_range_builder(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("create_range_builder") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[], false);
+            self.module
+                .add_function("create_range_builder", fn_type, None)
+        }
+    }
+
+    fn get_or_create_range_builder_to(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("create_range_builder_to") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(
+                        self.context.ptr_type(AddressSpace::default()),
+                    )
+                    .into(),
+                    self.context.f64_type().into(),
+                ],
+                false,
+            );
+            self.module
+                .add_function("create_range_builder_to", fn_type, None)
+        }
+    }
+
+    fn get_or_create_range_builder_from(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("create_range_builder_from") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(
+                        self.context.ptr_type(AddressSpace::default()),
+                    )
+                    .into(),
+                    self.context.f64_type().into(),
+                ],
+                false,
+            );
+            self.module
+                .add_function("create_range_builder_from", fn_type, None)
+        }
+    }
+
+    fn get_or_create_range_builder_step(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("create_range_builder_step") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(
+                        self.context.ptr_type(AddressSpace::default()),
+                    )
+                    .into(),
+                    self.context.f64_type().into(),
+                ],
+                false,
+            );
+            self.module
+                .add_function("create_range_builder_step", fn_type, None)
+        }
+    }
+
+    fn get_or_create_range_builder_get_from(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("range_builder_get_from") {
+            f
+        } else {
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            let fn_type = self.context.f64_type().fn_type(&[ptr_ty.into()], false);
+            self.module
+                .add_function("range_builder_get_from", fn_type, None)
+        }
+    }
+
+    fn get_or_create_range_builder_get_to(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("range_builder_get_to") {
+            f
+        } else {
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            let fn_type = self.context.f64_type().fn_type(&[ptr_ty.into()], false);
+            self.module
+                .add_function("range_builder_get_to", fn_type, None)
+        }
+    }
+
+    fn get_or_create_range_builder_get_step(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("range_builder_get_step") {
+            f
+        } else {
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            let fn_type = self.context.f64_type().fn_type(&[ptr_ty.into()], false);
+            self.module
+                .add_function("range_builder_get_step", fn_type, None)
+        }
+    }
+
+    fn get_or_create_io_read_file(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("io_read_file") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("io_read_file", fn_type, None)
+        }
+    }
+
+    fn get_or_create_io_write_file(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("io_write_file") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let f64_type = self.context.f64_type();
+            let fn_type = f64_type.fn_type(&[i8ptr.into(), i8ptr.into()], false);
+            self.module.add_function("io_write_file", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_text(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("web_text") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("web_text", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_json(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("web_json") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("web_json", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_file(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("web_file") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("web_file", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_page(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("web_page") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into()], false);
+            self.module.add_function("web_page", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_error_text(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("web_error_text") {
+            f
+        } else {
+            let i32t = self.context.i32_type();
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i32t.into(), i8ptr.into()], false);
+            self.module.add_function("web_error_text", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_error_page(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("web_error_page") {
+            f
+        } else {
+            let i32t = self.context.i32_type();
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i32t.into(), i8ptr.into()], false);
+            self.module.add_function("web_error_page", fn_type, None)
+        }
+    }
+
+    fn get_or_create_web_redirect(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("web_redirect") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let bool_type = self.context.bool_type();
+            let fn_type = i8ptr.fn_type(&[i8ptr.into(), bool_type.into()], false);
+            self.module.add_function("web_redirect", fn_type, None)
+        }
+    }
+
+    fn get_or_create_get_current_method(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_current_method") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[], false);
+            self.module
+                .add_function("get_current_method", fn_type, None)
+        }
+    }
+
+    fn get_or_create_get_current_path(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("get_current_path") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[], false);
+            self.module.add_function("get_current_path", fn_type, None)
+        }
+    }
+
+    // ───── Obj (Kv) extern bindings ─────
+    fn get_or_create_qs_obj_new(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("qs_obj_new") {
+            f
+        } else {
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = void_ptr.fn_type(&[], false);
+            self.module.add_function("qs_obj_new", fn_type, None)
+        }
+    }
+
+    fn get_or_create_qs_obj_insert_str(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("qs_obj_insert_str") {
+            f
+        } else {
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = self
+                .context
+                .void_type()
+                .fn_type(&[void_ptr.into(), i8ptr.into(), i8ptr.into()], false);
+            self.module.add_function("qs_obj_insert_str", fn_type, None)
+        }
+    }
+
+    fn get_or_create_qs_obj_get_str(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("qs_obj_get_str") {
+            f
+        } else {
+            let void_ptr = self.context.ptr_type(AddressSpace::default());
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[void_ptr.into(), i8ptr.into()], false);
+            self.module.add_function("qs_obj_get_str", fn_type, None)
         }
     }
 
@@ -3255,18 +6692,33 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
         Expr::Variable(v) => match ctx.var_types.get(v) {
             Some(t) => Ok(t.clone()),
             None => {
-                eprintln!("Variable \"{}\" not found", v);
-                std::process::exit(70);
+                if let Some(l) = ctx.types.get(v) {
+                    Ok(Type::Custom(l.clone()))
+                } else {
+                    Err(format!("Variable \"{v}\" not found"))
+                }
             }
         },
-        Expr::Index(list, _) => get_type_of_expr(list, ctx),
-        Expr::Object(_name, o) => {
-            let mut fields = HashMap::new();
-            for (name, expr) in o.iter() {
-                let field_type = get_type_of_expr(expr, ctx)?;
-                fields.insert(name.clone(), field_type);
+        Expr::Function(params, ret_type, body) => {
+            Ok(Type::Function(params.to_vec(), Box::new(ret_type.clone())))
+        }
+        Expr::Index(list, _) => match get_type_of_expr(list, ctx)? {
+            Type::List(inner) => Ok(*inner),
+            Type::Str => Ok(Type::Str), // indexing a string yields a one-character string
+            other => Err(format!("Cannot index into type {:?}", other)),
+        },
+        Expr::Object(name, o) => {
+            // Prefer the declared object type (by name) if available.
+            if let Some(Custype::Object(declared)) = ctx.types.get(name) {
+                return Ok(Type::Custom(Custype::Object(declared.clone())));
             }
-            Ok(Type::Custom(fields))
+            // Fallback: infer a structural object type from field expressions.
+            let mut fields = HashMap::new();
+            for (fname, expr) in o.iter() {
+                let field_type = get_type_of_expr(expr, ctx)?;
+                fields.insert(fname.clone(), field_type);
+            }
+            Ok(Type::Custom(Custype::Object(fields)))
         }
         Expr::Literal(tk) => match tk {
             Value::Num(_) => Ok(Type::Num),
@@ -3283,8 +6735,8 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
         Expr::Unary(_, e) => get_type_of_expr(e, ctx),
         Expr::Grouping(e) => get_type_of_expr(e, ctx),
         Expr::Binary(l, op, r) => {
-            let lt = get_type_of_expr(l, ctx)?;
-            let rt = get_type_of_expr(r, ctx)?;
+            let lt = get_type_of_expr(l, ctx)?.unwrap();
+            let rt = get_type_of_expr(r, ctx)?.unwrap();
             match op {
                 BinOp::Plus => match (&lt, &rt) {
                     (Type::Num, Type::Num) => Ok(Type::Num),
@@ -3310,14 +6762,62 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
         }
 
         Expr::Get(obj, prop) => {
+            // Special-case: Obj.new()
+            if let Expr::Variable(name) = &**obj {
+                if name == "Obj" {
+                    return match prop.as_str() {
+                        // Default to Obj(Str) for now; user will refine types later
+                        "new" => Ok(Type::Function(
+                            vec![],
+                            Box::new(Type::Kv(Box::new(Type::Nil))),
+                        )),
+                        other => Err(format!("Unknown property '{}' on Obj", other)),
+                    };
+                }
+            }
+
             // Type-checking for field access
             let obj_type = get_type_of_expr(obj, ctx)?;
             match obj_type {
-                Type::List(_) => {
+                Type::Kv(inner) => match prop.as_str() {
+                    // If inner is Nil (unknown yet), allow first insert to pick the type
+                    "insert" => {
+                        let val_ty = if *inner == Type::Nil {
+                            // Accept any value type on first insert; actual unification happens
+                            // in call checking or statement parsing.
+                            Type::Nil
+                        } else {
+                            *inner.clone()
+                        };
+                        Ok(Type::Function(
+                            vec![
+                                ("key".to_string(), Type::Str),
+                                ("value".to_string(), val_ty),
+                            ],
+                            Box::new(Type::Nil),
+                        ))
+                    }
+                    "get" => Ok(Type::Function(
+                        vec![("key".to_string(), Type::Str)],
+                        Box::new(Type::Option(inner)),
+                    )),
+                    other => Err(format!("Property '{other}' not found on Obj")),
+                },
+                Type::List(t) => {
                     if prop == "len" {
                         Ok(Type::Function(vec![], Box::new(Type::Num)))
+                    } else if prop == "push" {
+                        Ok(Type::Function(
+                            vec![("pushing".to_string(), *t)],
+                            Box::new(Type::Nil),
+                        ))
+                    } else if prop == "remove" {
+                        Ok(Type::Function(
+                            vec![("removing".to_string(), Type::Num)],
+                            Box::new(Type::Nil),
+                        ))
                     } else {
-                        Err(format!("Property '{}' not found on list type", prop))
+                        Err(format!("Property '{prop}' not found on list type"))
                     }
                 }
                 Type::Io => {
@@ -3326,48 +6826,182 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                     match prop.as_str() {
                         "random" => Ok(Type::Function(vec![], Box::new(Type::Num))),
                         "input" => Ok(Type::Function(
-                            vec![("prompt".to_string(), "Str".to_string())],
+                            vec![("prompt".to_string(), Type::Str)],
                             Box::new(Type::Str),
                         )),
-                        "route" => Ok(Type::Function(
+
+                        "listen" => Ok(Type::Function(
                             vec![
-                                ("method".to_string(), "Str".to_string()),
-                                ("route".to_string(), "Str".to_string()),
-                                ("func".to_string(), "Function".to_string()),
+                                ("port".to_string(), Type::Num),
+                                (
+                                    "handler".to_string(),
+                                    Type::Function(
+                                        vec![(
+                                            "req".to_string(),
+                                            Type::Custom(Custype::Object(HashMap::new())),
+                                        )],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                ),
                             ],
                             Box::new(Type::Nil),
                         )),
-                        "listen" => Ok(Type::Function(
-                            vec![("port".to_string(), "Num".to_string())],
-                            Box::new(Type::Nil),
-                        )),
+                        "range" => Ok(Type::RangeBuilder),
                         "read" => Ok(Type::Function(
-                            vec![("path".to_string(), "Str".to_string())],
-                            Box::new(Type::Str),
+                            vec![("path".to_string(), Type::Str)],
+                            Box::new(Type::Option(Box::new(Type::Str))),
                         )),
                         "write" => Ok(Type::Function(
                             vec![
-                                ("path".to_string(), "Str".to_string()),
-                                ("content".to_string(), "Str".to_string()),
+                                ("path".to_string(), Type::Str),
+                                ("content".to_string(), Type::Str),
                             ],
                             Box::new(Type::Nil),
                         )),
-                        other => Err(format!("Unknown property '{}' on io", other)),
+                        "web" => Ok(Type::Function(
+                            vec![],
+                            Box::new(Type::Custom({
+                                let mut web_type = HashMap::new();
+                                web_type.insert(
+                                    "text".to_string(),
+                                    Type::Function(
+                                        vec![("content".to_string(), Type::Str)],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+                                web_type.insert(
+                                    "page".to_string(),
+                                    Type::Function(
+                                        vec![("content".to_string(), Type::Str)],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+                                web_type.insert(
+                                    "file".to_string(),
+                                    Type::Function(
+                                        vec![("name".to_string(), Type::Str)],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+                                web_type.insert(
+                                    "json".to_string(),
+                                    Type::Function(
+                                        vec![("content".to_string(), Type::Str)],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+
+                                web_type.insert(
+                                    "redirect".to_string(),
+                                    Type::Function(
+                                        vec![
+                                            ("location".to_string(), Type::Str),
+                                            ("permanent".to_string(), Type::Bool),
+                                        ],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+                                // Add error property with text method
+                                let mut error_type = HashMap::new();
+                                error_type.insert(
+                                    "text".to_string(),
+                                    Type::Function(
+                                        vec![
+                                            ("status".to_string(), Type::Num),
+                                            ("content".to_string(), Type::Str),
+                                        ],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+                                error_type.insert(
+                                    "page".to_string(),
+                                    Type::Function(
+                                        vec![
+                                            ("status".to_string(), Type::Num),
+                                            ("content".to_string(), Type::Str),
+                                        ],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+                                error_type.insert(
+                                    "file".to_string(),
+                                    Type::Function(
+                                        vec![
+                                            ("status".to_string(), Type::Num),
+                                            ("name".to_string(), Type::Str),
+                                        ],
+                                        Box::new(Type::WebReturn),
+                                    ),
+                                );
+                                web_type.insert(
+                                    "error".to_string(),
+                                    Type::Custom(Custype::Object(error_type)),
+                                );
+                                Custype::Object(web_type)
+                            })),
+                        )),
+                        other => Err(format!("Unknown property '{other}' on io")),
                     }
                 }
+                Type::RangeBuilder => match prop.as_str() {
+                    "to" => Ok(Type::Function(
+                        vec![("rang".to_string(), Type::Num)],
+                        Box::new(Type::RangeBuilder),
+                    )),
+                    "from" => Ok(Type::Function(
+                        vec![("rang".to_string(), Type::Num)],
+                        Box::new(Type::RangeBuilder),
+                    )),
+                    "step" => Ok(Type::Function(
+                        vec![("rang".to_string(), Type::Num)],
+                        Box::new(Type::RangeBuilder),
+                    )),
+                    other => Err(format!("Unknown property '{other}' on io.range")),
+                },
                 Type::Num => match prop.as_str() {
                     "str" => Ok(Type::Function(vec![], Box::new(Type::Str))),
-                    other => Err(format!("Unknown property '{}' on type Num", other)),
+                    other => Err(format!("Unknown property '{other}' on type Num")),
                 },
-                Type::Custom(fields) => {
+                Type::Custom(Custype::Object(fields)) => {
                     // Look up property in custom type
                     if let Some(t) = fields.get(prop) {
                         Ok(t.clone())
                     } else {
-                        Err(format!(
-                            "Property '{}' not found on type {:?}",
-                            prop, fields,
+                        Err(format!("Property '{prop}' not found on type {fields:?}"))
+                    }
+                }
+                Type::Custom(Custype::Enum(ref variants)) => {
+                    if variants.contains(prop) {
+                        Ok(obj_type)
+                    } else {
+                        Err(format!("Enum {:?} does not contain variant {}", obj, prop))
+                    }
+                }
+                Type::Str => {
+                    if prop == "len" {
+                        Ok(Type::Function(vec![], Box::new(Type::Num)))
+                    } else if prop == "num" {
+                        Ok(Type::Function(
+                            vec![],
+                            Box::new(Type::Option(Box::new(Type::Num))),
                         ))
+                    } else if prop == "starts_with" {
+                        Ok(Type::Function(
+                            vec![("thing".to_string(), Type::Str)],
+                            Box::new(Type::Bool),
+                        ))
+                    } else if prop == "ends_with" {
+                        Ok(Type::Function(
+                            vec![("thing".to_string(), Type::Str)],
+                            Box::new(Type::Bool),
+                        ))
+                    } else if prop == "contains" {
+                        Ok(Type::Function(
+                            vec![("needle".to_string(), Type::Str)],
+                            Box::new(Type::Bool),
+                        ))
+                    } else {
+                        Err(format!("Property '{prop}' not found on type Str"))
                     }
                 }
                 other => Err(format!(
@@ -3379,20 +7013,155 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
         Expr::Block(_) => Ok(Type::Nil),
         Expr::Call(callee, args) => {
             // Special-case: io.random() always returns a number
-            if let Expr::Get(inner, prop) = &**callee {
-                if let Expr::Variable(obj) = &**inner {
-                    if obj == "io" && prop == "random" {
-                        if args.is_empty() {
-                            return Ok(Type::Num);
-                        } else {
-                            return Err(format!(
-                                "io.random() expects no arguments, got {}",
-                                args.len(),
-                            ));
-                        }
-                    }
-                }
-            }
+            //             if let Expr::Get(inner, prop) = &**callee {
+            // if let Expr::Variable(obj) = &**inner {
+            //     if obj == "io" && prop == "random" {
+            //         if args.is_empty() {
+            //             return Ok(Type::Num);
+            //         } else {
+            //             return Err(format!(
+            //                 "io.random() expects no arguments, got {}",
+            //                 args.len(),
+            //             ));
+            //         }
+            //     } else if obj == "io" && prop == "listen" {
+            //         if args.len() == 1 || args.len() == 2 {
+            //             return Ok(Type::Num); // io.listen returns a number
+            //         } else {
+            //             return Err(format!(
+            //                 "io.listen() expects 1 or 2 arguments, got {}",
+            //                 args.len(),
+            //             ));
+            //         }
+            //     } else if obj == "io" && prop == "method" {
+            //         if args.is_empty() {
+            //             return Ok(Type::Str); // io.method() returns a string
+            //         } else {
+            //             return Err(format!(
+            //                 "io.method() expects no arguments, got {}",
+            //                 args.len(),
+            //             ));
+            //         }
+            //     } else if obj == "io" && prop == "path" {
+            //         if args.is_empty() {
+            //             return Ok(Type::Str); // io.path() returns a string
+            //         } else {
+            //             return Err(format!(
+            //                 "io.path() expects no arguments, got {}",
+            //                 args.len(),
+            //             ));
+            //         }
+            //     } else if obj == "io" && prop == "web" {
+            //         if args.is_empty() {
+            //             return Ok(Type::Custom({
+            //                 let mut web_type = HashMap::new();
+            //                 web_type.insert(
+            //                     "text".to_string(),
+            //                     Type::Function(
+            //                         vec![("content".to_string(), Type::Str)],
+            //                         Box::new(Type::WebReturn),
+            //                     ),
+            //                 );
+            //                 web_type.insert(
+            //                     "page".to_string(),
+            //                     Type::Function(
+            //                         vec![("content".to_string(), Type::Str)],
+            //                         Box::new(Type::WebReturn),
+            //                     ),
+            //                 );
+            //                 web_type.insert(
+            //                     "file".to_string(),
+            //                     Type::Function(
+            //                         vec![("name".to_string(), Type::Str)],
+            //                         Box::new(Type::WebReturn),
+            //                     ),
+            //                 );
+            //                 web_type.insert(
+            //                     "json".to_string(),
+            //                     Type::Function(
+            //                         vec![("content".to_string(), Type::Str)],
+            //                         Box::new(Type::WebReturn),
+            //                     ),
+            //                 );
+
+            //                 web_type.insert(
+            //                     "redirect".to_string(),
+            //                     Type::Function(
+            //                         vec![
+            //                             ("location".to_string(), Type::Str),
+            //                             ("permanent".to_string(), Type::Bool),
+            //                         ],
+            //                         Box::new(Type::WebReturn),
+            //                     ),
+            //                 );
+            //                 // Add error property with text method
+            //                 let mut error_type = HashMap::new();
+            //                 error_type.insert(
+            //                     "text".to_string(),
+            //                     Type::Function(
+            //                         vec![
+            //                             ("status".to_string(), Type::Num),
+            //                             ("content".to_string(), Type::Str),
+            //                         ],
+            //                         Box::new(Type::WebReturn),
+            //                     ),
+            //                 );
+            //                 error_type.insert(
+            //                     "page".to_string(),
+            //                     Type::Function(
+            //                         vec![
+            //                             ("status".to_string(), Type::Num),
+            //                             ("content".to_string(), Type::Str),
+            //                         ],
+            //                         Box::new(Type::WebReturn),
+            //                     ),
+            //                 );
+            //                 web_type.insert(
+            //                     "error".to_string(),
+            //                     Type::Custom(Custype::Object(error_type)),
+            //                 );
+            //                 Custype::Object(web_type)
+            //             })); // io.web() returns a web helper object
+            //         } else {
+            //             return Err(format!("io.web() expects no arguments, got {}", args.len(),));
+            //         }
+            //     } else if obj == "io" && prop == "read" {
+            //         if args.len() == 1 {
+            //             return Ok(Type::Str); // io.read() returns a string (async by default)
+            //         } else {
+            //             return Err(format!("io.read() expects 1 argument, got {}", args.len(),));
+            //         }
+            //     } else if obj == "io" && prop == "write" {
+            //         if args.len() == 2 {
+            //             return Ok(Type::Num); // io.write() returns a number (async by default)
+            //         } else {
+            //             return Err(format!(
+            //                 "io.write() expects 2 arguments, got {}",
+            //                 args.len(),
+            //             ));
+            //         }
+            //     } else if obj == "web" && (prop == "page" || prop == "text" || prop == "file") {
+            //         if args.len() == 1 {
+            //             return Ok(Type::WebReturn); // web.page() returns a response object
+            //         } else {
+            //             return Err(format!(
+            //                 "web.{prop}() expects 1 argument, got {}",
+            //                 args.len(),
+            //             ));
+            //         }
+            //     } else if obj == "web" && prop == "redirect" {
+            //         if args.len() == 2 {
+            //             return Ok(Type::WebReturn); // web.redirect() returns a response object
+            //         } else {
+            //             return Err(format!(
+            //                 "web.redirect() expects 2 arguments, got {}",
+            //                 args.len(),
+            //             ));
+            //         }
+            //     }
+            // }
+            // }
+
             // Existing function call type-checking
             let callee_type = get_type_of_expr(callee, ctx)?;
             if let Type::Function(params, ret_type) = callee_type {
@@ -3403,10 +7172,30 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                         args.len(),
                     ));
                 }
+                // Special-case: first insert decides Obj(K) inner type when currently unknown (Nil)
+                if let Expr::Get(obj, mname) = &**callee {
+                    if mname == "insert" {
+                        if let Ok(Type::Kv(inner)) = get_type_of_expr(obj, ctx) {
+                            if *inner == Type::Nil {
+                                // Ensure key is Str; allow any value type on first insert
+                                let key_ty = get_type_of_expr(&args[0], ctx)?;
+                                if key_ty != Type::Str {
+                                    return Err(format!(
+                                        "Parameter #0 type mismatch: expected {:?}, got {:?}",
+                                        Type::Str,
+                                        key_ty,
+                                    ));
+                                }
+                                // Skip strict check for value here; caller will solidify type.
+                                return Ok(*ret_type);
+                            }
+                        }
+                    }
+                }
                 // verify each arg’s inferred type against the declared parameter type
                 for (i, (_, param_tstr)) in params.iter().enumerate() {
                     let arg_t = get_type_of_expr(&args[i], ctx)?;
-                    if param_tstr == "Function" {
+                    if matches!(param_tstr, Type::Function(_, _)) {
                         // Accept any function value
                         if let Type::Function(_, _) = arg_t {
                             // OK
@@ -3417,13 +7206,8 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                             ));
                         }
                     } else {
-                        let expected = match param_tstr.as_str() {
-                            "Num" => Type::Num,
-                            "Str" => Type::Str,
-                            "Bool" => Type::Bool,
-                            _ => Type::Nil,
-                        };
-                        if expected != arg_t {
+                        let expected = param_tstr;
+                        if *expected != arg_t {
                             return Err(format!(
                                 "Parameter #{} type mismatch: expected {:?}, got {:?}",
                                 i, expected, arg_t,

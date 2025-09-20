@@ -1,0 +1,5 @@
+fun do_something() {
+    return("Hello, World!")
+}
+
+let this_thing = 67;

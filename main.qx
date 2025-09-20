@@ -1,0 +1,7 @@
+let lis = ["hello", "hi", "test", "wow"];
+
+lis[0] = "first";
+
+for i in io.range.to(lis.len()) {
+    print(lis[i])
+}
