@@ -1,7 +1,52 @@
-let lis = ["hello", "hi", "test", "wow"];
+let web = io.web();
+use json: "json";
+print "wow"
 
-lis[0] = "first";
-
-for i in io.range.to(lis.len()) {
-    print(lis[i])
+object Task {
+    text: Str, 
+    completed: Bool,
 }
+
+object User {
+    name: Str,
+    tasks: [Task],
+}
+
+let sessions: Obj(User) = Obj.new();
+
+
+
+let maybe_user = json.parse_user_json("{\"name\": \"Trig\", \"tasks\": []}");
+maybe maybe_user {
+    print("Yay")
+} else {
+    print "no"
+}
+
+//io.listen(8087, fun(req: Request) {
+//    let body = req.body;
+ //   if req.path == "/api/register" {
+ //       maybe body {
+ //           let session = io.random().str();
+//            sessions.insert(session, User{
+//                name: body,
+//                tasks: [],
+//            });
+//            return web.text("Success: " + session);
+//        } else {
+//            return web.text("Bruh");
+//        }
+//    } else {
+//        let page = io.read("./test" + req.path);
+//        let user = sessions.get(req.body.default("guest")).default(User {
+//            name: "Guest",
+//            tasks: [],
+//        });
+//        maybe page {
+//                return web.page(page.replace("{name}", user.name).replace("{tasks}", "[]"))
+//
+//       } else {
+//            web.text("Not found")
+//        }
+//    }
+//})

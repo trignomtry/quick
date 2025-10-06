@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn rand() -> i32;
     fn time(t: *mut i64) -> i64;
     fn srand(seed: u32);
+    fn fdopen(fd: i32, mode: *const i8) -> *mut std::ffi::c_void;
     fn fopen(filename: *const i8, mode: *const i8) -> *mut std::ffi::c_void;
     fn fwrite(
         ptr: *const std::ffi::c_void,
@@ -34,19 +35,65 @@ unsafe extern "C" {
     fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
 
 }
-// Provide a C-ABI function to obtain stdin as a raw pointer for JIT mappings
+
 #[unsafe(no_mangle)]
 pub extern "C" fn get_stdin() -> *mut std::ffi::c_void {
     unsafe {
         // Use fd 0 (STDIN) opened as a FILE* via fdopen("r")
         let mode = b"r\0";
-        libc::fdopen(0, mode.as_ptr() as *const i8) as *mut std::ffi::c_void
+        fdopen(0, mode.as_ptr() as *const i8)
     }
 }
 // ───── Minimal KV Object Runtime (string -> string) ─────
 // Fast baseline using std HashMap; can swap to ahash/hashbrown later
 struct KvMap {
-    inner: HashMap<String, std::ffi::CString>,
+    inner: HashMap<String, *mut c_void>,
+}
+
+#[derive(Clone)]
+struct CaptureDescriptor<'ctx> {
+    global_name: String,
+    ty: BasicTypeEnum<'ctx>,
+}
+
+struct FunctionScopeGuard<'a> {
+    stack: &'a RefCell<Vec<String>>,
+}
+
+impl<'a> FunctionScopeGuard<'a> {
+    fn new(stack: &'a RefCell<Vec<String>>, name: String) -> Self {
+        stack.borrow_mut().push(name);
+        Self { stack }
+    }
+}
+
+impl<'a> Drop for FunctionScopeGuard<'a> {
+    fn drop(&mut self) {
+        let _ = self.stack.borrow_mut().pop();
+    }
+}
+
+#[derive(Clone)]
+struct LoopContext<'ctx> {
+    break_block: BasicBlock<'ctx>,
+    _continue_block: BasicBlock<'ctx>,
+}
+
+struct LoopScopeGuard<'a, 'ctx> {
+    stack: &'a RefCell<Vec<LoopContext<'ctx>>>,
+}
+
+impl<'a, 'ctx> LoopScopeGuard<'a, 'ctx> {
+    fn new(stack: &'a RefCell<Vec<LoopContext<'ctx>>>, ctx: LoopContext<'ctx>) -> Self {
+        stack.borrow_mut().push(ctx);
+        Self { stack }
+    }
+}
+
+impl<'a, 'ctx> Drop for LoopScopeGuard<'a, 'ctx> {
+    fn drop(&mut self) {
+        let _ = self.stack.borrow_mut().pop();
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -58,43 +105,148 @@ pub extern "C" fn qs_obj_new() -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qs_obj_insert_str(
-    map: *mut c_void,
-    key: *const c_char,
-    val: *const c_char,
-) {
-    if map.is_null() || key.is_null() || val.is_null() {
+pub unsafe extern "C" fn qs_obj_insert_str(map: *mut c_void, key: *const c_char, val: *mut c_void) {
+    if map.is_null() || key.is_null() {
         return;
     }
     let m = &mut *(map as *mut KvMap);
-    // Key stays as Rust String for hashing; value is stored as owned CString
+    // Key stays as Rust String for hashing; value is stored as an opaque pointer
     let k = CStr::from_ptr(key).to_string_lossy().into_owned();
-    let cs = CStr::from_ptr(val).to_owned();
-    m.inner.insert(k, cs);
+    m.inner.insert(k, val);
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qs_obj_get_str(map: *mut c_void, key: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn qs_obj_get_str(map: *mut c_void, key: *const c_char) -> *mut c_void {
     if map.is_null() || key.is_null() {
         return std::ptr::null_mut();
     }
     let m = &mut *(map as *mut KvMap);
     let k = CStr::from_ptr(key).to_string_lossy().into_owned();
     match m.inner.get(&k) {
-        Some(cs) => cs.as_ptr() as *mut c_char, // valid as long as it's in the map
+        Some(ptr) => *ptr,
         None => std::ptr::null_mut(),
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_str_replace(
+    haystack: *const c_char,
+    needle: *const c_char,
+    replacement: *const c_char,
+) -> *mut c_char {
+    if haystack.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let hay_bytes = CStr::from_ptr(haystack).to_bytes();
+    let needle_bytes = if needle.is_null() {
+        &[][..]
+    } else {
+        CStr::from_ptr(needle).to_bytes()
+    };
+    let replacement_bytes = if replacement.is_null() {
+        &[][..]
+    } else {
+        CStr::from_ptr(replacement).to_bytes()
+    };
+
+    if needle_bytes.is_empty() {
+        return std::ffi::CString::new(hay_bytes.to_vec())
+            .unwrap()
+            .into_raw();
+    }
+
+    let needle_len = needle_bytes.len();
+    let mut result = Vec::with_capacity(hay_bytes.len());
+    let mut index = 0;
+    let hay_len = hay_bytes.len();
+    while index < hay_len {
+        if index + needle_len <= hay_len && &hay_bytes[index..index + needle_len] == needle_bytes {
+            result.extend_from_slice(replacement_bytes);
+            index += needle_len;
+        } else {
+            result.push(hay_bytes[index]);
+            index += 1;
+        }
+    }
+
+    std::ffi::CString::new(result).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_str_split(
+    haystack: *const c_char,
+    delimiter: *const c_char,
+) -> *mut c_void {
+    let hay_bytes = if haystack.is_null() {
+        &[][..]
+    } else {
+        CStr::from_ptr(haystack).to_bytes()
+    };
+    let delim_bytes = if delimiter.is_null() {
+        &[][..]
+    } else {
+        CStr::from_ptr(delimiter).to_bytes()
+    };
+
+    let mut segments: Vec<Vec<u8>> = Vec::new();
+
+    if delim_bytes.is_empty() {
+        segments.push(hay_bytes.to_vec());
+    } else {
+        let mut start = 0usize;
+        let mut index = 0usize;
+        while index + delim_bytes.len() <= hay_bytes.len() {
+            if &hay_bytes[index..index + delim_bytes.len()] == delim_bytes {
+                segments.push(hay_bytes[start..index].to_vec());
+                index += delim_bytes.len();
+                start = index;
+            } else {
+                index += 1;
+            }
+        }
+        segments.push(hay_bytes[start..].to_vec());
+    }
+
+    let mut c_strings: Vec<*mut c_void> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let c = std::ffi::CString::new(seg).unwrap();
+        c_strings.push(c.into_raw() as *mut c_void);
+    }
+
+    let slots = c_strings.len() + 1;
+    let total_bytes = slots * std::mem::size_of::<*mut c_void>();
+    let buffer = malloc(total_bytes);
+    if buffer.is_null() {
+        for ptr in c_strings {
+            let _ = std::ffi::CString::from_raw(ptr as *mut c_char);
+        }
+        return std::ptr::null_mut();
+    }
+
+    // First slot stores the length as f64
+    let len_ptr = buffer.cast::<f64>();
+    *len_ptr = c_strings.len() as f64;
+
+    // Remaining slots store string pointers
+    let data_ptr = buffer.cast::<*mut c_void>().add(1);
+    for (idx, ptr) in c_strings.into_iter().enumerate() {
+        data_ptr.add(idx).write(ptr);
+    }
+
+    buffer
 }
 use hyper::body::Body;
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context;
-use inkwell::execution_engine::{ExecutionEngine, JitFunction};
-use inkwell::module::Module;
+use inkwell::execution_engine::{ExecutionEngine, FunctionLookupError, JitFunction};
+use inkwell::module::{Linkage, Module};
 use inkwell::types::{BasicType, BasicTypeEnum};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, PointerValue,
+    BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -103,12 +255,9 @@ use std::fmt::{Debug, Display, Formatter};
 use std::mem;
 use std::ptr;
 
-use std::ptr::null_mut;
-use std::sync::Arc;
-
-use libc::c_void;
 use std::convert::Infallible;
 use std::ffi::CStr;
+use std::ffi::c_void;
 use std::future::Future;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
@@ -116,7 +265,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 // Hyper (async HTTP server)
-use hyper::body::HttpBody as _;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
 
@@ -155,7 +303,6 @@ fn block_on_in_runtime<F: Future>(fut: F) -> F::Output {
     }
 }
 
-// Simple Request object representation for JIT
 #[repr(C)]
 pub struct RequestObject {
     method: *mut c_char,
@@ -636,6 +783,31 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i32, callback: *const c_v
         .set(callback_addr)
         .expect("Callback already set");
 
+    if std::env::var("QS_TEST_REQUEST").is_ok() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("failed to build test runtime");
+        let request = HyperRequest::builder()
+            .method("GET")
+            .uri("http://localhost/trignomtry")
+            .body(Body::empty())
+            .expect("failed to build request");
+        for n in 0..2 {
+            let request = HyperRequest::builder()
+                .method("GET")
+                .uri("http://localhost/trignomtry")
+                .body(Body::empty())
+                .expect("failed to build request");
+            let response = rt
+                .block_on(handle_hyper_request(request, callback_addr))
+                .expect("handler error");
+            eprintln!("test handler #{} status: {}", n + 1, response.status());
+        }
+        return;
+    }
+
     // Use same runtime configuration as original
     let cpu_count = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1108,6 +1280,8 @@ enum TokenKind {
     Comma,
     Plus,
     Minus,
+    AmpAmp,
+    PipePipe,
     Colon,
     Semicolon,
     Equal,
@@ -1136,6 +1310,7 @@ enum TokenKind {
     Print,
     Reprint,
     Return,
+    Break,
     Super,
     This,
     True,
@@ -1159,6 +1334,8 @@ enum BinOp {
     Minus,
     Mult,
     Div,
+    And,
+    Or,
     NotEq,
     EqEq,
     Greater,
@@ -1174,7 +1351,6 @@ enum Expr {
     Unary(Unary, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     Binary(Box<Expr>, BinOp, Box<Expr>),
-    Grouping(Box<Expr>),
     Get(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     List(Vec<Expr>),
@@ -1189,10 +1365,13 @@ enum Instruction {
         name: String,
         value: Expr,
         type_hint: Type,
+        global: bool,
     },
     Assign(Expr, Expr, Option<Type>),
     Println(Expr),
     Return(Expr),
+    Break,
+    Expr(Expr),
     If {
         condition: Expr,
         then: Vec<Instruction>,
@@ -1232,41 +1411,8 @@ enum Value {
     Num(f64),
     Str(String),
     /// Special return value used to signal early exit from functions
-    Return(Box<Value>),
-    Object(HashMap<String, Value>),
     Bool(bool),
-    Function(Vec<(String, String)>, Vec<Instruction>),
-    List(Vec<Value>),
     Nil,
-}
-
-#[derive(Default, Clone, Debug)]
-enum Reqs {
-    #[default]
-    Get,
-    Post,
-}
-
-#[derive(Default, Clone, Debug)]
-enum PathPart {
-    #[default]
-    Dynamic,
-    Static(String),
-}
-
-impl PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Num(l), Value::Num(r)) => l == r,
-            (Value::Str(l), Value::Str(r)) => l == r,
-            (Value::Bool(l), Value::Bool(r)) => l == r,
-            (Value::Function(l, _), Value::Function(r, _)) => l == r,
-            (Value::List(l), Value::List(r)) => l == r,
-            (Value::Nil, Value::Nil) => true,
-
-            _ => false,
-        }
-    }
 }
 
 impl Debug for Value {
@@ -1274,63 +1420,9 @@ impl Debug for Value {
         match self {
             Self::Num(n) => write!(f, "Num({n})"),
             Self::Str(s) => write!(f, "Str({s})"),
-            Self::Return(v) => write!(f, "{:?}", *v),
             Self::Bool(b) => write!(f, "Bool({b})"),
-            Self::Function(p, _) => write!(f, "Function({})", p.len()),
-            Self::List(l) => write!(
-                f,
-                "[{}]",
-                l.iter()
-                    .map(move |f| format!("{:?}", f))
-                    .collect::<Vec<String>>()
-                    .join(", ")
-            ),
-            Self::Object(o) => write!(f, "{:?}", o),
-            Self::Nil => write!(f, "nil"),
-        }
-    }
-}
 
-impl Display for Value {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Num(n) => write!(f, "{n}"),
-            Self::Str(s) => write!(f, "{s}"),
-            Self::Return(v) => write!(f, "{:?}", *v),
-            Self::Bool(b) => write!(f, "{b}"),
-            Self::Function(p, _) => write!(f, "{}", p.len()),
-            Self::List(l) => write!(
-                f,
-                "[{}]",
-                l.iter()
-                    .map(move |f| format!("{:?}", f))
-                    .collect::<Vec<String>>()
-                    .join(", ")
-            ),
-            Self::Object(o) => write!(f, "{:?}", o),
             Self::Nil => write!(f, "nil"),
-        }
-    }
-}
-
-impl Value {
-    fn value(&self) -> String {
-        match self {
-            Value::Num(n) => n.to_string(),
-            Value::Str(s) => s.to_string(),
-            Value::Return(inner) => inner.value(),
-            Value::Function(_, _) => "function block".to_string(),
-            Value::List(vals) => {
-                let inner = vals
-                    .iter()
-                    .map(|v| v.value())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("[{inner}]")
-            }
-            Value::Object(o) => format!("{:?}", o),
-            Value::Nil => "nil".to_string(),
-            Value::Bool(b) => b.to_string(),
         }
     }
 }
@@ -1350,6 +1442,8 @@ struct ModuleInfo {
     constants: HashMap<String, Expr>,
     // type map for fields (functions -> Function types, constants -> concrete types)
     field_types: HashMap<String, Type>,
+    // Object/enum type definitions declared inside the module
+    types: HashMap<String, Custype>,
 }
 
 impl Default for ModuleInfo {
@@ -1358,6 +1452,7 @@ impl Default for ModuleInfo {
             functions: HashMap::new(),
             constants: HashMap::new(),
             field_types: HashMap::new(),
+            types: HashMap::new(),
         }
     }
 }
@@ -1390,6 +1485,8 @@ struct Parser {
     inside_maybe: Option<String>,
     saw_non_nil_return: bool,
     saw_nil_return: bool,
+    is_global: bool,
+    loop_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1414,6 +1511,48 @@ impl Type {
             l.unwrap()
         } else {
             self.clone()
+        }
+    }
+    fn infer(&self, expected: &Type) -> Option<Type> {
+        match (self, expected) {
+            (Type::List(b), Type::List(e)) if **b == Type::Nil => Some(Type::List(e.clone())),
+            (Type::Kv(b), Type::List(e)) if **b == Type::Nil => Some(Type::Kv(e.clone())),
+            (o, e) => {
+                if o == e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn merge_return_types(old: &Type, new: &Type) -> Option<Type> {
+    if old == new {
+        return Some(old.clone());
+    }
+
+    match (old, new) {
+        (Type::Nil, other) => Some(Type::Option(Box::new(other.clone()))),
+        (other, Type::Nil) => Some(Type::Option(Box::new(other.clone()))),
+        (Type::Option(inner_old), Type::Option(inner_new)) => {
+            merge_return_types(inner_old, inner_new).map(|merged| Type::Option(Box::new(merged)))
+        }
+        (Type::Option(inner_old), other) => {
+            merge_return_types(inner_old, other).map(|merged| Type::Option(Box::new(merged)))
+        }
+        (other, Type::Option(inner_new)) => {
+            merge_return_types(other, inner_new).map(|merged| Type::Option(Box::new(merged)))
+        }
+        _ => {
+            if let Some(inferred) = old.infer(new) {
+                Some(inferred)
+            } else if let Some(inferred) = new.infer(old) {
+                Some(inferred)
+            } else {
+                None
+            }
         }
     }
 }
@@ -1466,6 +1605,8 @@ impl Parser {
             inside_maybe: None,
             saw_non_nil_return: false,
             saw_nil_return: false,
+            is_global: true,
+            loop_depth: 0,
         }
     }
 
@@ -1505,24 +1646,22 @@ impl Parser {
                 self.saw_non_nil_return = true;
             }
             // Unify return types: allow Nil and uniform type => Option(inner)
-            let new_ret_type = if let Some(old) = &self.current_return_type {
-                if *old == ret_type {
-                    old
-                } else if *old == Type::Nil {
-                    &Type::Option(Box::new(ret_type))
-                } else if ret_type == Type::Nil {
-                    &Type::Option(Box::new(old.clone()))
-                } else {
-                    return Err(format!(
-                        "Mismatched return types in function: {old:?} vs {ret_type:?}"
-                    ));
-                }
+            let merged_return_type = if let Some(old) = self.current_return_type.clone() {
+                merge_return_types(&old, &ret_type).ok_or_else(|| {
+                    format!("Mismatched return types in function: {old:?} vs {ret_type:?}")
+                })?
             } else {
-                &ret_type
+                ret_type.clone()
             };
-            self.current_return_type = Some(new_ret_type.clone());
+            self.current_return_type = Some(merged_return_type);
             self.match_kind(TokenKind::Semicolon);
             Ok(Instruction::Return(expr))
+        } else if self.match_kind(TokenKind::Break) {
+            if self.loop_depth == 0 {
+                return Err("'break' can only be used inside a loop".into());
+            }
+            self.match_kind(TokenKind::Semicolon);
+            Ok(Instruction::Break)
         } else if self.match_kind(TokenKind::For) {
             let iterator = if let TokenKind::Identifier(name) = self.peek().kind.clone() {
                 self.advance();
@@ -1555,7 +1694,17 @@ impl Parser {
             // Loop variable is numeric; register for type checking before parsing body
             self.pctx.var_types.insert(iterator.clone(), Type::Num);
 
-            let body_stmt = self.parse_statement()?;
+            self.loop_depth += 1;
+            let body_stmt = match self.parse_statement() {
+                Ok(body) => {
+                    self.loop_depth -= 1;
+                    body
+                }
+                Err(e) => {
+                    self.loop_depth -= 1;
+                    return Err(e);
+                }
+            };
 
             Ok(Instruction::For {
                 iterator,
@@ -1632,6 +1781,7 @@ impl Parser {
                         name,
                         value,
                         type_hint,
+                        global,
                     } => {
                         // Only allow literal constants to avoid executing code
                         let is_literal = matches!(
@@ -1659,6 +1809,8 @@ impl Parser {
                     }
                 }
             }
+
+            minfo.types = mod_parser.pctx.types.clone();
 
             // Prevent name collisions with existing variables/types
             if self.pctx.var_types.contains_key(&modname) || self.pctx.types.contains_key(&modname)
@@ -1688,17 +1840,28 @@ impl Parser {
             } else {
                 panic!();
             };
+            let var_name = self.inside_maybe.as_ref().unwrap();
+            let old_type = { self.pctx.var_types.get(var_name).unwrap() };
+            self.pctx.var_types.insert(
+                var_name.to_string(),
+                match old_type {
+                    Type::Option(o) => *o.clone(),
+                    _ => old_type.clone(),
+                },
+            );
 
             let block = self.parse_statement()?;
             let mut once_else = None;
             if self.match_kind(TokenKind::Else) {
                 once_else = Some(Box::new(self.parse_statement()?));
             }
-            let peekd = self.peek().line;
 
             self.inside_maybe = prev_inside.clone();
+
             Ok(Instruction::Maybe(maybe, Box::new(block), once_else))
         } else if self.match_kind(TokenKind::LBrace) {
+            let was = self.is_global;
+            self.is_global = false;
             // Static type scope for block: save outer types
             let saved_types = self.pctx.var_types.clone();
             let mut stmts = Vec::new();
@@ -1708,7 +1871,7 @@ impl Parser {
             self.consume(TokenKind::RBrace, "Expected '}' after block")?;
             // Restore outer static types after block
             self.pctx.var_types = saved_types;
-
+            self.is_global = was;
             Ok(Instruction::Block(stmts))
         } else if self.match_kind(TokenKind::Print) || self.match_kind(TokenKind::Reprint) {
             let prkind = self.previous().clone();
@@ -1722,7 +1885,7 @@ impl Parser {
                         if let Expr::Variable(ref vname) = expr {
                             if vname != var_name {
                                 return Err(
-                            "Cannot use a value that might be nil outside of a `maybe` block."
+                            "Cannot use a value that might be none outside of a `maybe` block."
                                 .into(),
                         );
                             }
@@ -1829,7 +1992,7 @@ impl Parser {
             Ok(Instruction::FunctionDef {
                 body: vec![block],
                 name: fun_name,
-                params: params,
+                params,
                 return_type: fn_ret_type,
             })
         } else if self.match_kind(TokenKind::If) {
@@ -1896,7 +2059,17 @@ impl Parser {
                 ));
             }
             // Parse the loop body (a statement, e.g., a block)
-            let body = self.parse_statement()?;
+            self.loop_depth += 1;
+            let body = match self.parse_statement() {
+                Ok(stmt) => {
+                    self.loop_depth -= 1;
+                    stmt
+                }
+                Err(e) => {
+                    self.loop_depth -= 1;
+                    return Err(e);
+                }
+            };
             // Generate a function for the while loop
             Ok(Instruction::While {
                 body: vec![body],
@@ -1909,6 +2082,10 @@ impl Parser {
             } else {
                 return Err("Expected a variable name after 'let'".into());
             };
+            let mut type_hint = None;
+            if self.match_kind(Colon) {
+                type_hint = Some(self.parse_type()?);
+            }
             self.consume(TokenKind::Equal, "Expected = after variable name")?;
             let expr = self.expression()?;
             // Special-case list literal assignment
@@ -1930,23 +2107,50 @@ impl Parser {
             }
             // Static type checking: infer expression type and enforce consistency
             let expr_type = get_type_of_expr(&expr, &self.pctx)?;
-            if let Some(existing) = self.pctx.var_types.get(&var_name) {
-                if *existing != expr_type {
-                    return Err(format!(
-                        "Cannot redeclare variable '{}' with different type. Previous: {:?}, New: {:?}",
-                        var_name, existing, expr_type,
-                    ));
+            let real_type = if let Some(hint) = type_hint {
+                match (expr_type.clone(), (hint)) {
+                    (Type::Kv(l), Type::Kv(y)) => Type::Kv(y),
+                    (Type::List(act), Type::List(exp)) if *act == Type::Nil => Type::List(exp),
+                    (act, exp) => {
+                        if act != exp {
+                            eprintln!(
+                                "Expected type {exp:?}, found {act:?} for variable {var_name}"
+                            );
+                            std::process::exit(70);
+                        } else {
+                            exp
+                        }
+                    }
                 }
             } else {
-                self.pctx
-                    .var_types
-                    .insert(var_name.clone(), expr_type.clone());
+                expr_type.clone()
+            };
+            if let Some(existing) = self.pctx.var_types.get(&var_name) {
+                let redeclaration_conflict = if *existing == real_type {
+                    false
+                } else {
+                    match (existing, &real_type) {
+                        (Type::List(inner), Type::List(_)) if **inner == Type::Nil => false,
+                        (Type::Kv(inner), Type::Kv(_)) if **inner == Type::Nil => false,
+                        _ => true,
+                    }
+                };
+
+                if redeclaration_conflict {
+                    return Err(format!(
+                        "Cannot redeclare variable '{var_name}' with different type. Previous: {existing:?}, New: {real_type:?}",
+                    ));
+                }
             }
+            self.pctx
+                .var_types
+                .insert(var_name.clone(), real_type.clone());
             self.match_kind(TokenKind::Semicolon);
             Ok(Instruction::Let {
                 name: var_name,
                 value: expr,
-                type_hint: expr_type,
+                type_hint: real_type,
+                global: self.is_global,
             })
         } else {
             // expression statement or assignment with complex left-hand side
@@ -2007,7 +2211,7 @@ impl Parser {
             if self.inside_maybe.is_none() {
                 if let Type::Option(_) = expr_type {
                     return Err(
-                        "Cannot use a value that might be nil outside of a `maybe` block.".into(),
+                        "Cannot use a value that might be none outside of a `maybe` block.".into(),
                     );
                 }
             }
@@ -2030,13 +2234,21 @@ impl Parser {
                     }
                 }
             }
-            self.match_kind(TokenKind::Semicolon);
-            Ok(Instruction::Return(expr))
+            if self.match_kind(TokenKind::Semicolon) {
+                Ok(Instruction::Expr(expr))
+            } else {
+                Ok(Instruction::Return(expr))
+            }
         }
     }
 
     fn parse_type(&mut self) -> Result<Type, String> {
         match self.peek().kind {
+            Maybe => {
+                self.advance();
+                let inner = self.parse_type()?;
+                Ok(Type::Option(Box::new(inner)))
+            }
             LBrack => {
                 self.advance();
                 let inside = self.parse_type()?;
@@ -2054,7 +2266,7 @@ impl Parser {
                         if let Some(t) = self.pctx.types.get(l) {
                             Some(Type::Custom(t.clone()))
                         } else {
-                            return Err(format!("Type not found"));
+                            return Err(format!("Type {l} not found"));
                         }
                     }
                 };
@@ -2080,7 +2292,29 @@ impl Parser {
 
     // ───── recursive-descent grammar ─────
     fn expression(&mut self) -> Result<Expr, String> {
-        self.equality()
+        self.or()
+    }
+
+    fn or(&mut self) -> Result<Expr, String> {
+        let mut expr = self.and()?;
+
+        while self.match_any(&[TokenKind::Or, TokenKind::PipePipe]) {
+            let right = self.and()?;
+            expr = Expr::Binary(Box::new(expr), BinOp::Or, Box::new(right));
+        }
+
+        Ok(expr)
+    }
+
+    fn and(&mut self) -> Result<Expr, String> {
+        let mut expr = self.equality()?;
+
+        while self.match_any(&[TokenKind::And, TokenKind::AmpAmp]) {
+            let right = self.equality()?;
+            expr = Expr::Binary(Box::new(expr), BinOp::And, Box::new(right));
+        }
+
+        Ok(expr)
     }
 
     fn parse_fn_params_body(&mut self) -> Result<(Vec<(String, Type)>, Type, Instruction), String> {
@@ -2340,46 +2574,59 @@ impl Parser {
         } else if let TokenKind::Identifier(i) = &pekd.kind {
             self.advance();
 
-            if i.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-                && self.match_kind(TokenKind::LBrace)
-            {
+            let is_object_type = matches!(self.pctx.types.get(i), Some(Custype::Object(_)));
+
+            if is_object_type && self.check(&TokenKind::LBrace) {
+                self.advance();
                 let mut vals = HashMap::new();
                 while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
                     let Identifier(key) = self.peek().kind else {
-                        return Err(format!("Expected identifier, found {}", self.peek().kind));
+                        return Err(format!(
+                            "Expected identifier, found {} and {}",
+                            self.advance().value.clone(),
+                            self.advance().value,
+                        ));
                     };
                     self.advance();
                     self.consume(Colon, "Expected ':' after field name")?;
                     let expr = self.expression()?;
-                    if !self.match_any(&[TokenKind::Comma, TokenKind::RBrace]) {
-                        return Err(format!(
-                            "Expected ',' or '}}' after field declaration, found {}",
-                            self.peek().kind
-                        ));
-                    }
                     vals.insert(key, expr);
-                }
-                self.consume(TokenKind::RBrace, "Expected '}' after object literal")?;
-                if let Some(Custype::Object(r)) = self.pctx.types.get(i) {
-                    let mut all_fields_present = true;
-                    for (name, typ) in r.iter() {
-                        if let Some(r_val) = vals.get(name) {
-                            let real_type = get_type_of_expr(r_val, &self.pctx)?;
 
-                            println!("Typ: {typ:?}, Real: {real_type:?}");
-                            if real_type != *typ {
-                                return Err(format!(
-                                    "Expected {name} to be type {typ:?}, got {real_type:?}",
-                                ));
-                            }
-                        } else {
-                            all_fields_present = false;
-                            break;
+                    if self.match_kind(TokenKind::Comma) {
+                        continue;
+                    }
+
+                    self.consume(TokenKind::RBrace, "Expected '}' after object literal")?;
+                    break;
+                }
+                if self.check(&TokenKind::RBrace) {
+                    self.advance();
+                }
+                let Custype::Object(r) = self
+                    .pctx
+                    .types
+                    .get(i)
+                    .expect("Object type should exist for literal")
+                else {
+                    unreachable!();
+                };
+                let mut all_fields_present = true;
+                for (name, typ) in r.iter() {
+                    if let Some(r_val) = vals.get(name) {
+                        let real_type = get_type_of_expr(r_val, &self.pctx)?;
+
+                        if real_type.infer(typ).is_none() {
+                            return Err(format!(
+                                "Expected {name} to be type {typ:?}, got {real_type:?}",
+                            ));
                         }
+                    } else {
+                        all_fields_present = false;
+                        break;
                     }
-                    if !all_fields_present {
-                        return Err(format!("{i} object requires more fields"));
-                    }
+                }
+                if !all_fields_present {
+                    return Err(format!("{i} object requires more fields"));
                 }
                 return Ok(Expr::Object(i.clone(), vals));
             }
@@ -2505,6 +2752,8 @@ impl Display for TokenKind {
             Self::Comma => "COMMA",
             Self::Plus => "PLUS",
             Self::Minus => "MINUS",
+            Self::AmpAmp => "AMP_AMP",
+            Self::PipePipe => "PIPE_PIPE",
             Self::Colon => "COLON",
             Self::Semicolon => "SEMICOLON",
             Self::Equal => "EQUAL",
@@ -2533,6 +2782,7 @@ impl Display for TokenKind {
             Self::Print => "PRINT",
             Self::Reprint => "REPRINT",
             Self::Return => "RETURN",
+            Self::Break => "BREAK",
             Self::Super => "SUPER",
             Self::This => "THIS",
             Self::True => "TRUE",
@@ -2577,10 +2827,12 @@ fn get_special_ident(val: String) -> TokenKind {
         "fun" => Fun,
         "if" => If,
         "none" => Nil,
+        "nil" => Nil,
         "or" => Or,
         "print" => Print,
         "reprint" => Reprint,
         "return" => Return,
+        "break" => Break,
         "super" => Super,
         "this" => This,
         "true" => True,
@@ -2722,6 +2974,8 @@ fn main() {
             let execution_engine = module
                 .create_jit_execution_engine(OptimizationLevel::Aggressive)
                 .unwrap();
+            let initial_quick_types = parser.pctx.var_types.clone();
+            let parser_ctx = parser.pctx;
             let codegen = Compiler {
                 context: &context,
                 module,
@@ -2730,8 +2984,12 @@ fn main() {
                 instructions: p,
                 vars: RefCell::new(HashMap::new()),
                 var_types: RefCell::new(HashMap::new()),
-                pctx: RefCell::new(parser.pctx),
+                quick_var_types: RefCell::new(initial_quick_types),
+                pctx: RefCell::new(parser_ctx),
                 current_module: RefCell::new(None),
+                closure_envs: RefCell::new(HashMap::new()),
+                current_function: RefCell::new(Vec::new()),
+                loop_stack: RefCell::new(Vec::new()),
             };
 
             // seed the C PRNG so io.random() varies each run
@@ -2740,11 +2998,11 @@ fn main() {
                 let now = time(ptr::null_mut());
                 srand(now as u32);
             }
-
             let sum = codegen
                 .run_code()
                 .ok_or("Unable to JIT compile code")
                 .unwrap();
+            codegen.module.print_to_file("./ll.v");
 
             unsafe {
                 let res = sum.call();
@@ -2782,14 +3040,58 @@ struct Compiler<'ctx> {
     instructions: Vec<Instruction>,
     vars: RefCell<HashMap<String, PointerValue<'ctx>>>,
     var_types: RefCell<HashMap<String, BasicTypeEnum<'ctx>>>,
+    quick_var_types: RefCell<HashMap<String, Type>>,
     pctx: RefCell<PreCtx>,
     // Active module namespace during module function compilation
     current_module: RefCell<Option<String>>,
+    // Captured environments for inline functions: closure name -> captured vars
+    closure_envs: RefCell<HashMap<String, HashMap<String, CaptureDescriptor<'ctx>>>>,
+    // Stack of function names currently being emitted
+    current_function: RefCell<Vec<String>>,
+    loop_stack: RefCell<Vec<LoopContext<'ctx>>>,
 }
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
 use inkwell::types::BasicMetadataTypeEnum;
 impl<'ctx> Compiler<'ctx> {
+    fn get_active_capture_descriptor(&self, var_name: &str) -> Option<CaptureDescriptor<'ctx>> {
+        let fn_name = {
+            let stack = self.current_function.borrow();
+            stack.last()?.clone()
+        };
+        self.closure_envs
+            .borrow()
+            .get(&fn_name)
+            .and_then(|m| m.get(var_name))
+            .cloned()
+    }
+
+    fn lookup_qtype(&self, var_name: &str) -> Option<Type> {
+        if let Some(t) = self.quick_var_types.borrow().get(var_name) {
+            return Some(t.clone());
+        }
+        self.pctx.borrow().var_types.get(var_name).cloned()
+    }
+
+    fn infer_expr_type(&self, expr: &Expr) -> Result<Type, String> {
+        let mut ctx = self.pctx.borrow().clone();
+        let quick_snapshot = self.quick_var_types.borrow().clone();
+        for (name, ty) in quick_snapshot {
+            ctx.var_types.insert(name, ty);
+        }
+        get_type_of_expr(expr, &ctx)
+    }
+
+    fn expr_type_matches<F>(&self, expr: &Expr, predicate: F) -> bool
+    where
+        F: Fn(Type) -> bool,
+    {
+        match self.infer_expr_type(expr) {
+            Ok(t) => predicate(t),
+            Err(_) => false,
+        }
+    }
+
     /// Expose C rand() → i32
     fn get_or_create_rand(&self) -> FunctionValue<'ctx> {
         self.module.get_function("rand").unwrap_or_else(|| {
@@ -2798,7 +3100,7 @@ impl<'ctx> Compiler<'ctx> {
         })
     }
 
-    fn qtype_to_llvm<'a>(&'a self, t: &Type) -> BasicTypeEnum<'a> {
+    fn qtype_to_llvm(&self, t: &Type) -> BasicTypeEnum<'ctx> {
         match t {
             Type::Num => self.context.f64_type().as_basic_type_enum(),
             Type::Bool => self.context.bool_type().as_basic_type_enum(),
@@ -2821,6 +3123,39 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
+    fn declare_function(
+        &self,
+        name: &str,
+        params: &[(String, Type)],
+        return_type: &Type,
+    ) -> FunctionValue<'ctx> {
+        if let Some(existing) = self.module.get_function(name) {
+            return existing;
+        }
+
+        let llvm_ret_type = self.qtype_to_llvm(return_type);
+        let param_metadata_types: Vec<BasicMetadataTypeEnum> = params
+            .iter()
+            .map(|(_, ty)| self.qtype_to_llvm(ty).into())
+            .collect();
+
+        let fn_type = match llvm_ret_type {
+            BasicTypeEnum::IntType(int_ty) => int_ty.fn_type(&param_metadata_types, false),
+            BasicTypeEnum::PointerType(ptr_ty) => ptr_ty.fn_type(&param_metadata_types, false),
+            BasicTypeEnum::FloatType(float_ty) => float_ty.fn_type(&param_metadata_types, false),
+            BasicTypeEnum::ArrayType(array_ty) => array_ty.fn_type(&param_metadata_types, false),
+            BasicTypeEnum::ScalableVectorType(vec_ty) => {
+                vec_ty.fn_type(&param_metadata_types, false)
+            }
+            BasicTypeEnum::VectorType(vec_ty) => vec_ty.fn_type(&param_metadata_types, false),
+            BasicTypeEnum::StructType(struct_ty) => {
+                struct_ty.fn_type(&param_metadata_types, false)
+            }
+        };
+
+        self.module.add_function(name, fn_type, None)
+    }
+
     // Module functions are compiled in run_code by synthesizing namespaced
     // Instruction::FunctionDef entries and feeding them through compile_instruction.
 
@@ -2832,6 +3167,7 @@ impl<'ctx> Compiler<'ctx> {
         // Entry block and position builder
         let entry_bb = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry_bb);
+        let _main_scope = FunctionScopeGuard::new(&self.current_function, "main".to_string());
         // Compile module functions into the LLVM module first (no execution).
         {
             let modules: Vec<(String, ModuleInfo)> = self
@@ -2841,7 +3177,41 @@ impl<'ctx> Compiler<'ctx> {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+
+            for (modname, minfo) in &modules {
+                for fdef in minfo.functions.values() {
+                    let ns = format!("{}__{}", modname, fdef.name);
+                    self.declare_function(&ns, &fdef.params, &fdef.return_type);
+                }
+            }
+
+            for instr in &self.instructions {
+                if let Instruction::FunctionDef {
+                    name,
+                    params,
+                    return_type,
+                    ..
+                } = instr
+                {
+                    self.declare_function(name, params, return_type);
+                }
+            }
+
             for (modname, minfo) in modules {
+                let saved_types = {
+                    let pctx_ref = self.pctx.borrow();
+                    pctx_ref.types.clone()
+                };
+                {
+                    let mut pctx_mut = self.pctx.borrow_mut();
+                    for (ty_name, custype) in &minfo.types {
+                        pctx_mut
+                            .types
+                            .entry(ty_name.clone())
+                            .or_insert(custype.clone());
+                    }
+                }
+
                 for (_fname, fdef) in minfo.functions {
                     let instr = Instruction::FunctionDef {
                         name: format!("{}__{}", modname, fdef.name),
@@ -2853,6 +3223,8 @@ impl<'ctx> Compiler<'ctx> {
                     self.compile_instruction(main_fn, &instr).unwrap();
                     *self.current_module.borrow_mut() = None;
                 }
+
+                self.pctx.borrow_mut().types = saved_types;
             }
         }
         // 1) Compile all function definitions first
@@ -2877,6 +3249,13 @@ impl<'ctx> Compiler<'ctx> {
                     .build_return(Some(&f64_type.const_float(0.0)))
                     .unwrap();
             }
+        }
+
+        // Verify the module before handing it to the JIT so we surface IR issues
+        if let Err(err) = self.module.verify() {
+            eprintln!("LLVM IR verification failed:\n{}", err.to_string());
+            self.module.print_to_stderr();
+            return None;
         }
 
         // Ensure C library functions are resolved at runtime to prevent segfaults
@@ -2910,6 +3289,12 @@ impl<'ctx> Compiler<'ctx> {
         let strstr_fn = self.get_or_create_strstr();
         self.execution_engine
             .add_global_mapping(&strstr_fn, strstr as usize);
+        let str_replace_fn = self.get_or_create_str_replace();
+        self.execution_engine
+            .add_global_mapping(&str_replace_fn, qs_str_replace as usize);
+        let str_split_fn = self.get_or_create_str_split();
+        self.execution_engine
+            .add_global_mapping(&str_split_fn, qs_str_split as usize);
         let sprintf_fn = self.get_or_create_sprintf();
         self.execution_engine
             .add_global_mapping(&sprintf_fn, sprintf as usize);
@@ -3030,8 +3415,17 @@ impl<'ctx> Compiler<'ctx> {
         self.execution_engine
             .add_global_mapping(&obj_get_fn, qs_obj_get_str as usize);
 
-        // Retrieve the JIT'd function
-        unsafe { self.execution_engine.get_function("main").ok() }
+        match unsafe { self.execution_engine.get_function::<SumFunc>("main") } {
+            Ok(func) => Some(func),
+            Err(FunctionLookupError::FunctionNotFound) => {
+                eprintln!("Failed to JIT program, update cli and try again");
+                None
+            }
+            Err(FunctionLookupError::JITNotEnabled) => {
+                eprintln!("Failed to JIT main(): JIT not enabled on execution engine");
+                None
+            }
+        }
     }
 
     fn compile_instruction(
@@ -3087,6 +3481,10 @@ impl<'ctx> Compiler<'ctx> {
                 self.builder.position_at_end(cont_bb);
                 Ok(())
             }
+            Instruction::Expr(expr) => {
+                let _ = self.compile_expr(expr)?;
+                Ok(())
+            }
             Instruction::Return(expr) => {
                 // In 'main', treat expression statements (calls) as side effects rather than returns
                 let fn_name = function.get_name().to_str().unwrap();
@@ -3101,29 +3499,84 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(())
             }
             Instruction::Block(b) => {
+                let saved_quick = self.quick_var_types.borrow().clone();
                 for i in b {
                     self.compile_instruction(function, i)?;
                 }
+                *self.quick_var_types.borrow_mut() = saved_quick;
                 Ok(())
             }
-            Instruction::Let { name, value, .. } => {
+            Instruction::Break => {
+                let break_block = {
+                    let stack = self.loop_stack.borrow();
+                    stack
+                        .last()
+                        .cloned()
+                        .expect("`break` used outside of a loop")
+                        .break_block
+                };
+                self.builder.build_unconditional_branch(break_block)?;
+                let after_break = self.context.append_basic_block(function, "after.break");
+                self.builder.position_at_end(after_break);
+                Ok(())
+            }
+            Instruction::Let {
+                name,
+                value,
+                global,
+                type_hint,
+            } => {
                 let init_val = self.compile_expr(value)?;
-                let elem_type = init_val.get_type();
+                let value_ty = init_val.get_type();
+                // Keep Quick type metadata in sync so later property accesses know the static type.
+                self.quick_var_types
+                    .borrow_mut()
+                    .insert(name.clone(), type_hint.clone());
 
-                // Hoist allocas to the entry block to avoid stack overflow in loops.
-                let entry = function.get_first_basic_block().unwrap();
-                let temp_builder = self.context.create_builder();
-                match entry.get_first_instruction() {
-                    Some(inst) => temp_builder.position_before(&inst),
-                    None => temp_builder.position_at_end(entry),
+                if *global {
+                    // Compute the declared LLVM type for the binding so the global matches static typing
+                    let llvm_ty = self.qtype_to_llvm(type_hint);
+                    let global =
+                        self.module
+                            .add_global(llvm_ty, Some(AddressSpace::default()), name);
+
+                    // Zero-initialize globals so the verifier accepts the module (non-constant init happens at runtime)
+                    let zero_init = match &llvm_ty {
+                        BasicTypeEnum::ArrayType(t) => t.const_zero().as_basic_value_enum(),
+                        BasicTypeEnum::FloatType(t) => t.const_zero().as_basic_value_enum(),
+                        BasicTypeEnum::IntType(t) => t.const_zero().as_basic_value_enum(),
+                        BasicTypeEnum::PointerType(t) => t.const_null().as_basic_value_enum(),
+                        BasicTypeEnum::StructType(t) => t.const_zero().as_basic_value_enum(),
+                        BasicTypeEnum::VectorType(t) => t.const_zero().as_basic_value_enum(),
+                        BasicTypeEnum::ScalableVectorType(t) => {
+                            t.const_zero().as_basic_value_enum()
+                        }
+                    };
+                    global.set_initializer(&zero_init);
+
+                    // Populate the global at runtime with the actual value
+                    self.builder
+                        .build_store(global.as_pointer_value(), init_val)?;
+
+                    self.vars
+                        .borrow_mut()
+                        .insert(name.clone(), global.as_pointer_value());
+                    self.var_types.borrow_mut().insert(name.clone(), llvm_ty);
+                } else {
+                    // Local path: hoist allocas to function entry
+                    let entry = function.get_first_basic_block().unwrap();
+                    let temp_builder = self.context.create_builder();
+                    match entry.get_first_instruction() {
+                        Some(inst) => temp_builder.position_before(&inst),
+                        None => temp_builder.position_at_end(entry),
+                    }
+
+                    let ptr = temp_builder.build_alloca(value_ty, name).unwrap();
+                    self.builder.build_store(ptr, init_val)?;
+                    self.vars.borrow_mut().insert(name.clone(), ptr);
+                    self.var_types.borrow_mut().insert(name.clone(), value_ty);
                 }
 
-                let ptr = temp_builder.build_alloca(elem_type, name).unwrap();
-                self.builder.build_store(ptr, init_val)?;
-                self.vars.borrow_mut().insert(name.clone(), ptr);
-                self.var_types
-                    .borrow_mut()
-                    .insert(name.clone(), elem_type.as_basic_type_enum());
                 Ok(())
             }
             Instruction::For {
@@ -3131,6 +3584,10 @@ impl<'ctx> Compiler<'ctx> {
                 range,
                 body,
             } => {
+                let saved_quick = self.quick_var_types.borrow().clone();
+                self.quick_var_types
+                    .borrow_mut()
+                    .insert(iterator.clone(), Type::Num);
                 let range_val = self.compile_expr(range)?;
                 let range_ptr = match range_val {
                     BasicValueEnum::PointerValue(p) => p,
@@ -3189,6 +3646,12 @@ impl<'ctx> Compiler<'ctx> {
                 let body_bb = self.context.append_basic_block(function, "for.body");
                 let step_bb = self.context.append_basic_block(function, "for.step");
                 let cont_bb = self.context.append_basic_block(function, "for.cont");
+
+                let loop_ctx = LoopContext {
+                    break_block: cont_bb,
+                    _continue_block: step_bb,
+                };
+                let _loop_scope = LoopScopeGuard::new(&self.loop_stack, loop_ctx);
 
                 if self
                     .builder
@@ -3283,6 +3746,7 @@ impl<'ctx> Compiler<'ctx> {
 
                 // continuation
                 self.builder.position_at_end(cont_bb);
+                *self.quick_var_types.borrow_mut() = saved_quick;
                 Ok(())
             }
             Instruction::Assign(target, new_val, _typ) => {
@@ -3298,12 +3762,56 @@ impl<'ctx> Compiler<'ctx> {
                         }
 
                         let new_c = self.compile_expr(new_val)?;
-                        let binding = self.vars.borrow();
-                        let ptr = binding
-                            .get(name)
-                            .unwrap_or_else(|| panic!("Variable not found: {name}"));
-                        self.builder.build_store(*ptr, new_c)?;
-                        Ok(())
+                        let ptr_opt = {
+                            let vars_ref = self.vars.borrow();
+                            vars_ref.get(name).copied()
+                        };
+
+                        match ptr_opt {
+                            Some(ptr) => {
+                                self.builder.build_store(ptr, new_c)?;
+                                if let Some(descriptor) = self.get_active_capture_descriptor(name) {
+                                    if let Some(global) =
+                                        self.module.get_global(&descriptor.global_name)
+                                    {
+                                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                        let env_ptr = self
+                                            .builder
+                                            .build_load(
+                                                ptr_ty,
+                                                global.as_pointer_value(),
+                                                &format!("{name}_env_ptr_store"),
+                                            )?
+                                            .into_pointer_value();
+                                        self.builder.build_store(env_ptr, new_c)?;
+                                    }
+                                }
+                                Ok(())
+                            }
+                            None => {
+                                if let Some(descriptor) = self.get_active_capture_descriptor(name) {
+                                    if let Some(global) =
+                                        self.module.get_global(&descriptor.global_name)
+                                    {
+                                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                        let env_ptr = self
+                                            .builder
+                                            .build_load(
+                                                ptr_ty,
+                                                global.as_pointer_value(),
+                                                &format!("{name}_env_ptr_store"),
+                                            )?
+                                            .into_pointer_value();
+                                        self.builder.build_store(env_ptr, new_c)?;
+                                        Ok(())
+                                    } else {
+                                        panic!("Capture global missing for {name}");
+                                    }
+                                } else {
+                                    panic!("Variable not found: {name}");
+                                }
+                            }
+                        }
                     }
                     Expr::Get(obj_expr, prop) => {
                         let obj_val = self.compile_expr(obj_expr)?;
@@ -3318,25 +3826,28 @@ impl<'ctx> Compiler<'ctx> {
                             panic!("Property assignment requires variable receiver");
                         };
 
-                        let binding = self.pctx.borrow();
-                        let Type::Custom(custom_type) = binding
-                            .var_types
-                            .get(var_name)
+                        let custom_type = match self
+                            .lookup_qtype(var_name)
                             .unwrap_or_else(|| panic!("Unknown type for object {var_name}"))
-                            .clone()
-                        else {
-                            panic!("Property assignment supported only on custom objects");
+                        {
+                            Type::Custom(ct) => ct,
+                            _ => panic!("Property assignment supported only on custom objects"),
                         };
 
+                        let binding = self.pctx.borrow();
                         let type_name = binding
                             .types
                             .iter()
-                            .find(|(_, def)| def == &&custom_type)
+                            .find(|(_, def)| **def == custom_type)
                             .map(|(k, _)| k.clone())
                             .unwrap();
                         let Custype::Object(field_defs) = &binding.types[&type_name] else {
                             panic!("Expected object type");
                         };
+                        let field_type = field_defs
+                            .get(prop)
+                            .unwrap_or_else(|| panic!("Unknown property {prop} on {type_name}"))
+                            .clone();
                         let field_index = field_defs
                             .keys()
                             .position(|k| k == prop)
@@ -3347,42 +3858,47 @@ impl<'ctx> Compiler<'ctx> {
 
                         let idx_const = self.context.i64_type().const_int(field_index, false);
                         let field_ptr = unsafe {
-                            self.builder
-                                .build_in_bounds_gep(
-                                    self.context.i64_type(),
-                                    obj_ptr,
-                                    &[idx_const],
-                                    &format!("store_{}", prop),
-                                )?
+                            self.builder.build_in_bounds_gep(
+                                self.context.i64_type(),
+                                obj_ptr,
+                                &[idx_const],
+                                &format!("store_{}", prop),
+                            )?
                         };
 
                         let value = self.compile_expr(new_val)?;
-                        let field_type = get_type_of_expr(&Expr::Get(obj_expr.clone(), prop.clone()), &self.pctx.borrow())
-                            .unwrap();
                         match field_type.unwrap() {
                             Type::Num => {
                                 let val = match value {
                                     BasicValueEnum::FloatValue(f) => f,
-                                    BasicValueEnum::IntValue(i) => self.builder.build_signed_int_to_float(
-                                        i,
-                                        self.context.f64_type(),
-                                        "prop_num_cast",
-                                    )?,
-                                    other => panic!("Cannot assign non-number {other:?} to numeric field"),
+                                    BasicValueEnum::IntValue(i) => {
+                                        self.builder.build_signed_int_to_float(
+                                            i,
+                                            self.context.f64_type(),
+                                            "prop_num_cast",
+                                        )?
+                                    }
+                                    other => panic!(
+                                        "Cannot assign non-number {other:?} to numeric field"
+                                    ),
                                 };
                                 self.builder.build_store(field_ptr, val)?;
                             }
                             Type::Str | Type::List(_) | Type::Custom(_) => {
                                 let ptr_val = match value {
                                     BasicValueEnum::PointerValue(p) => p,
-                                    other => panic!("Expected pointer value for property {prop}, got {other:?}"),
+                                    other => panic!(
+                                        "Expected pointer value for property {prop}, got {other:?}"
+                                    ),
                                 };
                                 self.builder.build_store(field_ptr, ptr_val)?;
                             }
                             Type::Bool => {
                                 let bool_val = match value {
                                     BasicValueEnum::IntValue(i) => i,
-                                    other => panic!("Expected boolean value for property {prop}, got {other:?}"),
+                                    other => panic!(
+                                        "Expected boolean value for property {prop}, got {other:?}"
+                                    ),
                                 };
                                 self.builder.build_store(field_ptr, bool_val)?;
                             }
@@ -3401,22 +3917,22 @@ impl<'ctx> Compiler<'ctx> {
                         let i64_ty = self.context.i64_type();
                         let idx_i64 = match index_val {
                             BasicValueEnum::IntValue(i) => i,
-                            BasicValueEnum::FloatValue(f) => self.builder.build_float_to_signed_int(
-                                f,
-                                i64_ty,
-                                "index_cast",
-                            )?,
+                            BasicValueEnum::FloatValue(f) => self
+                                .builder
+                                .build_float_to_signed_int(f, i64_ty, "index_cast")?,
                             other => panic!("Index must be numeric, got {other:?}"),
                         };
 
-                        let list_type = get_type_of_expr(list_expr, &self.pctx.borrow())
+                        let list_type = self
+                            .infer_expr_type(list_expr)
                             .unwrap_or_else(|e| panic!("{e}"));
                         let Type::List(inner) = list_type else {
                             panic!("Index assignment only supported on lists");
                         };
 
                         let one = i64_ty.const_int(1, false);
-                        let idx_with_offset = self.builder.build_int_add(idx_i64, one, "idx_plus1")?;
+                        let idx_with_offset =
+                            self.builder.build_int_add(idx_i64, one, "idx_plus1")?;
                         let elem_ptr = unsafe {
                             self.builder.build_in_bounds_gep(
                                 self.context.f64_type(),
@@ -3431,23 +3947,31 @@ impl<'ctx> Compiler<'ctx> {
                             Type::Num => {
                                 let val = match value {
                                     BasicValueEnum::FloatValue(f) => f,
-                                    BasicValueEnum::IntValue(i) => self.builder.build_signed_int_to_float(
-                                        i,
-                                        self.context.f64_type(),
-                                        "list_num_cast",
-                                    )?,
-                                    other => panic!("Cannot assign {other:?} to numeric list element"),
+                                    BasicValueEnum::IntValue(i) => {
+                                        self.builder.build_signed_int_to_float(
+                                            i,
+                                            self.context.f64_type(),
+                                            "list_num_cast",
+                                        )?
+                                    }
+                                    other => {
+                                        panic!("Cannot assign {other:?} to numeric list element")
+                                    }
                                 };
                                 self.builder.build_store(elem_ptr, val)?;
                             }
                             Type::Str => {
                                 let ptr_val = match value {
                                     BasicValueEnum::PointerValue(p) => p,
-                                    other => panic!("Cannot assign non-pointer {other:?} to string list element"),
+                                    other => panic!(
+                                        "Cannot assign non-pointer {other:?} to string list element"
+                                    ),
                                 };
                                 self.builder.build_store(elem_ptr, ptr_val)?;
                             }
-                            other => panic!("List assignment not supported for inner type {other:?}"),
+                            other => {
+                                panic!("List assignment not supported for inner type {other:?}")
+                            }
                         }
                         Ok(())
                     }
@@ -3498,79 +4022,18 @@ impl<'ctx> Compiler<'ctx> {
                 // Save current variable scopes to avoid leaking anon-fn parameters into caller
                 let saved_vars = self.vars.borrow().clone();
                 let saved_var_types = self.var_types.borrow().clone();
+                let saved_quick = self.quick_var_types.borrow().clone();
+                let capture_map = self.closure_envs.borrow().get(name).cloned();
+                let _function_scope = FunctionScopeGuard::new(&self.current_function, name.clone());
 
-                // Build LLVM function signature based on parameter and return types
-                // Map QuickLang types to LLVM types
-                let llvm_ret_type = match return_type {
-                    Type::Num => self.context.f64_type().as_basic_type_enum(),
-                    Type::Bool => self.context.bool_type().as_basic_type_enum(),
-                    Type::Str => self
-                        .context
-                        .ptr_type(AddressSpace::default())
-                        .as_basic_type_enum(),
-                    Type::Nil => BasicTypeEnum::FloatType(self.context.f64_type()),
-                    Type::Custom(_) => self
-                        .context
-                        .ptr_type(AddressSpace::default())
-                        .as_basic_type_enum(),
-                    Type::WebReturn => self
-                        .context
-                        .ptr_type(AddressSpace::default())
-                        .as_basic_type_enum(),
-                    other => unimplemented!("Return type {:?} not supported", other),
-                };
-
-                let param_llvm_types: Vec<BasicTypeEnum> = params
-                    .iter()
-                    .map(|(_, ty)| match ty {
-                        Type::Num => self.context.f64_type().as_basic_type_enum(),
-                        Type::Bool => self.context.bool_type().as_basic_type_enum(),
-                        Type::Str => self
-                            .context
-                            .ptr_type(AddressSpace::default())
-                            .as_basic_type_enum(),
-                        Type::Custom(_) => self
-                            .context
-                            .ptr_type(AddressSpace::default())
-                            .as_basic_type_enum(),
-
-                        other => unimplemented!("Parameter type {:?} not supported", other),
-                    })
-                    .collect();
-
-                // Inkwell expects parameter types as BasicMetadataTypeEnum when building
-                // function types; convert from BasicTypeEnum accordingly.
-                let param_metadata_types: Vec<inkwell::types::BasicMetadataTypeEnum> =
-                    param_llvm_types.iter().map(|t| (*t).into()).collect();
-
-                // Create the function type (void vs non-void)
-                // Build the LLVM function type based on the return type variant
-                let fn_type = match llvm_ret_type {
-                    BasicTypeEnum::IntType(int_ty) => {
-                        int_ty.fn_type(param_metadata_types.as_slice(), false)
-                    }
-                    BasicTypeEnum::PointerType(ptr_ty) => {
-                        ptr_ty.fn_type(param_metadata_types.as_slice(), false)
-                    }
-                    BasicTypeEnum::FloatType(float_ty) => {
-                        float_ty.fn_type(param_metadata_types.as_slice(), false)
-                    }
-                    BasicTypeEnum::ArrayType(array_ty) => {
-                        array_ty.fn_type(param_metadata_types.as_slice(), false)
-                    }
-                    BasicTypeEnum::ScalableVectorType(scvec_ty) => {
-                        scvec_ty.fn_type(param_metadata_types.as_slice(), false)
-                    }
-                    BasicTypeEnum::VectorType(vec_ty) => {
-                        vec_ty.fn_type(param_metadata_types.as_slice(), false)
-                    }
-                    BasicTypeEnum::StructType(struct_ty) => {
-                        struct_ty.fn_type(param_metadata_types.as_slice(), false)
-                    }
-                };
-
-                // Add the function to the module
-                let function = self.module.add_function(name, fn_type, None);
+                // Ensure the function is declared before emitting the body so it can be
+                // referenced by other functions (including modules) during compilation.
+                let function = self.declare_function(name, params, return_type);
+                debug_assert!(
+                    function.get_first_basic_block().is_none(),
+                    "Function `{}` emitted twice",
+                    name
+                );
 
                 // Create entry block and position builder
                 let entry_bb = self.context.append_basic_block(function, "entry");
@@ -3588,23 +4051,45 @@ impl<'ctx> Compiler<'ctx> {
                     self.builder.build_store(ptr, arg)?;
                     self.vars.borrow_mut().insert(param_name.clone(), ptr);
                     // Map AST Type to LLVM BasicTypeEnum for parameter
-                    let param_elem_type = match typ {
-                        Type::Num => self.context.f64_type().as_basic_type_enum(),
-                        Type::Bool => self.context.bool_type().as_basic_type_enum(),
-                        Type::Str => self
-                            .context
-                            .ptr_type(AddressSpace::default())
-                            .as_basic_type_enum(),
-                        Type::Custom(_) => self
-                            .context
-                            .ptr_type(AddressSpace::default())
-                            .as_basic_type_enum(),
-                        Type::Nil => self.context.f64_type().as_basic_type_enum(),
-                        other => unimplemented!("Parameter type {:?} not supported", other),
-                    };
+                    let param_elem_type = self.qtype_to_llvm(typ);
                     self.var_types
                         .borrow_mut()
                         .insert(param_name.clone(), param_elem_type);
+                    self.quick_var_types
+                        .borrow_mut()
+                        .insert(param_name.clone(), typ.clone());
+                }
+
+                if let Some(captures) = capture_map.as_ref() {
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    for (captured_name, descriptor) in captures {
+                        let capture_alloca = self
+                            .builder
+                            .build_alloca(descriptor.ty, captured_name)
+                            .unwrap();
+                        if let Some(global) = self.module.get_global(&descriptor.global_name) {
+                            let env_ptr = self
+                                .builder
+                                .build_load(
+                                    ptr_ty,
+                                    global.as_pointer_value(),
+                                    &format!("{captured_name}_env_ptr"),
+                                )?
+                                .into_pointer_value();
+                            let captured_val = self.builder.build_load(
+                                descriptor.ty,
+                                env_ptr,
+                                &format!("{captured_name}_env_val"),
+                            )?;
+                            self.builder.build_store(capture_alloca, captured_val)?;
+                        }
+                        self.vars
+                            .borrow_mut()
+                            .insert(captured_name.clone(), capture_alloca);
+                        self.var_types
+                            .borrow_mut()
+                            .insert(captured_name.clone(), descriptor.ty);
+                    }
                 }
 
                 // Compile the body of the function
@@ -3612,36 +4097,54 @@ impl<'ctx> Compiler<'ctx> {
                     self.compile_instruction(function, instr)?;
                 }
 
-                // Ensure the function has a return instruction
-                if matches!(return_type, Type::Nil) {
-                    if self
-                        .builder
-                        .get_insert_block()
-                        .unwrap()
-                        .get_terminator()
-                        .is_none()
-                    {
-                        let zero = self.context.f64_type().const_float(0.0);
-                        self.builder.build_return(Some(&zero))?;
+                // Ensure the function has a terminator; default to a sensible zero/null value.
+                if let Some(current_block) = self.builder.get_insert_block() {
+                    if current_block.get_terminator().is_none() {
+                        match function.get_type().get_return_type() {
+                            Some(BasicTypeEnum::FloatType(float_ty)) => {
+                                let zero = float_ty.const_float(0.0);
+                                self.builder.build_return(Some(&zero))?;
+                            }
+                            Some(BasicTypeEnum::IntType(int_ty)) => {
+                                let zero = int_ty.const_zero();
+                                self.builder.build_return(Some(&zero))?;
+                            }
+                            Some(BasicTypeEnum::PointerType(ptr_ty)) => {
+                                let null = ptr_ty.const_null();
+                                self.builder.build_return(Some(&null))?;
+                            }
+                            Some(BasicTypeEnum::StructType(_))
+                            | Some(BasicTypeEnum::VectorType(_))
+                            | Some(BasicTypeEnum::ArrayType(_))
+                            | Some(BasicTypeEnum::ScalableVectorType(_)) => {
+                                unreachable!(
+                                    "Unhandled default return for complex type in function `{name}`"
+                                );
+                            }
+                            None => {
+                                self.builder.build_return(None)?;
+                            }
+                        }
                     }
-                } else if self
-                    .builder
-                    .get_insert_block()
-                    .unwrap()
-                    .get_terminator()
-                    .is_none()
-                {
-                    // Default return zero for numeric functions
-                    let zero = self.context.f64_type().const_float(0.0);
-                    self.builder.build_return(Some(&zero))?;
                 }
 
                 // Restore previous variable scopes
                 *self.vars.borrow_mut() = saved_vars;
                 *self.var_types.borrow_mut() = saved_var_types;
+                *self.quick_var_types.borrow_mut() = saved_quick;
                 Ok(())
             }
             Instruction::Maybe(maybe, block, otherwise) => {
+                let Expr::Variable(var_name) = maybe else {
+                    unreachable!()
+                };
+                let var_name = var_name.clone();
+                let saved_quick = self.quick_var_types.borrow().clone();
+                if let Some(Type::Option(inner)) = saved_quick.get(&var_name).cloned() {
+                    self.quick_var_types
+                        .borrow_mut()
+                        .insert(var_name.clone(), (*inner).clone());
+                }
                 // Evaluate the maybe expression
                 let val = self.compile_expr(maybe)?;
                 // Build a nil comparison: non-nil => true branch
@@ -3673,6 +4176,7 @@ impl<'ctx> Compiler<'ctx> {
                     }
                     _ => panic!("Unsupported type in maybe: {val}"),
                 }?;
+
                 // Blocks for then, else, and continuation
                 let then_block = self.context.append_basic_block(function, "then");
                 let else_block = self.context.append_basic_block(function, "else");
@@ -3695,6 +4199,7 @@ impl<'ctx> Compiler<'ctx> {
                 }
 
                 // Else block (value is nil)
+                *self.quick_var_types.borrow_mut() = saved_quick.clone();
                 self.builder.position_at_end(else_block);
                 if let Some(else_node) = otherwise {
                     self.compile_instruction(function, else_node)?;
@@ -3710,6 +4215,7 @@ impl<'ctx> Compiler<'ctx> {
                 }
 
                 // Continue after maybe
+                *self.quick_var_types.borrow_mut() = saved_quick;
                 self.builder.position_at_end(after_block);
                 Ok(())
             }
@@ -3734,6 +4240,12 @@ impl<'ctx> Compiler<'ctx> {
                 };
                 self.builder
                     .build_conditional_branch(cond_val, body_bb, cont_bb)?;
+
+                let loop_ctx = LoopContext {
+                    break_block: cont_bb,
+                    _continue_block: cond_bb,
+                };
+                let _loop_scope = LoopScopeGuard::new(&self.loop_stack, loop_ctx);
 
                 self.builder.position_at_end(body_bb);
                 for stmt in body {
@@ -3861,6 +4373,71 @@ impl<'ctx> Compiler<'ctx> {
             self.module.add_function("free", fn_type, None)
         }
     }
+
+    fn expect_bool_value(&self, value: BasicValueEnum<'ctx>, context: &str) -> IntValue<'ctx> {
+        if let BasicValueEnum::IntValue(int_val) = value {
+            if int_val.get_type() == self.context.bool_type() {
+                return int_val;
+            }
+        }
+        panic!("Expected boolean value for {context}, found {:?}", value);
+    }
+
+    fn build_logical_binop(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        op: &BinOp,
+    ) -> Result<BasicValueEnum<'ctx>, BuilderError> {
+        let lhs_val = self.compile_expr(left)?;
+        let lhs_bool = self.expect_bool_value(lhs_val, "logical lhs");
+
+        let current_block = self
+            .builder
+            .get_insert_block()
+            .expect("Logical operator must be inside a block");
+        let parent_fn = current_block
+            .get_parent()
+            .expect("Logical operator must be inside a function");
+
+        let rhs_block = self.context.append_basic_block(parent_fn, "logic_rhs");
+        let end_block = self.context.append_basic_block(parent_fn, "logic_end");
+
+        let bool_ty = self.context.bool_type();
+        let true_const = bool_ty.const_int(1, false);
+        let false_const = bool_ty.const_int(0, false);
+
+        match op {
+            BinOp::And => {
+                self.builder
+                    .build_conditional_branch(lhs_bool, rhs_block, end_block)?;
+                self.builder.position_at_end(rhs_block);
+                let rhs_val = self.compile_expr(right)?;
+                let rhs_bool = self.expect_bool_value(rhs_val, "logical rhs");
+                self.builder.build_unconditional_branch(end_block)?;
+                let rhs_eval_block = self.builder.get_insert_block().unwrap();
+                self.builder.position_at_end(end_block);
+                let phi = self.builder.build_phi(bool_ty, "andtmp")?;
+                phi.add_incoming(&[(&rhs_bool, rhs_eval_block), (&false_const, current_block)]);
+                Ok(phi.as_basic_value())
+            }
+            BinOp::Or => {
+                self.builder
+                    .build_conditional_branch(lhs_bool, end_block, rhs_block)?;
+                self.builder.position_at_end(rhs_block);
+                let rhs_val = self.compile_expr(right)?;
+                let rhs_bool = self.expect_bool_value(rhs_val, "logical rhs");
+                self.builder.build_unconditional_branch(end_block)?;
+                let rhs_eval_block = self.builder.get_insert_block().unwrap();
+                self.builder.position_at_end(end_block);
+                let phi = self.builder.build_phi(bool_ty, "ortmp")?;
+                phi.add_incoming(&[(&true_const, current_block), (&rhs_bool, rhs_eval_block)]);
+                Ok(phi.as_basic_value())
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn compile_expr(&self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, BuilderError> {
         match expr {
             Expr::Variable(var_name) => {
@@ -3953,7 +4530,7 @@ impl<'ctx> Compiler<'ctx> {
                                 }
                             },
                             None => {
-                                if let Err(e) = get_type_of_expr(&args[1], &self.pctx.borrow()) {
+                                if let Err(e) = self.infer_expr_type(&args[1]) {
                                     eprintln!("{e}");
                                     std::process::exit(70);
                                 }
@@ -3972,7 +4549,11 @@ impl<'ctx> Compiler<'ctx> {
                         }
                     }
                     // Inline function passed directly: enforce it returns WebReturn
-                    Expr::Function(params, ret_ty, _body) => {
+                    Expr::Function(params, ret_ty, body) => {
+                        if !returns_on_all_paths(vec![*body.clone()]) {
+                            eprintln!("Inline function does not return on all paths");
+                            std::process::exit(70);
+                        }
                         if *ret_ty != Type::WebReturn {
                             eprintln!(
                                 "io.listen callback must return a web response (e.g., io.web().text(...)). Add an explicit 'return ...' in the handler."
@@ -4074,7 +4655,7 @@ impl<'ctx> Compiler<'ctx> {
                 if args.len() == 1
                     && matches!(&**callee, Expr::Get(obj, method) if {
                         if let Ok(Type::Custom(Custype::Object(fields))) =
-                            get_type_of_expr(obj, &self.pctx.borrow())
+                            self.infer_expr_type(obj)
                         {
                             match method.as_str() {
                                 "text" => matches!(fields.get("text"), Some(Type::Function(params, ret))
@@ -4155,7 +4736,7 @@ impl<'ctx> Compiler<'ctx> {
                 if args.len() == 2
                     && matches!(&**callee, Expr::Get(obj, method) if method == "redirect" && {
                         if let Ok(Type::Custom(Custype::Object(fields))) =
-                            get_type_of_expr(obj, &self.pctx.borrow())
+                            self.infer_expr_type(obj)
                         {
                             matches!(fields.get("redirect"), Some(Type::Function(params, ret))
                                 if params == &vec![("location".into(), Type::Str), ("permanent".into(), Type::Bool)]
@@ -4189,7 +4770,7 @@ impl<'ctx> Compiler<'ctx> {
                         if let Expr::Get(inner_obj, prop) = &**obj {
                             if prop != "error" { false } else {
                                 if let Ok(Type::Custom(Custype::Object(fields))) =
-                                    get_type_of_expr(inner_obj, &self.pctx.borrow())
+                                    self.infer_expr_type(inner_obj)
                                 {
                                     if let Some(Type::Custom(Custype::Object(efields))) = fields.get("error") {
                                         match method.as_str() {
@@ -4530,6 +5111,10 @@ impl<'ctx> Compiler<'ctx> {
                 ))
             }
             Expr::Binary(left, op, right) => {
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    return self.build_logical_binop(left, right, op);
+                }
+
                 // Compile both sides
                 let lval = match self.compile_expr(left)? {
                     BasicValueEnum::IntValue(i) => self
@@ -4578,6 +5163,7 @@ impl<'ctx> Compiler<'ctx> {
                                 .builder
                                 .build_float_compare(FloatPredicate::OGE, li, ri, "getmp")?
                                 .into(),
+                            _ => unreachable!("Unhandled binary operator {op:?} for floats"),
                         })
                     }
                     (BasicValueEnum::PointerValue(lp), BasicValueEnum::PointerValue(rp)) => {
@@ -4853,17 +5439,22 @@ impl<'ctx> Compiler<'ctx> {
                 // Compile the base object pointer
                 let base_val = self.compile_expr(obj_expr)?;
                 let obj_ptr = base_val.into_pointer_value();
-                // Determine the object's declared type by looking up the variable's static type
-                let var_name = if let Expr::Variable(name) = &**obj_expr {
-                    name
-                } else {
-                    panic!("Property access on non-variable object");
-                };
-                // Find the matching custom type definition
-                let binding = self.pctx.borrow();
-                let custom_type = match &binding.var_types[var_name] {
-                    Type::Custom(map) => map,
-                    _ => panic!("Variable {var_name} is not a custom object"),
+                // Determine the object's declared type using type inference so property access works
+                // on expressions like list indexing, not just named variables.
+                let inferred_type = self
+                    .infer_expr_type(obj_expr)
+                    .expect("Unable to infer type for property access");
+                let custom_type = match inferred_type {
+                    Type::Custom(ref map) => map,
+                    Type::Option(inner) => &match *inner {
+                        Type::Custom(ref map) => map.clone(),
+                        other => panic!(
+                            "Property access on option whose inner type {other:?} is not an object"
+                        ),
+                    },
+                    other => {
+                        panic!("Property access on non-object expression: {other:?}")
+                    }
                 };
                 let type_name = self
                     .pctx
@@ -4966,7 +5557,7 @@ impl<'ctx> Compiler<'ctx> {
                     Expr::Get(receiver, method)
                         if args.len() == 1
                             && matches!(
-                                get_type_of_expr(receiver, &self.pctx.borrow()),
+                                self.infer_expr_type(receiver),
                                 Ok(Type::RangeBuilder)
                             )
                             && matches!(method.as_str(), "to" | "from" | "step") =>
@@ -5015,7 +5606,7 @@ impl<'ctx> Compiler<'ctx> {
                     Expr::Get(obj, method)
                         if method == "insert"
                             && matches!(
-                                get_type_of_expr(obj, &self.pctx.borrow()),
+                                self.infer_expr_type(obj),
                                 Ok(Type::Kv(_))
                             ) =>
                     {
@@ -5023,10 +5614,23 @@ impl<'ctx> Compiler<'ctx> {
                         let key = self.compile_expr(&args[0])?;
                         let raw_val = self.compile_expr(&args[1])?;
 
-                        // Ensure value argument is an i8* (C string). If it's numeric/bool,
-                        // convert to string efficiently.
-                        let val_as_ptr: BasicMetadataValueEnum = match raw_val {
-                            BasicValueEnum::PointerValue(p) => p.into(),
+                        // Ensure value argument is an opaque pointer. If it's numeric/bool,
+                        // convert to a freshly allocated string first.
+                        let void_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                        let pointer_value = match raw_val {
+                            BasicValueEnum::PointerValue(p) => {
+                                if p.get_type() == void_ptr_ty {
+                                    p
+                                } else {
+                                    self.builder
+                                        .build_pointer_cast(
+                                            p,
+                                            void_ptr_ty,
+                                            "obj_insert_cast_ptr",
+                                        )
+                                        .unwrap()
+                                }
+                            }
                             BasicValueEnum::FloatValue(fv) => {
                                 // Allocate buffer and sprintf "%f"
                                 let fmt = self
@@ -5051,7 +5655,14 @@ impl<'ctx> Compiler<'ctx> {
                                         "sprintf_f",
                                     )
                                     .unwrap();
-                                buf.into()
+                                self
+                                    .builder
+                                    .build_pointer_cast(
+                                        buf,
+                                        void_ptr_ty,
+                                        "obj_insert_float_ptr",
+                                    )
+                                    .unwrap()
                             }
                             BasicValueEnum::IntValue(iv) => {
                                 // Treat 1-bit ints as bool; 8+/32/64 as integer via %ld
@@ -5072,7 +5683,14 @@ impl<'ctx> Compiler<'ctx> {
                                         .build_select(iv, t, f, "bool_sel")
                                         .unwrap()
                                         .into_pointer_value();
-                                    sel.into()
+                                    self
+                                        .builder
+                                        .build_pointer_cast(
+                                            sel,
+                                            void_ptr_ty,
+                                            "obj_insert_bool_ptr",
+                                        )
+                                        .unwrap()
                                 } else {
                                     // Generic integer: sprintf with "%ld"
                                     let fmt = self
@@ -5097,11 +5715,20 @@ impl<'ctx> Compiler<'ctx> {
                                             "sprintf_i",
                                         )
                                         .unwrap();
-                                    buf.into()
+                                    self
+                                        .builder
+                                        .build_pointer_cast(
+                                            buf,
+                                            void_ptr_ty,
+                                            "obj_insert_int_ptr",
+                                        )
+                                        .unwrap()
                                 }
                             }
                             other => panic!("Unsupported value type for Obj.insert: {:?}", other),
                         };
+
+                        let val_as_ptr: BasicMetadataValueEnum = pointer_value.into();
 
                         let fnv = self.get_or_create_qs_obj_insert_str();
                         let _ = self
@@ -5120,7 +5747,7 @@ impl<'ctx> Compiler<'ctx> {
                     Expr::Get(obj, method)
                         if method == "get"
                             && matches!(
-                                get_type_of_expr(obj, &self.pctx.borrow()),
+                                self.infer_expr_type(obj),
                                 Ok(Type::Kv(_))
                             ) =>
                     {
@@ -5193,7 +5820,10 @@ impl<'ctx> Compiler<'ctx> {
                     }
 
                     // Method call `.str()` on numeric values
-                    Expr::Get(obj, method) if method == "str" &&matches!(& get_type_of_expr(obj, &self.pctx.borrow()).unwrap(), Type::Num) => {
+                    Expr::Get(obj, method)
+                        if method == "str"
+                            && self.expr_type_matches(obj, |t| matches!(t.unwrap(), Type::Num)) =>
+                    {
                         // Ensure the object compiles to an integer before converting
                         let compiled_val = self.compile_expr(obj)?;
                         let num_val = match compiled_val {
@@ -5240,10 +5870,17 @@ impl<'ctx> Compiler<'ctx> {
                     }
 
                     // 2) Method call `.len()` on a pointer value (string or list)
-                    Expr::Get(obj, method) if method == "len" && matches!(get_type_of_expr(obj, &self.pctx.borrow()).unwrap(), Type::List(_) | Type::Str) => {
+                    Expr::Get(obj, method)
+                        if method == "len"
+                            && self.expr_type_matches(
+                                obj,
+                                |t| matches!(t.unwrap(), Type::List(_) | Type::Str),
+                            ) =>
+                    {
                         let obj_val = self.compile_expr(obj)?;
                         // Get the original type of the object from pctx
-                        let obj_type = get_type_of_expr(obj, &self.pctx.borrow())
+                        let obj_type = self
+                            .infer_expr_type(obj)
                             .unwrap_or_else(|e| panic!("Type error: {e}"));
 
                         if let BasicValueEnum::PointerValue(ptr) = obj_val {
@@ -5277,7 +5914,8 @@ impl<'ctx> Compiler<'ctx> {
                     }
                     Expr::Get(obj, method)
                         if method == "num"
-                            && get_type_of_expr(obj, &self.pctx.borrow())
+                            && self
+                                .infer_expr_type(obj)
                                 .unwrap_or_else(|e| panic!("Type error: {e}"))
                                 == Type::Str =>
                     {
@@ -5301,7 +5939,8 @@ impl<'ctx> Compiler<'ctx> {
 
                     Expr::Get(obj, method)
                         if method == "contains"
-                            && get_type_of_expr(obj, &self.pctx.borrow())
+                            && self
+                                .infer_expr_type(obj)
                                 .unwrap_or_else(|e| panic!("Type error: {e}"))
                                 == Type::Str
                             && args.len() == 1 =>
@@ -5322,7 +5961,6 @@ impl<'ctx> Compiler<'ctx> {
                             .unwrap_left();
                         let cond = match result {
                             BasicValueEnum::PointerValue(ptr) => {
-                                // Null pointer for nil
                                 let null_ptr =
                                     self.context.ptr_type(AddressSpace::default()).const_null();
                                 self.builder.build_int_compare(
@@ -5333,7 +5971,6 @@ impl<'ctx> Compiler<'ctx> {
                                 )
                             }
                             BasicValueEnum::FloatValue(iv) => {
-                                // Zero integer for nil
                                 let zero = self.context.f64_type().const_float(0.0);
                                 self.builder.build_float_compare(
                                     FloatPredicate::ONE,
@@ -5361,10 +5998,70 @@ impl<'ctx> Compiler<'ctx> {
                     }
 
                     Expr::Get(obj, method)
-                        if method == "starts_with"
-                            && get_type_of_expr(obj, &self.pctx.borrow())
+                        if method == "replace"
+                            && self
+                                .infer_expr_type(obj)
                                 .unwrap_or_else(|e| panic!("Type error: {e}"))
-                                == Type::Str =>
+                                == Type::Str
+                            && args.len() == 2 =>
+                    {
+                        let haystack_ptr = match self.compile_expr(obj)? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!(".replace() called on non-string value: {other:?}"),
+                        };
+                        let needle_ptr = match self.compile_expr(&args[0])? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!(".replace() needle must be a string, got {other:?}"),
+                        };
+                        let replacement_ptr = match self.compile_expr(&args[1])? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!(".replace() replacement must be a string, got {other:?}"),
+                        };
+
+                        let replace_fn = self.get_or_create_str_replace();
+                        let call = self.builder.build_call(
+                            replace_fn,
+                            &[haystack_ptr.into(), needle_ptr.into(), replacement_ptr.into()],
+                            "str_replace_call",
+                        )?;
+                        let result = call.try_as_basic_value().left().unwrap();
+                        Ok(result)
+                    }
+
+                    Expr::Get(obj, method)
+                        if method == "split"
+                            && self
+                                .infer_expr_type(obj)
+                                .unwrap_or_else(|e| panic!("Type error: {e}"))
+                                == Type::Str
+                            && args.len() == 1 =>
+                    {
+                        let haystack_ptr = match self.compile_expr(obj)? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!(".split() called on non-string value: {other:?}"),
+                        };
+                        let delimiter_ptr = match self.compile_expr(&args[0])? {
+                            BasicValueEnum::PointerValue(p) => p,
+                            other => panic!(".split() delimiter must be a string, got {other:?}"),
+                        };
+
+                        let split_fn = self.get_or_create_str_split();
+                        let call = self.builder.build_call(
+                            split_fn,
+                            &[haystack_ptr.into(), delimiter_ptr.into()],
+                            "str_split_call",
+                        )?;
+                        let result = call.try_as_basic_value().left().unwrap();
+                        Ok(result)
+                    }
+
+                    Expr::Get(obj, method)
+                        if method == "starts_with"
+                            && self
+                                .infer_expr_type(obj)
+                                .unwrap_or_else(|e| panic!("Type error: {e}"))
+                                == Type::Str
+                            && args.len() == 1 =>
                     {
                         let obj_val = match self.compile_expr(obj)? {
                             BasicValueEnum::PointerValue(p) => p,
@@ -5414,7 +6111,8 @@ impl<'ctx> Compiler<'ctx> {
 
                     Expr::Get(obj, method)
                         if method == "ends_with"
-                            && get_type_of_expr(obj, &self.pctx.borrow())
+                            && self
+                                .infer_expr_type(obj)
                                 .unwrap_or_else(|e| panic!("Type error: {e}"))
                                 == Type::Str =>
                     {
@@ -5482,12 +6180,15 @@ impl<'ctx> Compiler<'ctx> {
 
                     Expr::Get(obj, method)
                         if method == "push"
-                            && matches!(get_type_of_expr(obj, &self.pctx.borrow())
-                                .unwrap_or_else(|e| panic!("Type error: {e}"))
-                                ,Type::List(_)) =>
+                            && matches!(
+                                self
+                                    .infer_expr_type(obj)
+                                    .unwrap_or_else(|e| panic!("Type error: {e}")),
+                                Type::List(_)
+                            ) =>
                     {
                         // Resolve list inner type to determine supported behavior
-                        let inner_ty = match get_type_of_expr(obj, &self.pctx.borrow()) {
+                        let inner_ty = match self.infer_expr_type(obj) {
                             Ok(Type::List(inner)) => *inner,
                             Ok(other) => panic!(".push() called on non-list type: {:?}", other),
                             Err(e) => panic!("Type error: {e}"),
@@ -5643,6 +6344,83 @@ impl<'ctx> Compiler<'ctx> {
                         }
                     }
 
+                    Expr::Get(obj, met)
+                        if met == "default"
+                            && matches!(self.infer_expr_type(obj), Ok(Type::Option(_))) =>
+                    {
+                        if args.len() != 1 {
+                            panic!(
+                                "Option::default expects exactly one argument (the fallback value), got {}",
+                                args.len()
+                            );
+                        }
+
+                        let option_val = self.compile_expr(obj)?;
+                        let default_val = self.compile_expr(&args[0])?;
+
+                        let selected = match (option_val, default_val) {
+                            (
+                                BasicValueEnum::PointerValue(opt_ptr),
+                                BasicValueEnum::PointerValue(default_ptr),
+                            ) => {
+                                let null_ptr = opt_ptr.get_type().const_null();
+                                let has_value = self.builder.build_int_compare(
+                                    IntPredicate::NE,
+                                    opt_ptr,
+                                    null_ptr,
+                                    "option_default_has_value",
+                                )?;
+                                self.builder.build_select(
+                                    has_value,
+                                    opt_ptr.as_basic_value_enum(),
+                                    default_ptr.as_basic_value_enum(),
+                                    "option_default_select",
+                                )?
+                            }
+                            (
+                                BasicValueEnum::FloatValue(opt_float),
+                                BasicValueEnum::FloatValue(default_float),
+                            ) => {
+                                let zero = self.context.f64_type().const_float(0.0);
+                                let has_value = self.builder.build_float_compare(
+                                    FloatPredicate::ONE,
+                                    opt_float,
+                                    zero,
+                                    "option_default_has_value",
+                                )?;
+                                self.builder.build_select(
+                                    has_value,
+                                    opt_float.as_basic_value_enum(),
+                                    default_float.as_basic_value_enum(),
+                                    "option_default_select",
+                                )?
+                            }
+                            (
+                                BasicValueEnum::IntValue(opt_int),
+                                BasicValueEnum::IntValue(default_int),
+                            ) => {
+                                let zero = opt_int.get_type().const_zero();
+                                let has_value = self.builder.build_int_compare(
+                                    IntPredicate::NE,
+                                    opt_int,
+                                    zero,
+                                    "option_default_has_value",
+                                )?;
+                                self.builder.build_select(
+                                    has_value,
+                                    opt_int.as_basic_value_enum(),
+                                    default_int.as_basic_value_enum(),
+                                    "option_default_select",
+                                )?
+                            }
+                            other => panic!(
+                                "Option::default is not implemented for value combination: {other:?}"
+                            ),
+                        };
+
+                        Ok(selected)
+                    }
+
 
                     _ => {
                         panic!("Unsupported call expression: {callee:?}");
@@ -5708,16 +6486,15 @@ impl<'ctx> Compiler<'ctx> {
             }
             Expr::Index(list, indexed_by) => {
                 // Determine the static type of the left-hand side to decide behavior
-                let lhs_type = {
-                    let pctx = self.pctx.borrow();
-                    get_type_of_expr(list, &pctx).expect("Unable to resolve type for indexing")
-                };
+                let lhs_type = self
+                    .infer_expr_type(list)
+                    .expect("Unable to resolve type for indexing");
 
                 let lhs_val = self.compile_expr(list)?;
                 let index_val = self.compile_expr(indexed_by)?;
 
                 // Index must be integer (or numeric convertible)
-                let idx = match index_val { 
+                let idx = match index_val {
                     BasicValueEnum::IntValue(i) => i,
                     BasicValueEnum::FloatValue(f) => self.builder.build_float_to_signed_int(
                         f,
@@ -5826,6 +6603,21 @@ impl<'ctx> Compiler<'ctx> {
                                     .unwrap();
                                 Ok(loaded)
                             }
+                            Type::Custom(_)
+                            | Type::Option(_)
+                            | Type::List(_)
+                            | Type::Io
+                            | Type::WebReturn
+                            | Type::RangeBuilder
+                            | Type::Kv(_)
+                            | Type::Function(_, _) => {
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let loaded = self
+                                    .builder
+                                    .build_load(ptr_ty, elem_ptr, "load_ptr_elem")
+                                    .unwrap();
+                                Ok(loaded)
+                            }
                             _ => panic!("Indexing not supported on list inner type"),
                         }
                     }
@@ -5836,6 +6628,48 @@ impl<'ctx> Compiler<'ctx> {
                 // Generate a unique name for each anonymous function and compile it in isolation
                 let id = INLINE_FN_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let name = format!("inline_fn_{}", id);
+
+                // Capture the current variable bindings so we can snapshot the environment
+                let captured_bindings = self.vars.borrow().clone();
+                let captured_types = self.var_types.borrow().clone();
+                let mut capture_map: HashMap<String, CaptureDescriptor<'ctx>> = HashMap::new();
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+
+                for (var_name, _) in &captured_bindings {
+                    if params.iter().any(|(param_name, _)| param_name == var_name) {
+                        continue;
+                    }
+                    if let Some(ty) = captured_types.get(var_name) {
+                        let global_name = format!("inline_env_{}_{}", id, var_name);
+                        let global = if let Some(existing) = self.module.get_global(&global_name) {
+                            existing
+                        } else {
+                            let g = self
+                                .module
+                                .add_global(ptr_ty.as_basic_type_enum(), None, &global_name);
+                            g.set_linkage(Linkage::Internal);
+                            g.set_initializer(&ptr_ty.const_null().as_basic_value_enum());
+                            g
+                        };
+                        // Ensure the global stays referenced so LLVM keeps it alive
+                        let _ = global;
+                        capture_map.insert(
+                            var_name.clone(),
+                            CaptureDescriptor {
+                                global_name: global_name.clone(),
+                                ty: *ty,
+                            },
+                        );
+                    }
+                }
+
+                if capture_map.is_empty() {
+                    self.closure_envs.borrow_mut().remove(&name);
+                } else {
+                    self.closure_envs
+                        .borrow_mut()
+                        .insert(name.clone(), capture_map.clone());
+                }
 
                 // Remember current insertion point so we can restore it after compiling the anon fn
                 let saved_insert_block = self.builder.get_insert_block();
@@ -5855,6 +6689,29 @@ impl<'ctx> Compiler<'ctx> {
                 // Restore builder insertion point for the caller function
                 if let Some(bb) = saved_insert_block {
                     self.builder.position_at_end(bb);
+                }
+
+                // Store the current bindings into the capture globals so the closure can access them
+                if !capture_map.is_empty() {
+                    for (var_name, descriptor) in &capture_map {
+                        if let Some(ptr_value) = captured_bindings.get(var_name) {
+                            if let Some(global) = self.module.get_global(&descriptor.global_name) {
+                                let cast_ptr = self
+                                    .builder
+                                    .build_pointer_cast(
+                                        *ptr_value,
+                                        ptr_ty,
+                                        &format!("{var_name}_env_capture_ptr_{id}"),
+                                    )
+                                    .unwrap();
+                                self.builder
+                                    .build_store(
+                                        global.as_pointer_value(),
+                                        cast_ptr.as_basic_value_enum(),
+                                    )?;
+                            }
+                        }
+                    }
                 }
 
                 if let Some(func) = self.module.get_function(&name) {
@@ -5885,6 +6742,7 @@ impl<'ctx> Compiler<'ctx> {
                     }
                 }
             }
+
             _ => panic!("Unsupported expression in compile_expr: {expr:?}"),
         }
     }
@@ -5945,6 +6803,26 @@ impl<'ctx> Compiler<'ctx> {
             // strstr signature: (i8*, i8*) -> i8*
             let fn_type = i8ptr.fn_type(&[i8ptr.into(), i8ptr.into()], false);
             self.module.add_function("strstr", fn_type, None)
+        }
+    }
+
+    fn get_or_create_str_replace(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("qs_str_replace") {
+            f
+        } else {
+            let i8ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = i8ptr.fn_type(&[i8ptr.into(), i8ptr.into(), i8ptr.into()], false);
+            self.module.add_function("qs_str_replace", fn_type, None)
+        }
+    }
+
+    fn get_or_create_str_split(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("qs_str_split") {
+            f
+        } else {
+            let ptr = self.context.ptr_type(AddressSpace::default());
+            let fn_type = ptr.fn_type(&[ptr.into(), ptr.into()], false);
+            self.module.add_function("qs_str_split", fn_type, None)
         }
     }
 
@@ -6366,7 +7244,7 @@ impl<'ctx> Compiler<'ctx> {
             let fn_type = self
                 .context
                 .void_type()
-                .fn_type(&[void_ptr.into(), i8ptr.into(), i8ptr.into()], false);
+                .fn_type(&[void_ptr.into(), i8ptr.into(), void_ptr.into()], false);
             self.module.add_function("qs_obj_insert_str", fn_type, None)
         }
     }
@@ -6377,7 +7255,7 @@ impl<'ctx> Compiler<'ctx> {
         } else {
             let void_ptr = self.context.ptr_type(AddressSpace::default());
             let i8ptr = self.context.ptr_type(AddressSpace::default());
-            let fn_type = i8ptr.fn_type(&[void_ptr.into(), i8ptr.into()], false);
+            let fn_type = void_ptr.fn_type(&[void_ptr.into(), i8ptr.into()], false);
             self.module.add_function("qs_obj_get_str", fn_type, None)
         }
     }
@@ -6405,26 +7283,6 @@ impl<'ctx> Compiler<'ctx> {
 
         Ok(())
     }
-
-    fn jit_compile_sum(&self) -> Option<JitFunction<'_, SumFunc>> {
-        let i64_type = self.context.i64_type();
-        let fn_type = i64_type.fn_type(&[i64_type.into(), i64_type.into(), i64_type.into()], false);
-        let function = self.module.add_function("sum", fn_type, None);
-        let basic_block = self.context.append_basic_block(function, "entry");
-
-        self.builder.position_at_end(basic_block);
-
-        let x = function.get_nth_param(0)?.into_int_value();
-        let y = function.get_nth_param(1)?.into_int_value();
-        let z = function.get_nth_param(2)?.into_int_value();
-
-        let sum = self.builder.build_int_add(x, y, "sum").unwrap();
-        let sum = self.builder.build_int_add(sum, z, "sum").unwrap();
-
-        self.builder.build_return(Some(&sum)).unwrap();
-
-        unsafe { self.execution_engine.get_function("sum").ok() }
-    }
 }
 
 fn format_float(lexeme: &str) -> String {
@@ -6441,7 +7299,9 @@ fn format_float(lexeme: &str) -> String {
 
 fn tokenize(chars: Vec<char>) -> Vec<Token> {
     let mut is_commented = false;
-    let mut in_string: Option<std::string::String> = None;
+    let mut in_string = false;
+    let mut current_string = String::new();
+    let mut string_escape = false;
 
     let mut tokens = vec![];
     let mut line = 1;
@@ -6450,7 +7310,146 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
     while index < chars.len() {
         let current_char = chars[index];
 
-        // Handle comments
+        if in_string {
+            if string_escape {
+                match current_char {
+                    '"' => {
+                        current_string.push('"');
+                        index += 1;
+                        string_escape = false;
+                        continue;
+                    }
+                    '\\' => {
+                        current_string.push('\\');
+                        index += 1;
+                        string_escape = false;
+                        continue;
+                    }
+                    'n' => {
+                        current_string.push('\n');
+                        index += 1;
+                        string_escape = false;
+                        continue;
+                    }
+                    'r' => {
+                        current_string.push('\r');
+                        index += 1;
+                        string_escape = false;
+                        continue;
+                    }
+                    't' => {
+                        current_string.push('\t');
+                        index += 1;
+                        string_escape = false;
+                        continue;
+                    }
+                    '0' => {
+                        current_string.push('\0');
+                        index += 1;
+                        string_escape = false;
+                        continue;
+                    }
+                    '\'' => {
+                        current_string.push('\'');
+                        index += 1;
+                        string_escape = false;
+                        continue;
+                    }
+                    'x' => {
+                        if index + 2 < chars.len() {
+                            let hi = chars[index + 1];
+                            let lo = chars[index + 2];
+                            if let (Some(high), Some(low)) = (hi.to_digit(16), lo.to_digit(16)) {
+                                let value = ((high << 4) | low) as u32;
+                                if let Some(ch) = std::char::from_u32(value) {
+                                    current_string.push(ch);
+                                    index += 3;
+                                    string_escape = false;
+                                    continue;
+                                }
+                            }
+                        }
+                        current_string.push('\\');
+                        string_escape = false;
+                        continue;
+                    }
+                    'u' => {
+                        if index + 1 < chars.len() && chars[index + 1] == '{' {
+                            let mut j = index + 2;
+                            let mut digits = 0;
+                            let mut value: u32 = 0;
+                            while j < chars.len() {
+                                let c = chars[j];
+                                if c == '}' {
+                                    break;
+                                }
+                                if let Some(d) = c.to_digit(16) {
+                                    if digits >= 6 {
+                                        digits = 7; // mark invalid
+                                        break;
+                                    }
+                                    value = (value << 4) | d;
+                                    digits += 1;
+                                    j += 1;
+                                } else {
+                                    digits = 7; // mark invalid
+                                    break;
+                                }
+                            }
+                            if j < chars.len() && chars[j] == '}' && digits > 0 && digits <= 6 {
+                                if let Some(ch) = std::char::from_u32(value) {
+                                    current_string.push(ch);
+                                    index = j + 1;
+                                    string_escape = false;
+                                    continue;
+                                }
+                            }
+                        }
+                        current_string.push('\\');
+                        string_escape = false;
+                        continue;
+                    }
+                    _ => {
+                        current_string.push('\\');
+                        string_escape = false;
+                        continue;
+                    }
+                }
+            } else {
+                match current_char {
+                    '\\' => {
+                        string_escape = true;
+                        index += 1;
+                        continue;
+                    }
+                    '"' => {
+                        let string_value = std::mem::take(&mut current_string);
+                        let value_copy = string_value.clone();
+                        tokens.push(Token {
+                            value: value_copy,
+                            kind: Str(string_value),
+                            line,
+                        });
+                        in_string = false;
+                        string_escape = false;
+                        index += 1;
+                        continue;
+                    }
+                    '\n' => {
+                        current_string.push('\n');
+                        line += 1;
+                        index += 1;
+                        continue;
+                    }
+                    _ => {
+                        current_string.push(current_char);
+                        index += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         if is_commented {
             if current_char == '\n' {
                 is_commented = false;
@@ -6460,33 +7459,19 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
             continue;
         }
 
-        // Handle strings
         if current_char == '"' {
-            if in_string.is_none() {
-                in_string = Some("".to_string());
-            } else {
-                tokens.push(Token {
-                    value: in_string.clone().unwrap(),
-                    kind: Str(in_string.clone().unwrap()),
-                    line,
-                });
-                in_string = None;
-            }
-            index += 1;
-            continue;
-        } else if let Some(ref mut s) = in_string {
-            s.push(current_char);
+            in_string = true;
+            string_escape = false;
+            current_string.clear();
             index += 1;
             continue;
         }
 
-        // Handle newlines
         if current_char == '\n' {
             line += 1;
             index += 1;
             continue;
         }
-        // Skip whitespace
         if current_char == ' ' || current_char == '\t' {
             index += 1;
             continue;
@@ -6585,6 +7570,24 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
                     index += 2;
                     continue;
                 }
+                "&&" => {
+                    tokens.push(Token {
+                        value: "&&".to_string(),
+                        kind: TokenKind::AmpAmp,
+                        line,
+                    });
+                    index += 2;
+                    continue;
+                }
+                "||" => {
+                    tokens.push(Token {
+                        value: "||".to_string(),
+                        kind: TokenKind::PipePipe,
+                        line,
+                    });
+                    index += 2;
+                    continue;
+                }
                 "//" => {
                     is_commented = true;
                     index += 2;
@@ -6670,7 +7673,7 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
         index += 1;
     }
 
-    if in_string.is_some() {
+    if in_string {
         tokens.push(Token {
             value: "".to_string(),
             kind: Error(line as u64, "Unterminated string.".to_string()),
@@ -6733,11 +7736,17 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
             Box::new(Type::Nil)
         })),
         Expr::Unary(_, e) => get_type_of_expr(e, ctx),
-        Expr::Grouping(e) => get_type_of_expr(e, ctx),
         Expr::Binary(l, op, r) => {
             let lt = get_type_of_expr(l, ctx)?.unwrap();
             let rt = get_type_of_expr(r, ctx)?.unwrap();
             match op {
+                BinOp::And | BinOp::Or => {
+                    if lt == Type::Bool && rt == Type::Bool {
+                        Ok(Type::Bool)
+                    } else {
+                        Err("Logical operators require both operands to be boolean".into())
+                    }
+                }
                 BinOp::Plus => match (&lt, &rt) {
                     (Type::Num, Type::Num) => Ok(Type::Num),
                     (Type::Str, Type::Str) => Ok(Type::Str),
@@ -6985,12 +7994,7 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                             vec![],
                             Box::new(Type::Option(Box::new(Type::Num))),
                         ))
-                    } else if prop == "starts_with" {
-                        Ok(Type::Function(
-                            vec![("thing".to_string(), Type::Str)],
-                            Box::new(Type::Bool),
-                        ))
-                    } else if prop == "ends_with" {
+                    } else if prop == "ends_with" || prop == "starts_with" {
                         Ok(Type::Function(
                             vec![("thing".to_string(), Type::Str)],
                             Box::new(Type::Bool),
@@ -7000,14 +8004,31 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                             vec![("needle".to_string(), Type::Str)],
                             Box::new(Type::Bool),
                         ))
+                    } else if prop == "replace" {
+                        Ok(Type::Function(
+                            vec![
+                                ("needle".to_string(), Type::Str),
+                                ("replacement".to_string(), Type::Str),
+                            ],
+                            Box::new(Type::Str),
+                        ))
+                    } else if prop == "split" {
+                        Ok(Type::Function(
+                            vec![("delimiter".to_string(), Type::Str)],
+                            Box::new(Type::List(Box::new(Type::Str))),
+                        ))
                     } else {
                         Err(format!("Property '{prop}' not found on type Str"))
                     }
                 }
-                other => Err(format!(
-                    "Cannot access property '{}' on type {:?}",
-                    prop, other,
-                )),
+                Type::Option(inner) => match prop.as_str() {
+                    "default" => Ok(Type::Function(
+                        vec![("def".to_string(), *inner.clone())],
+                        inner,
+                    )),
+                    _ => Err(format!("Property '{prop}' not found on Optional type")),
+                },
+                other => Err(format!("Cannot access property '{prop}' on type {other:?}",)),
             }
         }
         Expr::Block(_) => Ok(Type::Nil),

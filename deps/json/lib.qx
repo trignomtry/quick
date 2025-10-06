@@ -1,0 +1,240 @@
+object Task {
+    text: Str, 
+    completed: Bool,
+}
+
+object User {
+    name: Str,
+    tasks: [Task],
+}
+
+
+object Token {
+    kind: Str,
+    value: Str,
+}
+
+fun json_tokenize(raw: Str) {
+    let tokens: [Token] = [];
+    let length = raw.len();
+    print(length);
+    let i = 0;
+    let in_string = false;
+    let escaping = false;
+    let current = "";
+
+    while i < length && true {
+        let ch = raw[i];
+
+        if in_string {
+            if escaping {
+                current = current + ch;
+                escaping = false;
+            } else if ch == "\\" {
+                escaping = true;
+            } else if ch == "\"" {
+                tokens.push(Token { kind: "string", value: current });
+                current = "";
+                in_string = false;
+            } else {
+                current = current + ch;
+            }
+            i = i + 1;
+        } else if ch == "\"" {
+            in_string = true;
+            current = "";
+            i = i + 1;
+        } else if " \n\r\t".contains(ch) {
+            i = i + 1;
+        } else if "{}[],:".contains(ch) {
+            tokens.push(Token { kind: ch, value: ch });
+            i = i + 1;
+        } else {
+            let literal = "";
+            while i < length {
+                let c = raw[i];
+                if "{}[],:\" \n\r\t".contains(c) {
+                    break;
+                }
+                literal = literal + c;
+                i = i + 1;
+            }
+            if literal.len() > 0 {
+                tokens.push(Token { kind: "literal", value: literal });
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    if in_string {
+        return [];
+    }
+    return tokens;
+}
+
+fun parse_user_json(raw: Str) {
+    let tokens = json_tokenize(raw);
+    print("token count: " + tokens.len().str());
+    if tokens.len() == 0 {
+        print("tokenizer returned 0 tokens");
+        return nil;
+    }
+    if tokens[0].kind != "{" {
+        print("expected {, saw " + tokens[0].kind);
+        return nil;
+    }
+
+    let total = tokens.len();
+    let current = 1;
+    let name = "";
+    let has_name = false;
+    let tasks: [Task] = [];
+    let has_tasks = false;
+
+    while current < total {
+        if tokens[current].kind == "}" {
+            break;
+        }
+        if tokens[current].kind != "string" {
+            return nil;
+        }
+        let key = tokens[current].value;
+        current = current + 1;
+
+        if current >= total || tokens[current].kind != ":" {
+            return nil;
+        }
+        current = current + 1;
+
+        if key == "name" {
+            if current >= total || tokens[current].kind != "string" {
+                return nil;
+            }
+            name = tokens[current].value;
+            has_name = true;
+            current = current + 1;
+        } else if key == "tasks" {
+            if current >= total || tokens[current].kind != "[" {
+                return nil;
+            }
+            current = current + 1;
+
+            let parsed_tasks: [Task] = [];
+            while current < total {
+                if tokens[current].kind == "]" {
+                    break;
+                }
+                if tokens[current].kind != "{" {
+                    return nil;
+                }
+                current = current + 1;
+
+                let task_text = "";
+                let task_completed = false;
+                let seen_text = false;
+                let seen_completed = false;
+
+                while current < total {
+                    if tokens[current].kind == "}" {
+                        break;
+                    }
+                    if tokens[current].kind != "string" {
+                        return nil;
+                    }
+                    let task_key = tokens[current].value;
+                    current = current + 1;
+
+                    if current >= total || tokens[current].kind != ":" {
+                        return nil;
+                    }
+                    current = current + 1;
+
+                    if task_key == "text" {
+                        if current >= total || tokens[current].kind != "string" {
+                            return nil;
+                        }
+                        task_text = tokens[current].value;
+                        seen_text = true;
+                        current = current + 1;
+                    } else if task_key == "completed" {
+                        if current >= total {
+                            return nil;
+                        }
+                        let bool_token = tokens[current];
+                        if bool_token.kind == "literal" || bool_token.kind == "string" {
+                            if bool_token.value == "true" {
+                                task_completed = true;
+                                seen_completed = true;
+                                current = current + 1;
+                            } else if bool_token.value == "false" {
+                                task_completed = false;
+                                seen_completed = true;
+                                current = current + 1;
+                            } else {
+                                return nil;
+                            }
+                        } else {
+                            return nil;
+                        }
+                    } else {
+                        return nil;
+                    }
+
+                    if current < total && tokens[current].kind == "," {
+                        current = current + 1;
+                    }
+                }
+
+                if current >= total || tokens[current].kind != "}" {
+                    return nil;
+                }
+                current = current + 1;
+
+                if !seen_text {
+                    return nil;
+                }
+                parsed_tasks.push(Task {
+                    text: task_text,
+                    completed: task_completed,
+                });
+
+                if current < total && tokens[current].kind == "," {
+                    current = current + 1;
+                }
+            }
+
+            if current >= total || tokens[current].kind != "]" {
+                return nil;
+            }
+            current = current + 1;
+            has_tasks = true;
+            tasks = parsed_tasks;
+        } else {
+            if current >= total {
+                return nil;
+            }
+            if tokens[current].kind == "string" || tokens[current].kind == "literal" {
+                current = current + 1;
+            } else {
+                return nil;
+            }
+        }
+
+        if current < total && tokens[current].kind == "," {
+            current = current + 1;
+        }
+    }
+
+    if current >= total || tokens[current].kind != "}" {
+        return nil;
+    }
+    if !has_name {
+        return nil;
+    }
+    if !has_tasks {
+        // leave tasks as the empty list created above
+    }
+
+    return User { name: name, tasks: tasks };
+}

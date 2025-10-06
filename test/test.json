@@ -1,4 +1,4 @@
 {
-    "name": "T",
-    "age": 1
+    "name": "{name}",
+    "tasks": "{tasks}"
 }
