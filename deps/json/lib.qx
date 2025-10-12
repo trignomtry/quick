@@ -17,7 +17,6 @@ object Token {
 fun json_tokenize(raw: Str) {
     let tokens: [Token] = [];
     let length = raw.len();
-    print(length);
     let i = 0;
     let in_string = false;
     let escaping = false;
@@ -25,7 +24,6 @@ fun json_tokenize(raw: Str) {
 
     while i < length && true {
         let ch = raw[i];
-
         if in_string {
             if escaping {
                 current = current + ch;
@@ -75,7 +73,6 @@ fun json_tokenize(raw: Str) {
 
 fun parse_user_json(raw: Str) {
     let tokens = json_tokenize(raw);
-    print("token count: " + tokens.len().str());
     if tokens.len() == 0 {
         print("tokenizer returned 0 tokens");
         return nil;

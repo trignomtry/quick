@@ -1,4 +1,5 @@
 use crate::TokenKind::*;
+use clap::Parser as Clap;
 unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
     fn strncmp(a: *const i8, b: *const i8, c: i32) -> i32;
@@ -659,14 +660,19 @@ pub unsafe extern "C" fn io_read_file(filename: *const c_char) -> *mut c_char {
 
     let filename_str = unsafe { cstr_to_string(filename) };
 
-    let result = block_on_in_runtime(async {
-        tokio::fs::read_to_string(&filename_str)
-            .await
-            .unwrap_or_default()
-    });
+    let read_result =
+        block_on_in_runtime(async { tokio::fs::read_to_string(&filename_str).await });
 
-    let c_str = std::ffi::CString::new(result).unwrap();
-    c_str.into_raw()
+    match read_result {
+        Ok(content) => std::ffi::CString::new(content).unwrap().into_raw(),
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                std::ptr::null_mut()
+            } else {
+                std::ffi::CString::new(String::new()).unwrap().into_raw()
+            }
+        }
+    }
 }
 
 // Async file writing function for io.write() - now the default
@@ -1011,231 +1017,6 @@ async fn handle_hyper_request(
         .body(Body::from(body))
         .unwrap_or_else(|_| HyperResponse::new(Body::from("Internal Server Error")));
     Ok(resp)
-}
-
-// Callback-based connection handler
-async fn handle_connection_with_callback(socket: tokio::net::TcpStream) {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    use tokio::time::timeout;
-
-    let _ = socket.set_nodelay(true);
-
-    // Avoid aliasing a &mut borrow for read and then writing on the same socket.
-    // Split into owned read/write halves for safety.
-    let (read_half, mut write_half) = socket.into_split();
-    let mut reader = BufReader::with_capacity(8192, read_half);
-    let mut request_line = String::with_capacity(512);
-
-    let read_result = timeout(Duration::from_secs(5), reader.read_line(&mut request_line)).await;
-
-    if read_result.is_err() {
-        return;
-    }
-
-    let mut parts = request_line.split_ascii_whitespace();
-    let method = parts.next().unwrap_or("GET").to_string();
-    let full_path = parts.next().unwrap_or("/").to_string();
-
-    // Parse path and query
-    fn percent_decode(input: &str) -> String {
-        let bytes = input.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'+' => {
-                    out.push(b' ');
-                    i += 1;
-                }
-                b'%' if i + 2 < bytes.len() => {
-                    let h1 = bytes[i + 1];
-                    let h2 = bytes[i + 2];
-                    let v1 = (h1 as char).to_digit(16);
-                    let v2 = (h2 as char).to_digit(16);
-                    if let (Some(v1), Some(v2)) = (v1, v2) {
-                        out.push(((v1 << 4) as u8) | (v2 as u8));
-                        i += 3;
-                    } else {
-                        // invalid, copy as-is
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-                b => {
-                    out.push(b);
-                    i += 1;
-                }
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    let (path, raw_query) = match full_path.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (full_path.clone(), String::new()),
-    };
-
-    // Build a normalized, decoded query string: key=value&key2=value2
-    let query = if raw_query.is_empty() {
-        String::new()
-    } else {
-        let mut parts = Vec::new();
-        for pair in raw_query.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (k, v) = match pair.split_once('=') {
-                Some((k, v)) => (k, v),
-                None => (pair, ""),
-            };
-            let dk = percent_decode(k);
-            let dv = percent_decode(v);
-            parts.push(format!("{}={}", dk, dv));
-        }
-        parts.join("&")
-    };
-
-    // Read headers until blank line
-    let mut headers_raw = String::new();
-    let mut header_line = String::new();
-    let mut content_length: usize = 0;
-    loop {
-        header_line.clear();
-        if timeout(Duration::from_secs(5), reader.read_line(&mut header_line))
-            .await
-            .is_err()
-        {
-            break;
-        }
-        // Empty line ("\r\n") marks end of headers
-        if header_line == "\r\n" || header_line.is_empty() {
-            break;
-        }
-        // Accumulate raw headers
-        headers_raw.push_str(&header_line);
-
-        let lower = header_line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            if let Ok(len) = rest.trim().parse::<usize>() {
-                content_length = len;
-            }
-        }
-    }
-
-    // Read body if Content-Length specified
-    let mut body_str = String::new();
-    if content_length > 0 {
-        let mut buf = vec![0u8; content_length];
-        let _ = timeout(Duration::from_secs(5), reader.read_exact(&mut buf)).await;
-        // Best-effort UTF-8 decode; fall back to lossless using from_utf8_lossy
-        body_str = String::from_utf8(buf).unwrap_or_default();
-    }
-
-    // Get the callback handler address (stored as usize)
-    let handler_addr = *CALLBACK_HANDLER
-        .get()
-        .expect("Callback not set before handling connection");
-    let (status_code, content_type, body, headers) = {
-        let method = method.clone();
-        let path = path.clone();
-        let query = query.clone();
-        let headers_raw = headers_raw.clone();
-        let body_str = body_str.clone();
-        match tokio::task::spawn_blocking(move || {
-            unsafe {
-                // Create a Request object for the callback
-                let method_cstr = std::ffi::CString::new(method).unwrap();
-                let path_cstr = std::ffi::CString::new(path).unwrap();
-                let query_cstr = std::ffi::CString::new(query)
-                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
-                let headers_cstr = std::ffi::CString::new(headers_raw)
-                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
-                let body_cstr = std::ffi::CString::new(body_str)
-                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
-
-                let request_obj = create_request_object(
-                    method_cstr.as_ptr(),
-                    path_cstr.as_ptr(),
-                    query_cstr.as_ptr(),   // query
-                    headers_cstr.as_ptr(), // headers
-                    body_cstr.as_ptr(),    // body
-                );
-
-                // Call the callback function - it should return a ResponseObject*
-                let func: extern "C" fn(*const RequestObject) -> *mut ResponseObject =
-                    std::mem::transmute::<usize, _>(handler_addr);
-                let response_ptr = func(request_obj);
-
-                let result = if response_ptr.is_null() {
-                    (
-                        404,
-                        "text/plain; charset=utf-8".to_string(),
-                        "Not Found".to_string(),
-                        "".to_string(),
-                    )
-                } else {
-                    let status = get_response_status(response_ptr);
-                    let content_type = cstr_to_string(get_response_content_type(response_ptr));
-                    let body = cstr_to_string(get_response_body(response_ptr));
-                    let headers = cstr_to_string(get_response_headers(response_ptr));
-
-                    // Clean up the response object
-                    let _ = Box::from_raw(response_ptr);
-
-                    (status, content_type, body, headers)
-                };
-
-                // Clean up the request object
-                let _ = Box::from_raw(request_obj);
-
-                result
-            }
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => (
-                500,
-                "text/plain; charset=utf-8".to_string(),
-                "Internal Server Error".to_string(),
-                "".to_string(),
-            ),
-        }
-    };
-
-    // Convert status code to status line
-    let status_line = match status_code {
-        200 => "200 OK",
-        301 => "301 Moved Permanently",
-        302 => "302 Found",
-        404 => "404 Not Found",
-        500 => "500 Internal Server Error",
-        _ => "200 OK", // Default fallback
-    };
-
-    // Build response with proper headers
-    let mut response = format!(
-        "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: keep-alive\r\nServer: QuickScript/1.0\r\n",
-        status_line,
-        body.len(),
-        content_type
-    );
-
-    // Add custom headers if any
-    if !headers.is_empty() {
-        response.push_str(&headers);
-        response.push_str("\r\n");
-    }
-
-    response.push_str("\r\n");
-    response.push_str(&body);
-
-    let _ = timeout(
-        Duration::from_secs(5),
-        write_half.write_all(response.as_bytes()),
-    )
-    .await;
-    let _ = write_half.flush().await;
 }
 
 #[derive(Debug, Clone)]
@@ -2741,57 +2522,60 @@ impl Parser {
 impl Display for TokenKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Self::LParen => "LEFT_PAREN",
-            Self::RParen => "RIGHT_PAREN",
-            Self::LBrace => "LEFT_BRACE",
-            Self::RBrace => "RIGHT_BRACE",
-            Self::LBrack => "LEFT_BRACK",
-            Self::RBrack => "RIGHT_BRACK",
-            Self::Star => "STAR",
-            Self::Dot => "DOT",
-            Self::Comma => "COMMA",
-            Self::Plus => "PLUS",
-            Self::Minus => "MINUS",
-            Self::AmpAmp => "AMP_AMP",
-            Self::PipePipe => "PIPE_PIPE",
-            Self::Colon => "COLON",
-            Self::Semicolon => "SEMICOLON",
-            Self::Equal => "EQUAL",
-            Self::EqualEqual => "EQUAL_EQUAL",
-            Self::Bang => "BANG",
-            Self::BangEqual => "BANG_EQUAL",
-            Self::Less => "LESS",
-            Self::LessEqual => "LESS_EQUAL",
-            Self::Greater => "GREATER",
-            Self::GreaterEqual => "GREATER_EQUAL",
-            Self::Slash => "SLASH",
-            Self::Str(_) => "STRING",
-            Self::Num(_) => "NUMBER",
-            Self::Identifier(_) => "IDENTIFIER",
-            Self::And => "AND",
-            Self::Object => "OBJECT",
-            Self::Enum => "ENUM",
-            Self::Maybe => "MAYBE",
-            Self::Else => "ELSE",
-            Self::False => "FALSE",
-            Self::For => "FOR",
-            Self::Fun => "FUN",
-            Self::If => "IF",
-            Self::Nil => "NIL",
-            Self::Or => "OR",
-            Self::Print => "PRINT",
-            Self::Reprint => "REPRINT",
-            Self::Return => "RETURN",
-            Self::Break => "BREAK",
-            Self::Super => "SUPER",
-            Self::This => "THIS",
-            Self::True => "TRUE",
-            Self::Let => "LET",
-            Self::In => "IN",
-            Self::While => "WHILE",
-            Self::Use => "USE",
-            Self::Eof => "EOF",
-            Self::Error(line, error) => &format!("[line {line}] Error: {error}"),
+            Self::LParen => "(".to_string(),
+            Self::RParen => ")".to_string(),
+            Self::LBrace => "{".to_string(),
+            Self::RBrace => "}".to_string(),
+            Self::LBrack => "[".to_string(),
+            Self::RBrack => "]".to_string(),
+            Self::Star => "*".to_string(),
+            Self::Dot => ".".to_string(),
+            Self::Comma => ",".to_string(),
+            Self::Plus => "+".to_string(),
+            Self::Minus => "-".to_string(),
+            Self::AmpAmp => "&&".to_string(),
+            Self::PipePipe => "||".to_string(),
+            Self::Colon => ":".to_string(),
+            Self::Semicolon => ";".to_string(),
+            Self::Equal => "=".to_string(),
+            Self::EqualEqual => "==".to_string(),
+            Self::Bang => "!".to_string(),
+            Self::BangEqual => "!=".to_string(),
+            Self::Less => "<".to_string(),
+            Self::LessEqual => "<=".to_string(),
+            Self::Greater => ">".to_string(),
+            Self::GreaterEqual => ">=".to_string(),
+            Self::Slash => "/".to_string(),
+            Self::Str(s) => {
+                let binding = format!("\"{s}\"");
+                binding
+            }
+            Self::Num(num) => format!("{num}"),
+            Self::Identifier(ident) => ident.to_string(),
+            Self::And => "and".to_string(),
+            Self::Object => "object".to_string(),
+            Self::Enum => "enum".to_string(),
+            Self::Maybe => "maybe".to_string(),
+            Self::Else => "else".to_string(),
+            Self::False => "false".to_string(),
+            Self::For => "for".to_string(),
+            Self::Fun => "fun".to_string(),
+            Self::If => "if".to_string(),
+            Self::Nil => "none".to_string(),
+            Self::Or => "or".to_string(),
+            Self::Print => "print".to_string(),
+            Self::Reprint => "reprint".to_string(),
+            Self::Return => "return".to_string(),
+            Self::Break => "break".to_string(),
+            Self::Super => "super".to_string(),
+            Self::This => "this".to_string(),
+            Self::True => "true".to_string(),
+            Self::Let => "let".to_string(),
+            Self::In => "in".to_string(),
+            Self::While => "while".to_string(),
+            Self::Use => "use".to_string(),
+            Self::Eof => "".to_string(),
+            Self::Error(line, error) => format!("[line {line}] Error: {error}"),
         };
         write!(f, "{s}")
     }
@@ -2927,106 +2711,373 @@ fn else_certifies(elses: &Option<Box<Instruction>>) -> bool {
     }
 }
 
+#[derive(Clap, Debug)]
+#[command( about, long_about = None)]
+struct Args {
+    /// Shows debugging info
+    #[arg(short, long, default_value_t = false)]
+    debug: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Clap, Debug)]
+enum Commands {
+    Run { filename: Option<String> },
+    Format { filename: Option<String> },
+}
+
 fn main() {
-    let args: Vec<std::string::String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <filename>", args[0]);
-        return;
-    }
+    let args = Args::parse();
 
-    let filename = &args[1];
+    match args.command {
+        Commands::Run { filename } => {
+            let filename = filename.unwrap_or("./src/main.rs".to_string());
+            let Ok(contents) = std::fs::read_to_string(&filename) else {
+                eprintln!("Os error while reading file {filename}. Please try again later");
+                std::process::exit(70);
+            };
+            let tokens = tokenize(contents.chars().collect());
 
-    let file_contents = std::fs::read_to_string(filename).unwrap_or_else(|_| {
-        eprintln!("Failed to read file {filename}");
-        std::string::String::new()
-    });
-    let tokens = tokenize(file_contents.chars().collect());
-    // Lexical error check
-    if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
-        for t in tokens {
-            if let Error(_, _) = t.kind {
-                t.print();
-            }
-        }
-        std::process::exit(65);
-    }
-    let mut parser = Parser::new(tokens);
-    match parser.parse_program() {
-        Ok(p) => {
-            for ins in p.clone() {
-                if let Instruction::FunctionDef {
-                    name,
-                    params: _,
-                    return_type: _,
-                    body,
-                } = ins
-                {
-                    if !returns_on_all_paths(body) {
-                        eprintln!(
-                            "Body of function '{name}' does not return a value every time. Try adding `return none` at the end of the function"
-                        );
-                        std::process::exit(70);
+            // Lexical error check
+            if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
+                for t in tokens {
+                    if let Error(_, _) = t.kind {
+                        t.print();
                     }
                 }
+                std::process::exit(65);
             }
-            let context = context::Context::create();
-            let module = context.create_module("sum");
-            let execution_engine = module
-                .create_jit_execution_engine(OptimizationLevel::Aggressive)
-                .unwrap();
-            let initial_quick_types = parser.pctx.var_types.clone();
-            let parser_ctx = parser.pctx;
-            let codegen = Compiler {
-                context: &context,
-                module,
-                builder: context.create_builder(),
-                execution_engine,
-                instructions: p,
-                vars: RefCell::new(HashMap::new()),
-                var_types: RefCell::new(HashMap::new()),
-                quick_var_types: RefCell::new(initial_quick_types),
-                pctx: RefCell::new(parser_ctx),
-                current_module: RefCell::new(None),
-                closure_envs: RefCell::new(HashMap::new()),
-                current_function: RefCell::new(Vec::new()),
-                loop_stack: RefCell::new(Vec::new()),
-            };
+            let mut parser = Parser::new(tokens);
+            match parser.parse_program() {
+                Ok(p) => {
+                    for ins in p.clone() {
+                        if let Instruction::FunctionDef {
+                            name,
+                            params: _,
+                            return_type: _,
+                            body,
+                        } = ins
+                        {
+                            if !returns_on_all_paths(body) {
+                                eprintln!(
+                                    "Body of function '{name}' does not return a value every time. Try adding `return none` at the end of the function"
+                                );
+                                std::process::exit(70);
+                            }
+                        }
+                    }
+                    let context = context::Context::create();
+                    let module = context.create_module("sum");
+                    let execution_engine = module
+                        .create_jit_execution_engine(OptimizationLevel::Aggressive)
+                        .unwrap();
+                    let initial_quick_types = parser.pctx.var_types.clone();
+                    let parser_ctx = parser.pctx;
+                    let codegen = Compiler {
+                        context: &context,
+                        module,
+                        builder: context.create_builder(),
+                        execution_engine,
+                        instructions: p,
+                        vars: RefCell::new(HashMap::new()),
+                        var_types: RefCell::new(HashMap::new()),
+                        quick_var_types: RefCell::new(initial_quick_types),
+                        pctx: RefCell::new(parser_ctx),
+                        current_module: RefCell::new(None),
+                        closure_envs: RefCell::new(HashMap::new()),
+                        current_function: RefCell::new(Vec::new()),
+                        loop_stack: RefCell::new(Vec::new()),
+                    };
 
-            // seed the C PRNG so io.random() varies each run
-            unsafe {
-                // get current epoch seconds
-                let now = time(ptr::null_mut());
-                srand(now as u32);
-            }
-            let sum = codegen
-                .run_code()
-                .ok_or("Unable to JIT compile code")
-                .unwrap();
-            codegen.module.print_to_file("./ll.v");
+                    // seed the C PRNG so io.random() varies each run
+                    unsafe {
+                        // get current epoch seconds
+                        let now = time(ptr::null_mut());
+                        srand(now as u32);
+                    }
+                    let sum = codegen
+                        .run_code()
+                        .ok_or("Unable to JIT compile code")
+                        .unwrap();
+                    codegen.module.print_to_file("./ll.v");
 
-            unsafe {
-                let res = sum.call();
-                if res != 0.0 {
-                    std::process::exit(res as i32);
+                    unsafe {
+                        let res = sum.call();
+                        if res != 0.0 {
+                            std::process::exit(res as i32);
+                        }
+                    }
+
+                    // If an HTTP server was started, keep the process alive.
+                    // Wait briefly for the server to transition to running if needed.
+                    let mut waited = 0u32;
+
+                    while !SERVER_RUNNING.load(Ordering::Relaxed) && waited < 1 {
+                        std::thread::sleep(Duration::from_millis(1));
+                        waited += 1;
+                    }
+                    if SERVER_RUNNING.load(Ordering::Relaxed) {
+                        // Park the main thread indefinitely. Ctrl+C will terminate the process.
+                        std::thread::park();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(65);
                 }
             }
-
-            // If an HTTP server was started, keep the process alive.
-            // Wait briefly for the server to transition to running if needed.
-            let mut waited = 0u32;
-
-            while !SERVER_RUNNING.load(Ordering::Relaxed) && waited < 1 {
-                std::thread::sleep(Duration::from_millis(1));
-                waited += 1;
-            }
-            if SERVER_RUNNING.load(Ordering::Relaxed) {
-                // Park the main thread indefinitely. Ctrl+C will terminate the process.
-                std::thread::park();
-            }
         }
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(65);
+        Commands::Format { filename } => {
+            let filename = filename.unwrap_or("./src/main.rs".to_string());
+            let Ok(contents) = std::fs::read_to_string(&filename) else {
+                eprintln!("Os error while reading file {filename}. Please try again later");
+                std::process::exit(70);
+            };
+            let tokens = tokenize(contents.chars().collect());
+            if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
+                for t in tokens {
+                    if let Error(_, _) = t.kind {
+                        t.print();
+                    }
+                }
+                std::process::exit(65);
+            }
+
+            let mut formatted = String::new();
+            let mut indent = 0usize;
+            let mut line_open = false;
+            let mut prev_kind: Option<TokenKind> = None;
+
+            let mut push_indent = |buf: &mut String, indent: usize, line_open: &mut bool| {
+                if !*line_open {
+                    for _ in 0..indent {
+                        buf.push('\t');
+                    }
+                    *line_open = true;
+                }
+            };
+
+            let mut trim_trailing_space = |buf: &mut String| {
+                while buf.ends_with(' ') {
+                    buf.pop();
+                }
+            };
+
+            let mut tokens = tokens.into_iter().peekable();
+            while let Some(token) = tokens.next() {
+                let kind = token.kind;
+                match &kind {
+                    LBrace => {
+                        if matches!(
+                            prev_kind,
+                            Some(
+                                Identifier(_)
+                                    | RParen
+                                    | RBrack
+                                    | True
+                                    | False
+                                    | Nil
+                                    | Return
+                                    | Else
+                            )
+                        ) {
+                            if !formatted.ends_with([' ', '\n', '\t']) {
+                                formatted.push(' ');
+                            }
+                        }
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push('{');
+                        formatted.push('\n');
+                        line_open = false;
+                        indent += 1;
+                    }
+                    RBrace => {
+                        indent = indent.saturating_sub(1);
+                        if !formatted.ends_with('\n') {
+                            trim_trailing_space(&mut formatted);
+                            formatted.push('\n');
+                            line_open = false;
+                        }
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push('}');
+                        if matches!(tokens.peek().map(|t| &t.kind), Some(Else)) {
+                            formatted.push(' ');
+                            line_open = true;
+                        } else {
+                            formatted.push('\n');
+                            line_open = false;
+                        }
+                    }
+                    Semicolon => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push(';');
+                        formatted.push('\n');
+                        line_open = false;
+                    }
+                    Comma => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push(',');
+                        formatted.push(' ');
+                        line_open = true;
+                    }
+                    Dot => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push('.');
+                    }
+                    Colon => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push(':');
+                        formatted.push(' ');
+                        line_open = true;
+                    }
+                    LParen => {
+                        if matches!(
+                            prev_kind,
+                            Some(
+                                If | For
+                                    | While
+                                    | Maybe
+                                    | Fun
+                                    | Print
+                                    | Reprint
+                                    | Return
+                                    | Let
+                                    | Use
+                            )
+                        ) && !formatted.ends_with([' ', '\n', '\t', '('])
+                        {
+                            formatted.push(' ');
+                        }
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push('(');
+                    }
+                    RParen => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push(')');
+                    }
+                    LBrack => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push('[');
+                    }
+                    RBrack => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push(']');
+                    }
+                    Str(inner) => {
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        if !matches!(prev_kind, Some(LParen | Dot | LBrack | Colon))
+                            && !formatted.ends_with([' ', '\n', '\t'])
+                        {
+                            formatted.push(' ');
+                        }
+                        formatted.push_str(&format!("\"{}\"", inner.replace("\"", "\\\"")));
+                    }
+                    Identifier(name) => {
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        if !matches!(prev_kind, Some(LParen | Dot | LBrack | Colon | Fun))
+                            && !formatted.ends_with([' ', '\n', '\t'])
+                        {
+                            formatted.push(' ');
+                        }
+                        formatted.push_str(name);
+                    }
+                    Num(num) => {
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        if !matches!(prev_kind, Some(LParen | Dot | LBrack | Colon))
+                            && !formatted.ends_with([' ', '\n', '\t'])
+                        {
+                            formatted.push(' ');
+                        }
+                        formatted.push_str(&format!("{num}"));
+                    }
+                    And | Or | Object | Enum | Maybe | Else | False | For | Fun | If | Nil
+                    | Print | Reprint | Return | Break | Super | This | True | Let | While
+                    | Use | In => {
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        if !matches!(prev_kind, Some(LParen | Dot | Colon))
+                            && !formatted.ends_with([' ', '\n', '\t'])
+                        {
+                            formatted.push(' ');
+                        }
+                        formatted.push_str(match &kind {
+                            And => "and",
+                            Or => "or",
+                            Object => "object",
+                            Enum => "enum",
+                            Maybe => "maybe",
+                            Else => "else",
+                            False => "false",
+                            For => "for",
+                            Fun => "fun",
+                            If => "if",
+                            Nil => "none",
+                            Print => "print",
+                            Reprint => "reprint",
+                            Return => "return",
+                            Break => "break",
+                            Super => "super",
+                            This => "this",
+                            True => "true",
+                            Let => "let",
+                            While => "while",
+                            Use => "use",
+                            In => "in",
+                            _ => unreachable!(),
+                        });
+                    }
+                    Plus | Minus | Star | Slash | EqualEqual | BangEqual | Less | LessEqual
+                    | Greater | GreaterEqual | AmpAmp | PipePipe | Equal => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        if !formatted.ends_with([' ', '\n', '\t']) {
+                            formatted.push(' ');
+                        }
+                        formatted.push_str(match &kind {
+                            Plus => "+",
+                            Minus => "-",
+                            Star => "*",
+                            Slash => "/",
+                            EqualEqual => "==",
+                            BangEqual => "!=",
+                            Less => "<",
+                            LessEqual => "<=",
+                            Greater => ">",
+                            GreaterEqual => ">=",
+                            AmpAmp => "&&",
+                            PipePipe => "||",
+                            Equal => "=",
+                            _ => unreachable!(),
+                        });
+                        formatted.push(' ');
+                    }
+                    Bang => {
+                        trim_trailing_space(&mut formatted);
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        formatted.push('!');
+                    }
+                    Eof => {}
+                    Error(_, _) => {}
+                }
+                prev_kind = Some(kind);
+            }
+
+            let mut final_output = formatted;
+            trim_trailing_space(&mut final_output);
+            if !final_output.ends_with('\n') {
+                final_output.push('\n');
+            }
+            std::fs::write(filename, final_output).unwrap();
         }
     }
 }
@@ -3148,9 +3199,7 @@ impl<'ctx> Compiler<'ctx> {
                 vec_ty.fn_type(&param_metadata_types, false)
             }
             BasicTypeEnum::VectorType(vec_ty) => vec_ty.fn_type(&param_metadata_types, false),
-            BasicTypeEnum::StructType(struct_ty) => {
-                struct_ty.fn_type(&param_metadata_types, false)
-            }
+            BasicTypeEnum::StructType(struct_ty) => struct_ty.fn_type(&param_metadata_types, false),
         };
 
         self.module.add_function(name, fn_type, None)
@@ -4974,7 +5023,7 @@ impl<'ctx> Compiler<'ctx> {
                         "fread_call",
                     )
                     .unwrap();
-
+ 
                 let fclose_fn = self.get_or_create_fclose();
                 self.builder
                     .build_call(fclose_fn, &[file_ptr.into()], "fclose_call")
@@ -6194,154 +6243,165 @@ impl<'ctx> Compiler<'ctx> {
                             Err(e) => panic!("Type error: {e}"),
                         };
 
+                        if args.len() != 1 {
+                            panic!(
+                                "List::push expects exactly one argument, got {}",
+                                args.len()
+                            );
+                        }
+
+                        let f64_ty = self.context.f64_type();
+                        let i64_ty = self.context.i64_type();
+
                         // Obtain the underlying buffer pointer
-                        let buf_ptr = match self.compile_expr(obj)? {
+                        let original_buf_ptr = match self.compile_expr(obj)? {
                             BasicValueEnum::PointerValue(p) => p,
                             _ => panic!("List object not a pointer value"),
                         };
 
-                        match inner_ty {
-                            // Numeric lists: elements are f64 stored after length slot
-                            Type::Num => {
-                                let f64_ty = self.context.f64_type();
-                                let i64_ty = self.context.i64_type();
+                        // Load current length from slot 0 (stored as f64)
+                        let cur_len_f = self
+                            .builder
+                            .build_load(f64_ty, original_buf_ptr, "len_load")?
+                            .into_float_value();
+                        let cur_len_i = self
+                            .builder
+                            .build_float_to_signed_int(cur_len_f, i64_ty, "len_to_i64")?;
 
-                                // Load current length from slot 0 (stored as f64)
-                                let cur_len_f = self
-                                    .builder
-                                    .build_load(f64_ty, buf_ptr, "len_load")?
-                                    .into_float_value();
-                                let cur_len_i = self
-                                    .builder
-                                    .build_float_to_signed_int(cur_len_f, i64_ty, "len_to_i64")?;
+                        // Ensure capacity for the new element: reuse 8-byte slots for simplicity.
+                        let slot_bytes = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
+                        let needed_slots = self.builder.build_int_add(
+                            cur_len_i,
+                            i64_ty.const_int(2, false),
+                            "needed_slots",
+                        )?; // len slot + existing elems + new elem
+                        let total_bytes = self
+                            .builder
+                            .build_int_mul(slot_bytes, needed_slots, "push_bytes")?;
+                        let realloc_fn = self.get_or_create_realloc();
+                        let new_raw = self
+                            .builder
+                            .build_call(
+                                realloc_fn,
+                                &[original_buf_ptr.into(), total_bytes.into()],
+                                "realloc_list_push",
+                            )?
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap()
+                            .into_pointer_value();
 
-                                // Reallocate buffer to fit one more element: bytes = 8 * (len + 2)
-                                let bytes_per = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
-                                let needed_slots = self
-                                    .builder
-                                    .build_int_add(cur_len_i, i64_ty.const_int(2, false), "needed_slots")?; // len + header + 1 new elem
-                                let total_bytes = self
-                                    .builder
-                                    .build_int_mul(bytes_per, needed_slots, "push_bytes")?;
-                                let realloc_fn = self.get_or_create_realloc();
-                                let new_raw = self
-                                    .builder
-                                    .build_call(realloc_fn, &[buf_ptr.into(), total_bytes.into()], "realloc_list_num")?
-                                    .try_as_basic_value()
-                                    .left()
-                                    .unwrap()
-                                    .into_pointer_value();
-                                // Update the source variable if `obj` is a variable name
-                                if let Expr::Variable(ref vname) = **obj {
-                                    if let Some(var_ptr) = self.vars.borrow().get(vname) {
-                                        let _ = self.builder.build_store(*var_ptr, new_raw);
-                                    }
-                                }
-                                let buf_ptr = new_raw;
-
-                                // Compute insertion index = len + 1 (skip length slot at index 0)
-                                let one = i64_ty.const_int(1, false);
-                                let idx = self.builder.build_int_add(cur_len_i, one, "push_idx")?;
-
-                                // Compute element pointer using f64 element type
-                                let elem_ptr = unsafe {
-                                    self.builder
-                                        .build_in_bounds_gep(f64_ty, buf_ptr, &[idx], "push_elem_ptr")?
-                                };
-
-                                // Compile value and ensure it's an f64
-                                let mut val = self.compile_expr(&args[0])?;
-                                let val_f = match val {
-                                    BasicValueEnum::FloatValue(f) => f,
-                                    BasicValueEnum::IntValue(iv) => self
-                                        .builder
-                                        .build_signed_int_to_float(iv, f64_ty, "int_to_float_push")?,
-                                    other => panic!("Attempted to push non-numeric value into numeric list: {:?}", other),
-                                };
-
-                                let _ = self.builder.build_store(elem_ptr, val_f);
-
-                                // Update length in slot 0: len += 1
-                                let new_len_i = self.builder.build_int_add(cur_len_i, one, "len_inc")?;
-                                let new_len_f = self.builder.build_signed_int_to_float(new_len_i, f64_ty, "len_to_f64")?;
-                                let _ = self.builder.build_store(buf_ptr, new_len_f);
-
-                                Ok(f64_ty.const_float(0.0).as_basic_value_enum())
+                        // Update the source variable if `obj` is a variable name
+                        if let Expr::Variable(ref vname) = **obj {
+                            if let Some(var_ptr) = self.vars.borrow().get(vname) {
+                                let _ = self.builder.build_store(*var_ptr, new_raw);
                             }
-                            // String lists: elements are pointers; store pointer values
-                            Type::Str => {
-                                let f64_ty = self.context.f64_type();
-                                let i64_ty = self.context.i64_type();
-
-                                // Load current length from slot 0 (as f64)
-                                let cur_len_f = self
-                                    .builder
-                                    .build_load(f64_ty, buf_ptr, "len_load")?
-                                    .into_float_value();
-                                let cur_len_i = self
-                                    .builder
-                                    .build_float_to_signed_int(cur_len_f, i64_ty, "len_to_i64")?;
-
-                                // Reallocate buffer to fit one more element: bytes = 8 * (len + 2)
-                                let bytes_per = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
-                                let needed_slots = self
-                                    .builder
-                                    .build_int_add(cur_len_i, i64_ty.const_int(2, false), "needed_slots")?; // len + header + 1 new elem
-                                let total_bytes = self
-                                    .builder
-                                    .build_int_mul(bytes_per, needed_slots, "push_bytes")?;
-                                let realloc_fn = self.get_or_create_realloc();
-                                let new_raw = self
-                                    .builder
-                                    .build_call(realloc_fn, &[buf_ptr.into(), total_bytes.into()], "realloc_list_str")?
-                                    .try_as_basic_value()
-                                    .left()
-                                    .unwrap()
-                                    .into_pointer_value();
-                                // Update the source variable if `obj` is a variable name
-                                if let Expr::Variable(ref vname) = **obj {
-                                    if let Some(var_ptr) = self.vars.borrow().get(vname) {
-                                        let _ = self.builder.build_store(*var_ptr, new_raw);
-                                    }
-                                }
-                                let buf_ptr = new_raw;
-
-                                let one = i64_ty.const_int(1, false);
-                                let idx = self.builder.build_int_add(cur_len_i, one, "push_idx")?;
-
-                                // Compute element address using 8-byte slots (f64 stride)
-                                let elem_ptr = unsafe {
-                                    self.builder.build_in_bounds_gep(
-                                        f64_ty,
-                                        buf_ptr,
-                                        &[idx],
-                                        "push_elem_ptr",
-                                    )?
-                                };
-
-                                // Compile value and ensure it's a pointer (C string)
-                                let val = self.compile_expr(&args[0])?;
-                                let ptr_val = match val {
-                                    BasicValueEnum::PointerValue(p) => p,
-                                    other => panic!(
-                                        "Attempted to push non-string into string list: {:?}",
-                                        other
-                                    ),
-                                };
-                                let _ = self.builder.build_store(elem_ptr, ptr_val);
-
-                                // Increment length in slot 0
-                                let new_len_i = self.builder.build_int_add(cur_len_i, one, "len_inc")?;
-                                let new_len_f = self
-                                    .builder
-                                    .build_signed_int_to_float(new_len_i, f64_ty, "len_to_f64")?;
-                                let _ = self.builder.build_store(buf_ptr, new_len_f);
-
-                                Ok(f64_ty.const_float(0.0).as_basic_value_enum())
-                            }
-                            // TODO: Support other element types (bool, objects). For now, no-op.
-                            _ => Ok(self.context.f64_type().const_float(0.0).as_basic_value_enum()),
                         }
+                        let buf_ptr = new_raw;
+
+                        // Compute insertion index = len + 1 (skip length slot at index 0)
+                        let one = i64_ty.const_int(1, false);
+                        let idx = self.builder.build_int_add(cur_len_i, one, "push_idx")?;
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(f64_ty, buf_ptr, &[idx], "push_elem_ptr")?
+                        };
+
+                        // Compile the pushed value and convert it to the appropriate storage representation
+                        let val = self.compile_expr(&args[0])?;
+                        let value_to_store = match inner_ty {
+                            Type::Num => match val {
+                                BasicValueEnum::FloatValue(f) => f.as_basic_value_enum(),
+                                BasicValueEnum::IntValue(iv) => self
+                                    .builder
+                                    .build_signed_int_to_float(iv, f64_ty, "int_to_float_push")?
+                                    .as_basic_value_enum(),
+                                other => panic!(
+                                    "Attempted to push non-numeric value into numeric list: {:?}",
+                                    other
+                                ),
+                            },
+                            Type::Bool => match val {
+                                BasicValueEnum::IntValue(iv) => {
+                                    if iv.get_type().get_bit_width() == 1 {
+                                        iv.as_basic_value_enum()
+                                    } else {
+                                        let zero = iv.get_type().const_zero();
+                                        self.builder
+                                            .build_int_compare(
+                                                IntPredicate::NE,
+                                                iv,
+                                                zero,
+                                                "int_to_bool_push",
+                                            )?
+                                            .as_basic_value_enum()
+                                    }
+                                }
+                                BasicValueEnum::FloatValue(fv) => {
+                                    let zero = f64_ty.const_float(0.0);
+                                    self.builder
+                                        .build_float_compare(
+                                            FloatPredicate::ONE,
+                                            fv,
+                                            zero,
+                                            "float_to_bool_push",
+                                        )?
+                                        .as_basic_value_enum()
+                                }
+                                other => panic!(
+                                    "Attempted to push non-boolean value into bool list: {:?}",
+                                    other
+                                ),
+                            },
+                            Type::Nil => match val {
+                                BasicValueEnum::PointerValue(p) => p.as_basic_value_enum(),
+                                BasicValueEnum::FloatValue(f) => f.as_basic_value_enum(),
+                                BasicValueEnum::IntValue(iv) => {
+                                    if iv.get_type().get_bit_width() == 1 {
+                                        iv.as_basic_value_enum()
+                                    } else {
+                                        self
+                                            .builder
+                                            .build_signed_int_to_float(
+                                                iv,
+                                                f64_ty,
+                                                "int_to_float_push",
+                                            )?
+                                            .as_basic_value_enum()
+                                    }
+                                }
+                                other => panic!(
+                                    "Attempted to push unsupported value into untyped list: {:?}",
+                                    other
+                                ),
+                            },
+                            Type::Str
+                            | Type::Custom(_)
+                            | Type::Option(_)
+                            | Type::List(_)
+                            | Type::Io
+                            | Type::WebReturn
+                            | Type::RangeBuilder
+                            | Type::Kv(_)
+                            | Type::Function(_, _) => match val {
+                                BasicValueEnum::PointerValue(p) => p.as_basic_value_enum(),
+                                other => panic!(
+                                    "Attempted to push non-pointer value into pointer list: {:?}",
+                                    other
+                                ),
+                            },
+                        };
+
+                        let _ = self.builder.build_store(elem_ptr, value_to_store);
+
+                        // Update length in slot 0: len += 1
+                        let new_len_i = self.builder.build_int_add(cur_len_i, one, "len_inc")?;
+                        let new_len_f = self
+                            .builder
+                            .build_signed_int_to_float(new_len_i, f64_ty, "len_to_f64")?;
+                        let _ = self.builder.build_store(buf_ptr, new_len_f);
+
+                        Ok(f64_ty.const_float(0.0).as_basic_value_enum())
                     }
 
                     Expr::Get(obj, met)

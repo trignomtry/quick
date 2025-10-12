@@ -1,0 +1,328 @@
+{
+    "name": "QuickScript",
+    "scopeName": "source.quick",
+    "fileTypes": [
+        "qx"
+    ],
+    "patterns": [
+        {
+            "include": "#comments"
+        },
+        {
+            "include": "#strings"
+        },
+        {
+            "include": "#moduleImports"
+        },
+        {
+            "include": "#objectDefinitions"
+        },
+        {
+            "include": "#functionDefinitions"
+        },
+        {
+            "include": "#objectBody"
+        },
+        {
+            "include": "#variableDeclarations"
+        },
+        {
+            "include": "#keywords"
+        },
+        {
+            "include": "#numbers"
+        },
+        {
+            "include": "#constants"
+        },
+        {
+            "include": "#types"
+        },
+        {
+            "include": "#functionCalls"
+        },
+        {
+            "include": "#propertyAccess"
+        },
+        {
+            "include": "#identifiers"
+        }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.quick",
+                    "match": "//.*$"
+                },
+                {
+                    "name": "comment.block.quick",
+                    "begin": "/\\*",
+                    "end": "\\*/",
+                    "patterns": [
+                        {
+                            "match": "(?<=\\*)@\\w+",
+                            "name": "storage.type.annotation.quick"
+                        }
+                    ]
+                }
+            ]
+        },
+        "strings": {
+            "name": "string.quoted.double.quick",
+            "begin": "\"",
+            "beginCaptures": {
+                "0": {
+                    "name": "punctuation.definition.string.begin.quick"
+                }
+            },
+            "end": "\"",
+            "endCaptures": {
+                "0": {
+                    "name": "punctuation.definition.string.end.quick"
+                }
+            },
+            "patterns": [
+                {
+                    "match": "\\\\.",
+                    "name": "constant.character.escape.quick"
+                }
+            ]
+        },
+        "numbers": {
+            "name": "constant.numeric.quick",
+            "match": "\\b\\d+(?:_\\d+)*(?:\\.\\d+(?:_\\d+)*)?(?:[eE][+-]?\\d+)?\\b"
+        },
+        "keywords": {
+            "name": "keyword.control.quick",
+            "match": "\\b(break|continue|else|for|fun|func|if|in|match|maybe|object|return|use|when|while)\\b"
+        },
+        "constants": {
+            "name": "constant.language.quick",
+            "match": "\\b(false|nil|null|true)\\b"
+        },
+        "types": {
+            "patterns": [
+                {
+                    "name": "support.type.quick",
+                    "match": "\\b[A-Z][A-Za-z0-9_]*\\b(?=\\s*\\()"
+                },
+                {
+                    "name": "support.type.quick",
+                    "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+                }
+            ]
+        },
+        "moduleImports": {
+            "begin": "\\buse\\b",
+            "beginCaptures": {
+                "0": {
+                    "name": "keyword.control.import.quick"
+                }
+            },
+            "end": "(;|$)",
+            "endCaptures": {
+                "1": {
+                    "name": "punctuation.terminator.statement.quick"
+                }
+            },
+            "patterns": [
+                {
+                    "match": ":",
+                    "name": "punctuation.separator.key-value.quick"
+                },
+                {
+                    "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\b",
+                    "name": "entity.name.namespace.quick"
+                },
+                {
+                    "include": "#strings"
+                }
+            ]
+        },
+        "variableDeclarations": {
+            "begin": "\\b(let)\\b",
+            "beginCaptures": {
+                "1": {
+                    "name": "storage.type.variable.quick"
+                }
+            },
+            "end": "(?=\\s*=|;|$)",
+            "patterns": [
+                {
+                    "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\b(?=\\s*(?::|=|,|$))",
+                    "name": "variable.other.readwrite.quick"
+                },
+                {
+                    "match": ":",
+                    "name": "punctuation.separator.type.annotation.quick"
+                },
+                {
+                    "include": "#types"
+                },
+                {
+                    "match": ",",
+                    "name": "punctuation.separator.variable.quick"
+                }
+            ]
+        },
+        "objectDefinitions": {
+            "begin": "\\bobject\\b",
+            "beginCaptures": {
+                "0": {
+                    "name": "storage.type.object.quick"
+                }
+            },
+            "end": "(?=\\s*\\{)",
+            "patterns": [
+                {
+                    "match": "\\b([A-Z][A-Za-z0-9_]*)\\b",
+                    "name": "entity.name.type.quick"
+                }
+            ]
+        },
+        "functionDefinitions": {
+            "begin": "\\b(fun|func)\\b",
+            "beginCaptures": {
+                "1": {
+                    "name": "storage.type.function.quick"
+                }
+            },
+            "end": "(?=\\s*\\{)",
+            "patterns": [
+                {
+                    "match": "\\b([a-zA-Z_][A-Za-z0-9_]*)\\b(?=\\s*\\()",
+                    "name": "entity.name.function.quick"
+                },
+                {
+                    "include": "#parameters"
+                }
+            ]
+        },
+        "parameters": {
+            "begin": "\\(",
+            "beginCaptures": {
+                "0": {
+                    "name": "punctuation.section.group.begin.quick"
+                }
+            },
+            "end": "\\)",
+            "endCaptures": {
+                "0": {
+                    "name": "punctuation.section.group.end.quick"
+                }
+            },
+            "patterns": [
+                {
+                    "match": "\\b([a-zA-Z_][A-Za-z0-9_]*)\\b(?=\\s*:)",
+                    "name": "variable.parameter.quick"
+                },
+                {
+                    "match": ":",
+                    "name": "punctuation.separator.parameter.quick"
+                },
+                {
+                    "include": "#types"
+                },
+                {
+                    "include": "#numbers"
+                },
+                {
+                    "match": ",",
+                    "name": "punctuation.separator.parameter.quick"
+                }
+            ]
+        },
+        "functionCalls": {
+            "patterns": [
+                {
+                    "name": "entity.name.function.quick",
+                    "match": "(?<=\\.)[a-zA-Z_][A-Za-z0-9_]*(?=\\s*\\()"
+                }
+            ]
+        },
+        "objectBody": {
+            "begin": "\\{",
+            "beginCaptures": {
+                "0": {
+                    "name": "punctuation.section.block.begin.quick"
+                }
+            },
+            "end": "\\}",
+            "endCaptures": {
+                "0": {
+                    "name": "punctuation.section.block.end.quick"
+                }
+            },
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "include": "#strings"
+                },
+                {
+                    "include": "#keywords"
+                },
+                {
+                    "include": "#moduleImports"
+                },
+                {
+                    "include": "#variableDeclarations"
+                },
+                {
+                    "include": "#functionDefinitions"
+                },
+                {
+                    "include": "#objectDefinitions"
+                },
+                {
+                    "include": "#numbers"
+                },
+                {
+                    "include": "#types"
+                },
+                {
+                    "include": "#objectFields"
+                },
+                {
+                    "include": "#functionCalls"
+                },
+                {
+                    "include": "#propertyAccess"
+                },
+                {
+                    "include": "#identifiers"
+                }
+            ]
+        },
+        "objectFields": {
+            "patterns": [
+                {
+                    "name": "variable.other.property.quick",
+                    "match": "\\b([a-zA-Z_][A-Za-z0-9_]*)\\b(?=\\s*:)"
+                },
+                {
+                    "match": ":",
+                    "name": "punctuation.separator.key-value.quick"
+                }
+            ]
+        },
+        "propertyAccess": {
+            "patterns": [
+                {
+                    "name": "variable.other.member.quick",
+                    "match": "(?<=\\.)[a-zA-Z_][A-Za-z0-9_]*"
+                }
+            ]
+        },
+        "identifiers": {
+            "patterns": [
+                {
+                    "name": "variable.other.readwrite.quick",
+                    "match": "\\b(?!(?:break|continue|default|else|for|fun|func|if|in|match|maybe|object|return|use|when|while|true|false|nil|null)\\b)[a-z_][A-Za-z0-9_]*\\b"
+                }
+            ]
+        }
+    }
+}
