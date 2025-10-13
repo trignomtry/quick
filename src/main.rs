@@ -660,8 +660,7 @@ pub unsafe extern "C" fn io_read_file(filename: *const c_char) -> *mut c_char {
 
     let filename_str = unsafe { cstr_to_string(filename) };
 
-    let read_result =
-        block_on_in_runtime(async { tokio::fs::read_to_string(&filename_str).await });
+    let read_result = block_on_in_runtime(async { tokio::fs::read_to_string(&filename_str).await });
 
     match read_result {
         Ok(content) => std::ffi::CString::new(content).unwrap().into_raw(),
@@ -1073,6 +1072,7 @@ enum TokenKind {
     LessEqual,
     Greater,
     GreaterEqual,
+    BigArrow,
     Slash,
     Str(String),
     Identifier(String),
@@ -1081,6 +1081,7 @@ enum TokenKind {
     Object,
     Enum,
     Maybe,
+    Match,
     Else,
     False,
     For,
@@ -1140,6 +1141,569 @@ enum Expr {
     Function(Vec<(String, Type)>, Type, Box<Instruction>),
 }
 
+impl Expr {
+    fn get_type(&self, ctx: &PreCtx) -> Result<Type, String> {
+        let expr = self;
+        match expr {
+            Expr::Variable(v) => match ctx.var_types.get(v) {
+                Some(t) => Ok(t.clone()),
+                None => {
+                    if let Some(l) = ctx.types.get(v) {
+                        Ok(Type::Custom(l.clone()))
+                    } else {
+                        Err(format!("Variable \"{v}\" not found"))
+                    }
+                }
+            },
+            Expr::Function(params, ret_type, body) => {
+                Ok(Type::Function(params.to_vec(), Box::new(ret_type.clone())))
+            }
+            Expr::Index(list, _) => match get_type_of_expr(list, ctx)? {
+                Type::List(inner) => Ok(*inner),
+                Type::Str => Ok(Type::Str), // indexing a string yields a one-character string
+                other => Err(format!("Cannot index into type {:?}", other)),
+            },
+            Expr::Object(name, o) => {
+                // Prefer the declared object type (by name) if available.
+                if let Some(Custype::Object(declared)) = ctx.types.get(name) {
+                    return Ok(Type::Custom(Custype::Object(declared.clone())));
+                }
+                // Fallback: infer a structural object type from field expressions.
+                let mut fields = HashMap::new();
+                for (fname, expr) in o.iter() {
+                    let field_type = get_type_of_expr(expr, ctx)?;
+                    fields.insert(fname.clone(), field_type);
+                }
+                Ok(Type::Custom(Custype::Object(fields)))
+            }
+            Expr::Literal(tk) => match tk {
+                Value::Num(_) => Ok(Type::Num),
+                Value::Str(_) => Ok(Type::Str),
+                Value::Bool(_) => Ok(Type::Bool),
+                Value::Nil => Ok(Type::Nil),
+                _ => Err("Unsupported literal type".into()),
+            },
+            Expr::List(l) => Ok(Type::List(if let Some(r) = l.first() {
+                Box::new(get_type_of_expr(r, ctx)?)
+            } else {
+                Box::new(Type::Nil)
+            })),
+            Expr::Unary(_, e) => get_type_of_expr(e, ctx),
+            Expr::Binary(l, op, r) => {
+                let lt = get_type_of_expr(l, ctx)?.unwrap();
+                let rt = get_type_of_expr(r, ctx)?.unwrap();
+                match op {
+                    BinOp::And | BinOp::Or => {
+                        if lt == Type::Bool && rt == Type::Bool {
+                            Ok(Type::Bool)
+                        } else {
+                            Err("Logical operators require both operands to be boolean".into())
+                        }
+                    }
+                    BinOp::Plus => match (&lt, &rt) {
+                        (Type::Num, Type::Num) => Ok(Type::Num),
+                        (Type::Str, Type::Str) => Ok(Type::Str),
+                        _ => Err("Operands of '+' must be both numbers or both strings".into()),
+                    },
+                    BinOp::Minus | BinOp::Mult | BinOp::Div => {
+                        if lt == Type::Num && rt == Type::Num {
+                            Ok(Type::Num)
+                        } else {
+                            Err(format!("Operator {:?} requires two numbers", op))
+                        }
+                    }
+                    BinOp::EqEq | BinOp::NotEq => Ok(Type::Bool),
+                    BinOp::Greater | BinOp::Less | BinOp::GreaterEqual | BinOp::LessEqual => {
+                        if lt == Type::Num && rt == Type::Num {
+                            Ok(Type::Bool)
+                        } else {
+                            Err(format!("Operator {:?} requires two numbers", op))
+                        }
+                    }
+                }
+            }
+
+            Expr::Get(obj, prop) => {
+                // Special-case: Obj.new()
+                if let Expr::Variable(name) = &**obj {
+                    if name == "Obj" {
+                        return match prop.as_str() {
+                            // Default to Obj(Str) for now; user will refine types later
+                            "new" => Ok(Type::Function(
+                                vec![],
+                                Box::new(Type::Kv(Box::new(Type::Nil))),
+                            )),
+                            other => Err(format!("Unknown property '{}' on Obj", other)),
+                        };
+                    }
+                }
+
+                // Type-checking for field access
+                let obj_type = get_type_of_expr(obj, ctx)?;
+                match obj_type {
+                    Type::Kv(inner) => match prop.as_str() {
+                        // If inner is Nil (unknown yet), allow first insert to pick the type
+                        "insert" => {
+                            let val_ty = if *inner == Type::Nil {
+                                // Accept any value type on first insert; actual unification happens
+                                // in call checking or statement parsing.
+                                Type::Nil
+                            } else {
+                                *inner.clone()
+                            };
+                            Ok(Type::Function(
+                                vec![
+                                    ("key".to_string(), Type::Str),
+                                    ("value".to_string(), val_ty),
+                                ],
+                                Box::new(Type::Nil),
+                            ))
+                        }
+                        "get" => Ok(Type::Function(
+                            vec![("key".to_string(), Type::Str)],
+                            Box::new(Type::Option(inner)),
+                        )),
+                        other => Err(format!("Property '{other}' not found on Obj")),
+                    },
+                    Type::List(t) => {
+                        if prop == "len" {
+                            Ok(Type::Function(vec![], Box::new(Type::Num)))
+                        } else if prop == "push" {
+                            Ok(Type::Function(
+                                vec![("pushing".to_string(), *t)],
+                                Box::new(Type::Nil),
+                            ))
+                        } else if prop == "remove" {
+                            Ok(Type::Function(
+                                vec![("removing".to_string(), Type::Num)],
+                                Box::new(Type::Nil),
+                            ))
+                        } else {
+                            Err(format!("Property '{prop}' not found on list type"))
+                        }
+                    }
+                    Type::Io => {
+                        // Special-case io properties
+
+                        match prop.as_str() {
+                            "random" => Ok(Type::Function(vec![], Box::new(Type::Num))),
+                            "input" => Ok(Type::Function(
+                                vec![("prompt".to_string(), Type::Str)],
+                                Box::new(Type::Str),
+                            )),
+
+                            "listen" => Ok(Type::Function(
+                                vec![
+                                    ("port".to_string(), Type::Num),
+                                    (
+                                        "handler".to_string(),
+                                        Type::Function(
+                                            vec![(
+                                                "req".to_string(),
+                                                Type::Custom(Custype::Object(HashMap::new())),
+                                            )],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    ),
+                                ],
+                                Box::new(Type::Nil),
+                            )),
+                            "range" => Ok(Type::RangeBuilder),
+                            "read" => Ok(Type::Function(
+                                vec![("path".to_string(), Type::Str)],
+                                Box::new(Type::Option(Box::new(Type::Str))),
+                            )),
+                            "write" => Ok(Type::Function(
+                                vec![
+                                    ("path".to_string(), Type::Str),
+                                    ("content".to_string(), Type::Str),
+                                ],
+                                Box::new(Type::Nil),
+                            )),
+                            "web" => Ok(Type::Function(
+                                vec![],
+                                Box::new(Type::Custom({
+                                    let mut web_type = HashMap::new();
+                                    web_type.insert(
+                                        "text".to_string(),
+                                        Type::Function(
+                                            vec![("content".to_string(), Type::Str)],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+                                    web_type.insert(
+                                        "page".to_string(),
+                                        Type::Function(
+                                            vec![("content".to_string(), Type::Str)],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+                                    web_type.insert(
+                                        "file".to_string(),
+                                        Type::Function(
+                                            vec![("name".to_string(), Type::Str)],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+                                    web_type.insert(
+                                        "json".to_string(),
+                                        Type::Function(
+                                            vec![("content".to_string(), Type::Str)],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+
+                                    web_type.insert(
+                                        "redirect".to_string(),
+                                        Type::Function(
+                                            vec![
+                                                ("location".to_string(), Type::Str),
+                                                ("permanent".to_string(), Type::Bool),
+                                            ],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+                                    // Add error property with text method
+                                    let mut error_type = HashMap::new();
+                                    error_type.insert(
+                                        "text".to_string(),
+                                        Type::Function(
+                                            vec![
+                                                ("status".to_string(), Type::Num),
+                                                ("content".to_string(), Type::Str),
+                                            ],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+                                    error_type.insert(
+                                        "page".to_string(),
+                                        Type::Function(
+                                            vec![
+                                                ("status".to_string(), Type::Num),
+                                                ("content".to_string(), Type::Str),
+                                            ],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+                                    error_type.insert(
+                                        "file".to_string(),
+                                        Type::Function(
+                                            vec![
+                                                ("status".to_string(), Type::Num),
+                                                ("name".to_string(), Type::Str),
+                                            ],
+                                            Box::new(Type::WebReturn),
+                                        ),
+                                    );
+                                    web_type.insert(
+                                        "error".to_string(),
+                                        Type::Custom(Custype::Object(error_type)),
+                                    );
+                                    Custype::Object(web_type)
+                                })),
+                            )),
+                            other => Err(format!("Unknown property '{other}' on io")),
+                        }
+                    }
+                    Type::RangeBuilder => match prop.as_str() {
+                        "to" => Ok(Type::Function(
+                            vec![("rang".to_string(), Type::Num)],
+                            Box::new(Type::RangeBuilder),
+                        )),
+                        "from" => Ok(Type::Function(
+                            vec![("rang".to_string(), Type::Num)],
+                            Box::new(Type::RangeBuilder),
+                        )),
+                        "step" => Ok(Type::Function(
+                            vec![("rang".to_string(), Type::Num)],
+                            Box::new(Type::RangeBuilder),
+                        )),
+                        other => Err(format!("Unknown property '{other}' on io.range")),
+                    },
+                    Type::Num => match prop.as_str() {
+                        "str" => Ok(Type::Function(vec![], Box::new(Type::Str))),
+                        other => Err(format!("Unknown property '{other}' on type Num")),
+                    },
+                    Type::Custom(Custype::Object(fields)) => {
+                        // Look up property in custom type
+                        if let Some(t) = fields.get(prop) {
+                            Ok(t.clone())
+                        } else {
+                            Err(format!("Property '{prop}' not found on type {fields:?}"))
+                        }
+                    }
+                    Type::Custom(Custype::Enum(ref variants)) => {
+                        if variants.contains(prop) {
+                            Ok(obj_type)
+                        } else {
+                            Err(format!("Enum {:?} does not contain variant {}", obj, prop))
+                        }
+                    }
+                    Type::Str => {
+                        if prop == "len" {
+                            Ok(Type::Function(vec![], Box::new(Type::Num)))
+                        } else if prop == "num" {
+                            Ok(Type::Function(
+                                vec![],
+                                Box::new(Type::Option(Box::new(Type::Num))),
+                            ))
+                        } else if prop == "ends_with" || prop == "starts_with" {
+                            Ok(Type::Function(
+                                vec![("thing".to_string(), Type::Str)],
+                                Box::new(Type::Bool),
+                            ))
+                        } else if prop == "contains" {
+                            Ok(Type::Function(
+                                vec![("needle".to_string(), Type::Str)],
+                                Box::new(Type::Bool),
+                            ))
+                        } else if prop == "replace" {
+                            Ok(Type::Function(
+                                vec![
+                                    ("needle".to_string(), Type::Str),
+                                    ("replacement".to_string(), Type::Str),
+                                ],
+                                Box::new(Type::Str),
+                            ))
+                        } else if prop == "split" {
+                            Ok(Type::Function(
+                                vec![("delimiter".to_string(), Type::Str)],
+                                Box::new(Type::List(Box::new(Type::Str))),
+                            ))
+                        } else {
+                            Err(format!("Property '{prop}' not found on type Str"))
+                        }
+                    }
+                    Type::Option(inner) => match prop.as_str() {
+                        "default" => Ok(Type::Function(
+                            vec![("def".to_string(), *inner.clone())],
+                            inner,
+                        )),
+                        _ => Err(format!("Property '{prop}' not found on Optional type")),
+                    },
+                    other => Err(format!("Cannot access property '{prop}' on type {other:?}",)),
+                }
+            }
+            Expr::Block(_) => Ok(Type::Nil),
+            Expr::Call(callee, args) => {
+                // Special-case: io.random() always returns a number
+                //             if let Expr::Get(inner, prop) = &**callee {
+                // if let Expr::Variable(obj) = &**inner {
+                //     if obj == "io" && prop == "random" {
+                //         if args.is_empty() {
+                //             return Ok(Type::Num);
+                //         } else {
+                //             return Err(format!(
+                //                 "io.random() expects no arguments, got {}",
+                //                 args.len(),
+                //             ));
+                //         }
+                //     } else if obj == "io" && prop == "listen" {
+                //         if args.len() == 1 || args.len() == 2 {
+                //             return Ok(Type::Num); // io.listen returns a number
+                //         } else {
+                //             return Err(format!(
+                //                 "io.listen() expects 1 or 2 arguments, got {}",
+                //                 args.len(),
+                //             ));
+                //         }
+                //     } else if obj == "io" && prop == "method" {
+                //         if args.is_empty() {
+                //             return Ok(Type::Str); // io.method() returns a string
+                //         } else {
+                //             return Err(format!(
+                //                 "io.method() expects no arguments, got {}",
+                //                 args.len(),
+                //             ));
+                //         }
+                //     } else if obj == "io" && prop == "path" {
+                //         if args.is_empty() {
+                //             return Ok(Type::Str); // io.path() returns a string
+                //         } else {
+                //             return Err(format!(
+                //                 "io.path() expects no arguments, got {}",
+                //                 args.len(),
+                //             ));
+                //         }
+                //     } else if obj == "io" && prop == "web" {
+                //         if args.is_empty() {
+                //             return Ok(Type::Custom({
+                //                 let mut web_type = HashMap::new();
+                //                 web_type.insert(
+                //                     "text".to_string(),
+                //                     Type::Function(
+                //                         vec![("content".to_string(), Type::Str)],
+                //                         Box::new(Type::WebReturn),
+                //                     ),
+                //                 );
+                //                 web_type.insert(
+                //                     "page".to_string(),
+                //                     Type::Function(
+                //                         vec![("content".to_string(), Type::Str)],
+                //                         Box::new(Type::WebReturn),
+                //                     ),
+                //                 );
+                //                 web_type.insert(
+                //                     "file".to_string(),
+                //                     Type::Function(
+                //                         vec![("name".to_string(), Type::Str)],
+                //                         Box::new(Type::WebReturn),
+                //                     ),
+                //                 );
+                //                 web_type.insert(
+                //                     "json".to_string(),
+                //                     Type::Function(
+                //                         vec![("content".to_string(), Type::Str)],
+                //                         Box::new(Type::WebReturn),
+                //                     ),
+                //                 );
+
+                //                 web_type.insert(
+                //                     "redirect".to_string(),
+                //                     Type::Function(
+                //                         vec![
+                //                             ("location".to_string(), Type::Str),
+                //                             ("permanent".to_string(), Type::Bool),
+                //                         ],
+                //                         Box::new(Type::WebReturn),
+                //                     ),
+                //                 );
+                //                 // Add error property with text method
+                //                 let mut error_type = HashMap::new();
+                //                 error_type.insert(
+                //                     "text".to_string(),
+                //                     Type::Function(
+                //                         vec![
+                //                             ("status".to_string(), Type::Num),
+                //                             ("content".to_string(), Type::Str),
+                //                         ],
+                //                         Box::new(Type::WebReturn),
+                //                     ),
+                //                 );
+                //                 error_type.insert(
+                //                     "page".to_string(),
+                //                     Type::Function(
+                //                         vec![
+                //                             ("status".to_string(), Type::Num),
+                //                             ("content".to_string(), Type::Str),
+                //                         ],
+                //                         Box::new(Type::WebReturn),
+                //                     ),
+                //                 );
+                //                 web_type.insert(
+                //                     "error".to_string(),
+                //                     Type::Custom(Custype::Object(error_type)),
+                //                 );
+                //                 Custype::Object(web_type)
+                //             })); // io.web() returns a web helper object
+                //         } else {
+                //             return Err(format!("io.web() expects no arguments, got {}", args.len(),));
+                //         }
+                //     } else if obj == "io" && prop == "read" {
+                //         if args.len() == 1 {
+                //             return Ok(Type::Str); // io.read() returns a string (async by default)
+                //         } else {
+                //             return Err(format!("io.read() expects 1 argument, got {}", args.len(),));
+                //         }
+                //     } else if obj == "io" && prop == "write" {
+                //         if args.len() == 2 {
+                //             return Ok(Type::Num); // io.write() returns a number (async by default)
+                //         } else {
+                //             return Err(format!(
+                //                 "io.write() expects 2 arguments, got {}",
+                //                 args.len(),
+                //             ));
+                //         }
+                //     } else if obj == "web" && (prop == "page" || prop == "text" || prop == "file") {
+                //         if args.len() == 1 {
+                //             return Ok(Type::WebReturn); // web.page() returns a response object
+                //         } else {
+                //             return Err(format!(
+                //                 "web.{prop}() expects 1 argument, got {}",
+                //                 args.len(),
+                //             ));
+                //         }
+                //     } else if obj == "web" && prop == "redirect" {
+                //         if args.len() == 2 {
+                //             return Ok(Type::WebReturn); // web.redirect() returns a response object
+                //         } else {
+                //             return Err(format!(
+                //                 "web.redirect() expects 2 arguments, got {}",
+                //                 args.len(),
+                //             ));
+                //         }
+                //     }
+                // }
+                // }
+
+                // Existing function call type-checking
+                let callee_type = get_type_of_expr(callee, ctx)?;
+                if let Type::Function(params, ret_type) = callee_type {
+                    if args.len() != params.len() {
+                        return Err(format!(
+                            "Expected {} arguments but got {} on {callee:?}",
+                            params.len(),
+                            args.len(),
+                        ));
+                    }
+                    // Special-case: first insert decides Obj(K) inner type when currently unknown (Nil)
+                    if let Expr::Get(obj, mname) = &**callee {
+                        if mname == "insert" {
+                            if let Ok(Type::Kv(inner)) = get_type_of_expr(obj, ctx) {
+                                if *inner == Type::Nil {
+                                    // Ensure key is Str; allow any value type on first insert
+                                    let key_ty = get_type_of_expr(&args[0], ctx)?;
+                                    if key_ty != Type::Str {
+                                        return Err(format!(
+                                            "Parameter #0 type mismatch: expected {:?}, got {:?}",
+                                            Type::Str,
+                                            key_ty,
+                                        ));
+                                    }
+                                    // Skip strict check for value here; caller will solidify type.
+                                    return Ok(*ret_type);
+                                }
+                            }
+                        }
+                    }
+                    // verify each arg’s inferred type against the declared parameter type
+                    for (i, (_, param_tstr)) in params.iter().enumerate() {
+                        let arg_t = get_type_of_expr(&args[i], ctx)?;
+                        if matches!(param_tstr, Type::Function(_, _)) {
+                            // Accept any function value
+                            if let Type::Function(_, _) = arg_t {
+                                // OK
+                            } else {
+                                return Err(format!(
+                                    "Parameter #{} type mismatch: expected a function, got {:?}",
+                                    i, arg_t,
+                                ));
+                            }
+                        } else {
+                            let expected = param_tstr;
+                            if *expected != arg_t {
+                                return Err(format!(
+                                    "Parameter #{} type mismatch: expected {:?}, got {:?}",
+                                    i, expected, arg_t,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(*ret_type)
+                } else {
+                    Err(format!("Can only call functions, found {:?}", callee_type))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MatchArm {
+    CatchAll(String, Instruction),
+    Literal(Expr, Instruction),
+}
+
 #[derive(Debug, Clone)]
 enum Instruction {
     Let {
@@ -1157,6 +1721,10 @@ enum Instruction {
         condition: Expr,
         then: Vec<Instruction>,
         elses: Option<Box<Instruction>>,
+    },
+    Match {
+        expr: Expr,
+        arms: Vec<MatchArm>,
     },
     While {
         condition: Expr,
@@ -1420,7 +1988,7 @@ impl Parser {
         if self.match_kind(TokenKind::Return) {
             let expr = self.expression()?;
             let ret_type = get_type_of_expr(&expr, &self.pctx)?;
-            // Track explicit nil/non-nil returns for this function
+            // Track explicit nil/non-xnil returns for this function
             if ret_type == Type::Nil {
                 self.saw_nil_return = true;
             } else {
@@ -1828,6 +2396,57 @@ impl Parser {
                 then: vec![then_block_stmt],
                 elses: else_node,
             })
+        } else if self.match_kind(TokenKind::Match) {
+            let matching_expr = self.expression()?;
+            let matching_expr_type = matching_expr.get_type(&self.pctx)?;
+            self.consume(
+                TokenKind::LBrace,
+                &format!("Expected '{{' after match, found {}", self.peek().kind),
+            )?;
+            let mut arms: Vec<MatchArm> = vec![];
+            while !self.match_kind(TokenKind::RBrace) {
+                let matching = self.expression()?;
+                if let Expr::Variable(ref name) = matching {
+                    self.consume(
+                        TokenKind::BigArrow,
+                        &format!("Expected => in match statement, found {}", self.peek().kind),
+                    )?;
+                    let previous = self
+                        .pctx
+                        .var_types
+                        .insert(name.to_string(), matching_expr_type.clone());
+
+                    let runs = self.parse_statement()?;
+                    if let Some(prev) = previous {
+                        self.pctx.var_types.insert(name.to_string(), prev);
+                    } else {
+                        self.pctx.var_types.remove(name);
+                    }
+                    arms.push(MatchArm::CatchAll(name.to_string(), runs));
+                } else if matching
+                    .get_type(&self.pctx)?
+                    .infer(&matching_expr_type)
+                    .is_none()
+                {
+                    eprintln!(
+                        "Matching wrong type, expr is type {:?}",
+                        matching_expr_type
+                    );
+                    std::process::exit(70);
+                } else {
+                    self.consume(
+                        TokenKind::BigArrow,
+                        &format!("Expected => in match statement, found {}", self.peek().kind),
+                    )?;
+                    let runs = self.parse_statement()?;
+                    arms.push(MatchArm::Literal(matching, runs));
+                }
+            }
+
+            Ok(Instruction::Match {
+                expr: matching_expr,
+                arms,
+            })
         } else if self.match_kind(TokenKind::While) {
             // Parse while loop condition
             let expr = self.expression()?;
@@ -2015,11 +2634,7 @@ impl Parser {
                     }
                 }
             }
-            if self.match_kind(TokenKind::Semicolon) {
-                Ok(Instruction::Expr(expr))
-            } else {
-                Ok(Instruction::Return(expr))
-            }
+            Ok(Instruction::Expr(expr))
         }
     }
 
@@ -2300,7 +2915,14 @@ impl Parser {
                         break;
                     }
                 }
-                self.consume(TokenKind::RParen, "Expected ')' after arguments.")?;
+                self.consume(
+                    TokenKind::RParen,
+                    &format!(
+                        "Expected ')' after arguments, found {}{}",
+                        self.previous().kind,
+                        self.peek().kind
+                    ),
+                )?;
 
                 // If calling a direct variable function, keep existing type checks
                 if let Expr::Variable(ref name) = expr {
@@ -2545,6 +3167,7 @@ impl Display for TokenKind {
             Self::LessEqual => "<=".to_string(),
             Self::Greater => ">".to_string(),
             Self::GreaterEqual => ">=".to_string(),
+            Self::BigArrow => "=>".to_string(),
             Self::Slash => "/".to_string(),
             Self::Str(s) => {
                 let binding = format!("\"{s}\"");
@@ -2556,6 +3179,7 @@ impl Display for TokenKind {
             Self::Object => "object".to_string(),
             Self::Enum => "enum".to_string(),
             Self::Maybe => "maybe".to_string(),
+            Self::Match => "match".to_string(),
             Self::Else => "else".to_string(),
             Self::False => "false".to_string(),
             Self::For => "for".to_string(),
@@ -2610,6 +3234,7 @@ fn get_special_ident(val: String) -> TokenKind {
         "in" => In,
         "fun" => Fun,
         "if" => If,
+        "match" => Match,
         "none" => Nil,
         "nil" => Nil,
         "or" => Or,
@@ -2642,6 +3267,7 @@ fn returns_on_all_paths(block: Vec<Instruction>) -> bool {
                     continue;
                 }
             }
+
             Instruction::If {
                 condition: _,
                 then,
@@ -2655,7 +3281,24 @@ fn returns_on_all_paths(block: Vec<Instruction>) -> bool {
                     continue;
                 }
             }
-            Instruction::Maybe(thing, body, elses) => {
+            Instruction::Match { expr:_, arms } => {
+                let mut all_certified = true;
+                for arm in arms {
+                    let body = match arm {
+                        MatchArm::CatchAll(_, b) => b,
+                        MatchArm::Literal(_, a)=> a,
+                    };
+                    if !returns_on_all_paths(vec![body]) {
+                        all_certified = false;
+                        break;
+                    }
+ 
+                }
+                if all_certified {
+                    return true;
+                }
+            }
+            Instruction::Maybe(_, body, elses) => {
                 let cert = returns_on_all_paths(vec![*body]) && else_certifies(&elses); // recursive helper; never uses unwrap_or(Nothing)
 
                 if cert {
@@ -2690,23 +3333,18 @@ fn else_certifies(elses: &Option<Box<Instruction>>) -> bool {
             }
 
             Instruction::If { then, elses, .. } => {
-                // OLD (too strict):
-                // returns_on_all_paths(then.clone()) && else_certifies(elses)
-
-                // NEW (treat elses: None as a final else):
                 if elses.is_none() {
-                    returns_on_all_paths(then.clone()) // acts like a final else-block
+                    returns_on_all_paths(then.clone()) 
                 } else {
                     returns_on_all_paths(then.clone()) && else_certifies(elses)
                 }
             }
 
             Instruction::Return(_) => {
-                // else { return ... }
                 true
             }
 
-            _ => false, // any other shape, play it safe
+            _ => false, 
         },
     }
 }
@@ -3001,9 +3639,9 @@ fn main() {
                         }
                         formatted.push_str(&format!("{num}"));
                     }
-                    And | Or | Object | Enum | Maybe | Else | False | For | Fun | If | Nil
-                    | Print | Reprint | Return | Break | Super | This | True | Let | While
-                    | Use | In => {
+                    And | Or | Object | Enum | Maybe | Else | False | For | Fun | If | Match
+                    | Nil | Print | Reprint | Return | Break | Super | This | True | Let
+                    | While | Use | In => {
                         push_indent(&mut formatted, indent, &mut line_open);
                         if !matches!(prev_kind, Some(LParen | Dot | Colon))
                             && !formatted.ends_with([' ', '\n', '\t'])
@@ -3021,6 +3659,7 @@ fn main() {
                             For => "for",
                             Fun => "fun",
                             If => "if",
+                            Match => "match",
                             Nil => "none",
                             Print => "print",
                             Reprint => "reprint",
@@ -3037,7 +3676,7 @@ fn main() {
                         });
                     }
                     Plus | Minus | Star | Slash | EqualEqual | BangEqual | Less | LessEqual
-                    | Greater | GreaterEqual | AmpAmp | PipePipe | Equal => {
+                    | Greater | GreaterEqual | BigArrow | AmpAmp | PipePipe | Equal => {
                         trim_trailing_space(&mut formatted);
                         push_indent(&mut formatted, indent, &mut line_open);
                         if !formatted.ends_with([' ', '\n', '\t']) {
@@ -3054,6 +3693,7 @@ fn main() {
                             LessEqual => "<=",
                             Greater => ">",
                             GreaterEqual => ">=",
+                            BigArrow => "=>",
                             AmpAmp => "&&",
                             PipePipe => "||",
                             Equal => "=",
@@ -4317,6 +4957,101 @@ impl<'ctx> Compiler<'ctx> {
                 module_name,
                 mod_path,
             } => Ok(()),
+            Instruction::Match { expr, arms } => {
+                let scrutinee_type = self.infer_expr_type(expr).unwrap();
+                let mut else_branch: Option<Instruction> = None;
+                enum Possible {
+                    NeedsCatchAll,
+                    Enum(Vec<String>),
+                    Bool,
+                }
+                let  possibles= match scrutinee_type.clone() {
+                    Type::Num => Possible::NeedsCatchAll,
+                    Type::Str => Possible::NeedsCatchAll,
+                    Type::Bool => Possible::Bool,
+                    Type::Custom(Custype::Enum(e)) =>Possible::Enum(e),
+                    other => {
+                        eprintln!("Can't match on a {scrutinee_type:?}");
+                        std::process::exit(70);
+                    }
+                };
+                let mut saw_catchall = false;
+                let mut saw_true_false = (false, false);
+
+                for arm in arms {
+                    match arm {
+                        MatchArm::CatchAll(_, _) => {saw_catchall = true; break;},
+                        MatchArm::Literal(e, _) => {
+                            if let Type::Bool = scrutinee_type {
+                                if let Expr::Literal(Value::Bool(b)) = e {
+                                    if *b {
+                                        saw_true_false.0 = true;
+                                    } else {
+                                        saw_true_false.1 = true;
+                                    }
+                                } else {
+                                    eprintln!("{e:?} is not a valid match arm for Bool type");
+                                    std::process::exit(70);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+                match possibles {
+                    Possible::NeedsCatchAll => {
+                        if !saw_catchall {
+                            eprintln!("All variants of {scrutinee_type:?} not covered in match statement");
+                            std::process::exit(70);
+                        }
+                    }
+                    Possible::Bool => {
+                        match saw_true_false {
+                            (true, true) => {
+
+                            }
+                            _ => if !saw_catchall {
+                                eprintln!("Not all Bool variants found in match statement");
+                                std::process::exit(70);
+                            }
+                        }
+                    }
+                    _ => panic!(),
+                }
+                for arm in arms.iter().rev() {
+                    match arm {
+                        MatchArm::Literal(pattern, runs) => {
+                            let condition = Expr::Binary(
+                                Box::new(expr.clone()),
+                                BinOp::EqEq,
+                                Box::new(pattern.clone()),
+                            );
+                            let new_if = Instruction::If {
+                                condition,
+                                then: vec![runs.clone()],
+                                elses: else_branch.take().map(Box::new),
+                            };
+                            else_branch = Some(new_if);
+                        }
+                        MatchArm::CatchAll(name,  runs) => {
+                            let binding = Instruction::Let {
+                                name: name.clone(),
+                                value: expr.clone(),
+                                type_hint: scrutinee_type.clone(),
+                                global: false,
+                            };
+                            let mut block_instrs = vec![binding];
+                            block_instrs.push(runs.clone());
+                            else_branch = Some(Instruction::Block(block_instrs));
+                        }
+                    }
+                }
+                if let Some(final_instr) = else_branch {
+                    self.compile_instruction(function, &final_instr)
+                } else {
+                    Ok(())
+                }
+            }
             Instruction::Nothing => Ok(()),
             l => unimplemented!("{:#?}", l),
         }
@@ -7630,6 +8365,15 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
                     index += 2;
                     continue;
                 }
+                "=>" => {
+                    tokens.push(Token {
+                        value: "=>".to_string(),
+                        kind: BigArrow,
+                        line,
+                    });
+                    index += 2;
+                    continue;
+                }
                 "&&" => {
                     tokens.push(Token {
                         value: "&&".to_string(),
@@ -8248,7 +8992,7 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
             if let Type::Function(params, ret_type) = callee_type {
                 if args.len() != params.len() {
                     return Err(format!(
-                        "Expected {} arguments but got {}",
+                        "Expected {} arguments but got {} on {callee:?}",
                         params.len(),
                         args.len(),
                     ));
@@ -8282,8 +9026,7 @@ fn get_type_of_expr(expr: &Expr, ctx: &PreCtx) -> Result<Type, String> {
                             // OK
                         } else {
                             return Err(format!(
-                                "Parameter #{} type mismatch: expected a function, got {:?}",
-                                i, arg_t,
+                                "Parameter #{i} type mismatch: expected a function, got {arg_t:?}",
                             ));
                         }
                     } else {

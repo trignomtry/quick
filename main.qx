@@ -1,19 +1,10 @@
- let web = io.web();
+let web = io.web();
 io.listen(8087, fun(req: Request){
-	let path = req.path;
-	if path.ends_with("/"){
-		path = path + "index.html";
+	match req.path {
+		"/hi" => return web.text("Hello!");
+		"/api/data" => return web.json("{\"message\": \"Hello!\"}");
+		"/redirect" => return web.redirect("/hi", false);
+		"/" => return web.file("./test/index.html");
+		other => return web.file("./test/404.html");
 	}
-	let page = io.read("./test" + path);
-	let user = sessions.get(req.body.default("guest")).default(User{
-		name: "Guest", tasks:[],
-	}
-	);
-	maybe page{
-		print("found");
-		web.page(page.replace("{name}", user.name).replace("{tasks}", "[]"))
-	} else{
-		web.text("Not found")
-	}
-}
-)
+})
