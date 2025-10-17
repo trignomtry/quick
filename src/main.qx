@@ -1,0 +1,10 @@
+let web = io.web();
+io.listen(8087, fun(req: Request){
+	match req.path {
+		"/hi" => return web.text("Hello!");
+		"/api/data" => return web.json("{\"message\": \"Hello!\"}");
+		"/redirect" => return web.redirect("/hi", false);
+		"/" => return web.file("./test/index.html");
+		other => return web.page(io.read("./test/404.html").default("Not found!").replace("{path}", other));
+	}
+})

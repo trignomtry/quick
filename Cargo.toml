@@ -1,9 +1,10 @@
 [package]
-name = "quickscript"
+name = "quick"
 version = "0.1.0"
 authors = ["Trig Northrup <northruptrig@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
+description = "The QuickScript CLI tool, inspired by cargo"
 
 [dependencies]
 actix = "0.13.5"
@@ -17,7 +18,10 @@ tokio = { version = "1", features = [
     "fs",
 ] }
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 clap = { version = "4.5.48", features = ["derive"] }
 [profile.release]
 lto = true

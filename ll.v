@@ -13,6 +13,8 @@ target datalayout = "e-m:o-i64:64-i128:128-n32:64-S128-Fn32"
 @str_literal.6 = private unnamed_addr constant [2 x i8] c"/\00", align 1
 @str_literal.7 = private unnamed_addr constant [18 x i8] c"./test/index.html\00", align 1
 @str_literal.8 = private unnamed_addr constant [16 x i8] c"./test/404.html\00", align 1
+@str_literal.9 = private unnamed_addr constant [11 x i8] c"Not found!\00", align 1
+@str_literal.10 = private unnamed_addr constant [7 x i8] c"{path}\00", align 1
 
 define double @main() {
 entry:
@@ -41,7 +43,7 @@ entry:
   br i1 %streq, label %then, label %else
 
 common.ret:                                       ; preds = %else18, %then17, %then10, %then2, %then
-  %common.ret.op = phi ptr [ %web_call, %then ], [ %web_call9, %then2 ], [ %web_redirect_call, %then10 ], [ %web_call24, %then17 ], [ %web_call27, %else18 ]
+  %common.ret.op = phi ptr [ %web_call, %then ], [ %web_call9, %then2 ], [ %web_redirect_call, %then10 ], [ %web_call24, %then17 ], [ %web_call28, %else18 ]
   ret ptr %common.ret.op
 
 then:                                             ; preds = %entry
@@ -85,7 +87,12 @@ else18:                                           ; preds = %else11
   %req25 = load ptr, ptr %req, align 8
   %get_path_call26 = call ptr @get_request_path(ptr %req25)
   store ptr %get_path_call26, ptr %other, align 8
-  %web_call27 = call ptr @web_file(ptr @str_literal.8)
+  %io_read_call = call ptr @io_read_file(ptr @str_literal.8)
+  %option_default_has_value = icmp ne ptr %io_read_call, null
+  %option_default_select = select i1 %option_default_has_value, ptr %io_read_call, ptr @str_literal.9
+  %other27 = load ptr, ptr %other, align 8
+  %str_replace_call = call ptr @qs_str_replace(ptr %option_default_select, ptr @str_literal.10, ptr %other27)
+  %web_call28 = call ptr @web_page(ptr %str_replace_call)
   br label %common.ret
 }
 
@@ -100,6 +107,12 @@ declare ptr @web_json(ptr)
 declare ptr @web_redirect(ptr, i1)
 
 declare ptr @web_file(ptr)
+
+declare ptr @io_read_file(ptr)
+
+declare ptr @qs_str_replace(ptr, ptr, ptr)
+
+declare ptr @web_page(ptr)
 
 declare void @qs_listen_with_callback(i32, ptr)
 
@@ -120,8 +133,6 @@ declare ptr @realloc(ptr, i64)
 declare i64 @atoi(ptr)
 
 declare ptr @strstr(ptr, ptr)
-
-declare ptr @qs_str_replace(ptr, ptr, ptr)
 
 declare ptr @qs_str_split(ptr, ptr)
 
@@ -163,11 +174,7 @@ declare double @range_builder_get_to(ptr)
 
 declare double @range_builder_get_step(ptr)
 
-declare ptr @io_read_file(ptr)
-
 declare double @io_write_file(ptr, ptr)
-
-declare ptr @web_page(ptr)
 
 declare ptr @web_error_text(i32, ptr)
 

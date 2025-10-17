@@ -35,6 +35,16 @@
         .nav a:hover {
             text-decoration: underline;
         }
+
+        .codeblock {
+            width: 100%;
+            height: 300px;
+            border: none;
+
+            border-radius: 10px;
+            padding: 10px;
+            background-color: rgb(213, 213, 213);
+        }
     </style>
 </head>
 
@@ -62,26 +72,23 @@
         <li>✅ File serving with io.read()</li>
         <li>✅ JSON API responses</li>
         <li>✅ HTTP redirects</li>
-        <li>✅ Custom error pages</li>
         <li>❌ Crazy boilerplate</li>
         <li>❌ Complex request handling</li>
         <li>❌ Slow Responses</li>
     </ul>
 
-    <h2>QuickScript Syntax</h2>
-    <pre><code>let web = io.web()
-
-fun handle(req: Request) {
-    if req.path == "/" {
-        return web.page(io.read("index.html"))
-    } else if req.path == "/api/data" {
-        return web.json("{\"message\": \"Hello!\"}")
-    } else {
-        return web.error.text(404, "Not found!")
+    <h2>This Web Server's Code: </h2>
+    <textarea class="codeblock lang-rust" spellcheck="false">let web = io.web();
+io.listen(8087, fun(req: Request){
+    match req.path {
+        "/hi" => return web.text("Hello!");
+        "/api/data" => return web.json("{\"message\": \"Hello!\"}");
+        "/redirect" => return web.redirect("/hi", false);
+        "/" => return web.file("./test/index.html");
+        other => return web.page(io.read("./test/404.html").default("Not found!").replace("{path}", other));
     }
-}
-
-io.listen(8080, handle)</code></pre>
+})</textarea>
+    <script src="https://cdn.jsdelivr.net/gh/google/code-prettify@master/loader/run_prettify.js"></script>
 </body>
 
 </html>

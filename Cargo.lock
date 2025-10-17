@@ -876,7 +876,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quickscript"
+name = "quick"
 version = "0.1.0"
 dependencies = [
  "actix",
