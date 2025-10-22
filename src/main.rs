@@ -34,6 +34,8 @@ unsafe extern "C" {
     fn fclose(stream: *mut std::ffi::c_void) -> i32;
     fn fgets(s: *mut i8, size: i32, stream: *mut std::ffi::c_void) -> *mut i8;
     fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
+    fn LLVMLinkInMCJIT();
+    fn LLVMLinkInInterpreter();
 
 }
 
@@ -249,11 +251,13 @@ use inkwell::types::{BasicType, BasicTypeEnum};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
+use inkwell::targets::{InitializationConfig, Target};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
+use std::ops::Index;
 use std::ptr;
 
 use std::convert::Infallible;
@@ -274,6 +278,7 @@ use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
 // Unique ID generator for anonymous functions to avoid name collisions
 static INLINE_FN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
+static LLVM_INIT: OnceLock<()> = OnceLock::new();
 
 unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
@@ -302,6 +307,17 @@ fn block_on_in_runtime<F: Future>(fut: F) -> F::Output {
         });
         rt.block_on(fut)
     }
+}
+
+fn ensure_llvm_ready() {
+    LLVM_INIT.get_or_init(|| {
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("Failed to start the QuickScript runner");
+        unsafe {
+            LLVMLinkInInterpreter();
+            LLVMLinkInMCJIT();
+        }
+    });
 }
 
 #[repr(C)]
@@ -1140,10 +1156,33 @@ enum Expr {
     Block(Vec<Instruction>),
     Function(Vec<(String, Type)>, Type, Box<Instruction>),
 }
-
+ 
 impl Expr {
     fn get_type(&self, ctx: &PreCtx) -> Result<Type, String> {
         let expr = self;
+        let line_hint = ctx.current_line();
+        let type_error = |message: String, hint: Option<&str>| -> Result<Type, String> {
+            let reset = "\x1b[0m";
+            let line_color = "\x1b[1;37m";
+            let error_color = "\x1b[31m";
+            let tip_label_color = "\x1b[1;33m";
+            let tip_color = "\x1b[36m";
+
+            let mut text = if let Some(line) = line_hint {
+                format!("{line_color}[Line {line}]:{reset} {error_color}{message}{reset}")
+            } else {
+                format!("{error_color}{message}{reset}")
+            };
+            if let Some(tip) = hint {
+                if !tip.is_empty() {
+                    text.push_str(&format!(
+                        "\n  {tip_label_color}Tip:{reset} {tip_color}{tip}{reset}"
+                    ));
+                }
+            }
+            Err(text)
+        };
+        let infer_expr = |sub_expr: &Expr| ctx.with_line(line_hint, || sub_expr.get_type(ctx));
         match expr {
             Expr::Variable(v) => match ctx.var_types.get(v) {
                 Some(t) => Ok(t.clone()),
@@ -1151,17 +1190,25 @@ impl Expr {
                     if let Some(l) = ctx.types.get(v) {
                         Ok(Type::Custom(l.clone()))
                     } else {
-                        Err(format!("Variable \"{v}\" not found"))
+                        return type_error(
+                            format!("Unknown identifier \"{v}\""),
+                            Some("Declare it with `let` before using it, or ensure the spelling matches the definition."),
+                        );
                     }
                 }
             },
-            Expr::Function(params, ret_type, body) => {
+            Expr::Function(params, ret_type, _body) => {
                 Ok(Type::Function(params.to_vec(), Box::new(ret_type.clone())))
             }
-            Expr::Index(list, _) => match list.get_type( ctx)? {
+            Expr::Index(list, _) => match infer_expr(list)? {
                 Type::List(inner) => Ok(*inner),
                 Type::Str => Ok(Type::Str), // indexing a string yields a one-character string
-                other => Err(format!("Cannot index into type {other:?}")),
+                other => {
+                    return type_error(
+                        format!("Cannot index into value of type {other:?}"),
+                        Some("Only lists and strings support indexing. Make sure you're indexing a list or string."),
+                    )
+                }
             },
             Expr::Object(name, o) => {
                 // Prefer the declared object type (by name) if available.
@@ -1171,7 +1218,7 @@ impl Expr {
                 // Fallback: infer a structural object type from field expressions.
                 let mut fields = HashMap::new();
                 for (fname, expr) in o.iter() {
-                    let field_type = expr.get_type( ctx)?;
+                    let field_type = infer_expr(expr)?;
                     fields.insert(fname.clone(), field_type);
                 }
                 Ok(Type::Custom(Custype::Object(fields)))
@@ -1181,35 +1228,49 @@ impl Expr {
                 Value::Str(_) => Ok(Type::Str),
                 Value::Bool(_) => Ok(Type::Bool),
                 Value::Nil => Ok(Type::Nil),
-                _ => Err("Unsupported literal type".into()),
+                _ => {
+                    return type_error(
+                        "Unsupported literal value".to_string(),
+                        Some("Only numbers, strings, booleans, and nil are valid literals here."),
+                    )
+                }
             },
             Expr::List(l) => Ok(Type::List(if let Some(r) = l.first() {
-                Box::new(r.get_type( ctx)?)
+                Box::new(infer_expr(r)?)
             } else {
                 Box::new(Type::Nil)
             })),
-            Expr::Unary(_, e) => e.get_type( ctx),
+            Expr::Unary(_, e) => infer_expr(e),
             Expr::Binary(l, op, r) => {
-                let lt = l.get_type( ctx)?.unwrap();
-                let rt = r.get_type( ctx)?.unwrap();
+                let lt = infer_expr(l)?.unwrap();
+                let rt = infer_expr(r)?.unwrap();
                 match op {
                     BinOp::And | BinOp::Or => {
                         if lt == Type::Bool && rt == Type::Bool {
                             Ok(Type::Bool)
                         } else {
-                            Err("Logical operators require both operands to be boolean".into())
+                            return type_error(
+                                "Logical operators require both sides to be Bool".to_string(),
+                                Some("Ensure both operands evaluate to booleans before using 'and' or 'or'."),
+                            )
                         }
                     }
                     BinOp::Plus => match (&lt, &rt) {
                         (Type::Num, Type::Num) => Ok(Type::Num),
                         (Type::Str, Type::Str) => Ok(Type::Str),
-                        _ => Err("Operands of '+' must be both numbers or both strings".into()),
+                        _ => type_error(
+                            "The '+' operator needs two numbers or two strings".to_string(),
+                            Some("Convert values to a shared type (both Num or both Str) before adding."),
+                        ),
                     },
                     BinOp::Minus | BinOp::Mult | BinOp::Div => {
                         if lt == Type::Num && rt == Type::Num {
                             Ok(Type::Num)
                         } else {
-                            Err(format!("Operator {:?} requires two numbers", op))
+                            type_error(
+                                format!("Operator {op:?} requires two numbers"),
+                                Some("Cast both operands to Num or adjust the expression."),
+                            )
                         }
                     }
                     BinOp::EqEq | BinOp::NotEq => Ok(Type::Bool),
@@ -1217,7 +1278,10 @@ impl Expr {
                         if lt == Type::Num && rt == Type::Num {
                             Ok(Type::Bool)
                         } else {
-                            Err(format!("Operator {:?} requires two numbers", op))
+                            type_error(
+                                format!("Operator {op:?} requires two numbers"),
+                                Some("Use numeric operands, or convert values before comparing."),
+                            )
                         }
                     }
                 }
@@ -1233,13 +1297,16 @@ impl Expr {
                                 vec![],
                                 Box::new(Type::Kv(Box::new(Type::Nil))),
                             )),
-                            other => Err(format!("Unknown property '{}' on Obj", other)),
+                            other => type_error(
+                                format!("Unknown Obj helper '{other}'"),
+                                Some("Valid helpers are 'new' for constructing empty objects."),
+                            ),
                         };
                     }
                 }
 
                 // Type-checking for field access
-                let obj_type = obj.get_type( ctx)?;
+                let obj_type = infer_expr(obj)?;
                 match obj_type {
                     Type::Kv(inner) => match prop.as_str() {
                         // If inner is Nil (unknown yet), allow first insert to pick the type
@@ -1263,7 +1330,12 @@ impl Expr {
                             vec![("key".to_string(), Type::Str)],
                             Box::new(Type::Option(inner)),
                         )),
-                        other => Err(format!("Property '{other}' not found on Obj")),
+                        other => {
+                            return type_error(
+                                format!("Property '{other}' not found on Obj"),
+                                Some("Check the available methods: insert(key, value) and get(key)."),
+                            )
+                        }
                     },
                     Type::List(t) => {
                         if prop == "len" {
@@ -1279,7 +1351,10 @@ impl Expr {
                                 Box::new(Type::Nil),
                             ))
                         } else {
-                            Err(format!("Property '{prop}' not found on list type"))
+                            type_error(
+                                format!("Property '{prop}' not found on list"),
+                                Some("Lists expose len(), push(value), and remove(index)."),
+                            )
                         }
                     }
                     Type::Io => {
@@ -1402,7 +1477,12 @@ impl Expr {
                                     Custype::Object(web_type)
                                 })),
                             )),
-                            other => Err(format!("Unknown property '{other}' on io")),
+                            other => {
+                                return type_error(
+                                    format!("Unknown io helper '{other}'"),
+                                    Some("Check the available builders like range(), read(), write(), web(), listen(), input(), and random()."),
+                                )
+                            }
                         }
                     }
                     Type::RangeBuilder => match prop.as_str() {
@@ -1418,25 +1498,37 @@ impl Expr {
                             vec![("rang".to_string(), Type::Num)],
                             Box::new(Type::RangeBuilder),
                         )),
-                        other => Err(format!("Unknown property '{other}' on io.range")),
+                        other => type_error(
+                            format!("Unknown range builder method '{other}'"),
+                            Some("Use to(), from(), or step() when building numeric ranges."),
+                        ),
                     },
                     Type::Num => match prop.as_str() {
                         "str" => Ok(Type::Function(vec![], Box::new(Type::Str))),
-                        other => Err(format!("Unknown property '{other}' on type Num")),
+                        other => type_error(
+                            format!("Unknown Num helper '{other}'"),
+                            Some("Did you mean to call num.str()? That's the only helper currently exposed."),
+                        ),
                     },
                     Type::Custom(Custype::Object(fields)) => {
                         // Look up property in custom type
                         if let Some(t) = fields.get(prop) {
                             Ok(t.clone())
                         } else {
-                            Err(format!("Property '{prop}' not found on type {fields:?}"))
+                            type_error(
+                                format!("Property '{prop}' not found on object"),
+                                Some("Verify the field exists on the declared object type."),
+                            )
                         }
                     }
                     Type::Custom(Custype::Enum(ref variants)) => {
                         if variants.contains(prop) {
                             Ok(obj_type)
                         } else {
-                            Err(format!("Enum {:?} does not contain variant {}", obj, prop))
+                            type_error(
+                                format!("Enum value does not contain variant '{prop}'"),
+                                Some("Check the enum definition for available variants."),
+                            )
                         }
                     }
                     Type::Str => {
@@ -1471,7 +1563,10 @@ impl Expr {
                                 Box::new(Type::List(Box::new(Type::Str))),
                             ))
                         } else {
-                            Err(format!("Property '{prop}' not found on type Str"))
+                            type_error(
+                                format!("Property '{prop}' not found on Str"),
+                                Some("Available helpers: len, num, starts_with, ends_with, contains, replace, split."),
+                            )
                         }
                     }
                     Type::Option(inner) => match prop.as_str() {
@@ -1479,9 +1574,15 @@ impl Expr {
                             vec![("def".to_string(), *inner.clone())],
                             inner,
                         )),
-                        _ => Err(format!("Property '{prop}' not found on Optional type")),
+                        _ => type_error(
+                            format!("Property '{prop}' not found on Option"),
+                            Some("Options only expose default(value) for now."),
+                        ),
                     },
-                    other => Err(format!("Cannot access property '{prop}' on type {other:?}",)),
+                    other => type_error(
+                        format!("Cannot access property '{prop}' on type {other:?}"),
+                        Some("Check the value before using '.' or convert it to an object with that field."),
+                    ),
                 }
             }
             Expr::Block(_) => Ok(Type::Nil),
@@ -1637,28 +1738,33 @@ impl Expr {
                 // }
 
                 // Existing function call type-checking
-                let callee_type = callee.get_type( ctx)?;
+                let callee_type = infer_expr(callee)?;
                 if let Type::Function(params, ret_type) = callee_type {
                     if args.len() != params.len() {
-                        return Err(format!(
-                            "Expected {} arguments but got {} on {callee:?}",
-                            params.len(),
-                            args.len(),
-                        ));
+                        return type_error(
+                            format!(
+                                "Expected {} argument(s) but received {}",
+                                params.len(),
+                                args.len(),
+                            ),
+                            Some("Match the function signature or adjust the call site."),
+                        );
                     }
                     // Special-case: first insert decides Obj(K) inner type when currently unknown (Nil)
                     if let Expr::Get(obj, mname) = &**callee {
                         if mname == "insert" {
-                            if let Ok(Type::Kv(inner)) = obj.get_type( ctx) {
+                            if let Ok(Type::Kv(inner)) = infer_expr(obj.as_ref()) {
                                 if *inner == Type::Nil {
                                     // Ensure key is Str; allow any value type on first insert
-                                    let key_ty = args[0].get_type( ctx)?;
+                                    let key_ty = infer_expr(&args[0])?;
                                     if key_ty != Type::Str {
-                                        return Err(format!(
-                                            "Parameter #0 type mismatch: expected {:?}, got {:?}",
-                                            Type::Str,
-                                            key_ty,
-                                        ));
+                                        return type_error(
+                                            format!(
+                                                "Map keys must be Str, but argument 1 is {:?}",
+                                                key_ty
+                                            ),
+                                            Some("Convert the key to a string before calling insert."),
+                                        );
                                     }
                                     // Skip strict check for value here; caller will solidify type.
                                     return Ok(*ret_type);
@@ -1668,30 +1774,42 @@ impl Expr {
                     }
                     // verify each arg’s inferred type against the declared parameter type
                     for (i, (_, param_tstr)) in params.iter().enumerate() {
-                        let arg_t = args[i].get_type( ctx)?;
+                        let arg_t = infer_expr(&args[i])?;
                         if matches!(param_tstr, Type::Function(_, _)) {
                             // Accept any function value
                             if let Type::Function(_, _) = arg_t {
                                 // OK
                             } else {
-                                return Err(format!(
-                                    "Parameter #{} type mismatch: expected a function, got {:?}",
-                                    i, arg_t,
-                                ));
+                                return type_error(
+                                    format!(
+                                        "Argument {} should be a function, but it has type {:?}",
+                                        i + 1,
+                                        arg_t,
+                                    ),
+                                    Some("Pass a lambda or named function that matches the expected callback signature."),
+                                );
                             }
                         } else {
                             let expected = param_tstr;
                             if *expected != arg_t {
-                                return Err(format!(
-                                    "Parameter #{} type mismatch: expected {:?}, got {:?}",
-                                    i, expected, arg_t,
-                                ));
+                                return type_error(
+                                    format!(
+                                        "Argument {} has type {:?}, but {:?} is required",
+                                        i + 1,
+                                        arg_t,
+                                        expected,
+                                    ),
+                                    Some("Cast the argument or adjust the function signature so the types agree."),
+                                );
                             }
                         }
                     }
                     Ok(*ret_type)
                 } else {
-                    Err(format!("Can only call functions, found {:?}", callee_type))
+                    type_error(
+                        format!("Can only call functions, found value of type {:?}", callee_type),
+                        Some("Make sure the expression before '()' evaluates to a function."),
+                    )
                 }
             }
         }
@@ -1812,6 +1930,23 @@ struct PreCtx {
     types: HashMap<String, Custype>,
     // Loaded modules and their exports (types only; no execution)
     modules: HashMap<String, ModuleInfo>,
+    current_line: Cell<Option<usize>>,
+}
+
+impl PreCtx {
+    fn current_line(&self) -> Option<usize> {
+        self.current_line.get()
+    }
+
+    fn with_line<R, F>(&self, line: Option<usize>, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let prev = self.current_line.replace(line);
+        let result = f();
+        self.current_line.set(prev);
+        result
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1984,10 +2119,15 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Instruction, String> {
+        while self.match_kind(TokenKind::Semicolon){}
         // Handle return statements with type inference and consistency checking
         if self.match_kind(TokenKind::Return) {
             let expr = self.expression()?;
-            let ret_type = expr.get_type( &self.pctx)?;
+            let expr_line = self.previous().line;
+            let line_hint = self.previous().line;
+            let ret_type = self
+                .pctx
+                .with_line(Some(line_hint), || expr.get_type(&self.pctx))?;
             // Track explicit nil/non-xnil returns for this function
             if ret_type == Type::Nil {
                 self.saw_nil_return = true;
@@ -2028,7 +2168,11 @@ impl Parser {
             )?;
 
             let range_expr = self.expression()?;
-            match range_expr.get_type( &self.pctx)? {
+            let range_line = self.previous().line;
+            let range_type = self
+                .pctx
+                .with_line(Some(range_line), || range_expr.get_type(&self.pctx))?;
+            match range_type {
                 Type::RangeBuilder => {}
                 Type::List(_) => {
                     return Err("For loops iterate over io.range(...) builders".to_string());
@@ -2148,7 +2292,10 @@ impl Parser {
                         let vtype = if type_hint != Type::Nil {
                             type_hint
                         } else {
-                            value.get_type( &mod_parser.pctx).unwrap_or(Type::Nil)
+                            mod_parser
+                                .pctx
+                                .with_line(None, || value.get_type(&mod_parser.pctx))
+                                .unwrap_or(Type::Nil)
                         };
                         minfo.field_types.insert(name.clone(), vtype);
                         minfo.constants.insert(name, value);
@@ -2187,17 +2334,20 @@ impl Parser {
             self.inside_maybe = if let Expr::Variable(ref v) = maybe {
                 Some(v.clone())
             } else {
-                panic!();
+                None
             };
-            let var_name = self.inside_maybe.as_ref().unwrap();
-            let old_type = { self.pctx.var_types.get(var_name).unwrap() };
+            match self.inside_maybe.as_ref() {
+
+                Some(var_name) => {            let old_type = { self.pctx.var_types.get(var_name).unwrap() };
             self.pctx.var_types.insert(
                 var_name.to_string(),
                 match old_type {
                     Type::Option(o) => *o.clone(),
                     _ => old_type.clone(),
                 },
-            );
+            );} None => {}
+            }
+
 
             let block = self.parse_statement()?;
             let mut once_else = None;
@@ -2226,7 +2376,10 @@ impl Parser {
             let prkind = self.previous().clone();
             let expr = self.expression()?;
             // Static type checking for print expression
-            let _expr_type = expr.get_type( &self.pctx)?;
+            let print_line = self.previous().line;
+            let _expr_type = self
+                .pctx
+                .with_line(Some(print_line), || expr.get_type(&self.pctx))?;
 
             if let Some(var_name) = &self.inside_maybe {
                 match _expr_type {
@@ -2276,8 +2429,19 @@ impl Parser {
                 let act_typ = self.parse_type()?;
 
                 fields.insert(field, act_typ);
-                self.advance();
-                let _ = self.consume(Comma, "msg");
+
+                if self.match_kind(TokenKind::Comma) {
+                    continue;
+                }
+
+                if self.check(&TokenKind::RBrace) {
+                    continue;
+                }
+
+                return Err(format!(
+                    "Expected comma after field type, found {}",
+                    self.peek().kind
+                ));
             }
 
             self.pctx.types.insert(obj_name, Custype::Object(fields));
@@ -2312,7 +2476,6 @@ impl Parser {
                 variants.push(variant_name);
             }
             self.pctx.types.insert(ename, Custype::Enum(variants));
-            println!("{:?}", self.peek());
             Ok(Instruction::Nothing)
         } else if self.match_kind(TokenKind::Fun) {
             if self.is_at_end() {
@@ -2347,6 +2510,7 @@ impl Parser {
         } else if self.match_kind(TokenKind::If) {
             // Parse the primary `if`
             let condition = self.expression()?;
+            let condition_line = self.previous().line;
             let then_block_stmt = self.parse_statement()?;
             // Build an else-chain for any number of else-if or else clauses
             let mut else_node: Option<Box<Instruction>> = None;
@@ -2388,7 +2552,11 @@ impl Parser {
                     break; // no more chaining after a plain else
                 }
             }
-            if condition.get_type( &self.pctx)? != Type::Bool {
+            if self
+                .pctx
+                .with_line(Some(condition_line), || condition.get_type(&self.pctx))?
+                != Type::Bool
+            {
                 return Err("If conditions must be booleans".to_string());
             }
             Ok(Instruction::If {
@@ -2398,7 +2566,10 @@ impl Parser {
             })
         } else if self.match_kind(TokenKind::Match) {
             let matching_expr = self.expression()?;
-            let matching_expr_type = matching_expr.get_type(&self.pctx)?;
+            let matching_line = self.previous().line;
+            let matching_expr_type = self
+                .pctx
+                .with_line(Some(matching_line), || matching_expr.get_type(&self.pctx))?;
             self.consume(
                 TokenKind::LBrace,
                 &format!("Expected '{{' after match, found {}", self.peek().kind),
@@ -2406,6 +2577,7 @@ impl Parser {
             let mut arms: Vec<MatchArm> = vec![];
             while !self.match_kind(TokenKind::RBrace) {
                 let matching = self.expression()?;
+                let case_line = self.previous().line;
                 if let Expr::Variable(ref name) = matching {
                     self.consume(
                         TokenKind::BigArrow,
@@ -2423,8 +2595,10 @@ impl Parser {
                         self.pctx.var_types.remove(name);
                     }
                     arms.push(MatchArm::CatchAll(name.to_string(), runs));
-                } else if matching
-                    .get_type(&self.pctx)?
+                    self.match_kind(TokenKind::Comma);
+                } else if self
+                    .pctx
+                    .with_line(Some(case_line), || matching.get_type(&self.pctx))?
                     .infer(&matching_expr_type)
                     .is_none()
                 {
@@ -2440,6 +2614,7 @@ impl Parser {
                     )?;
                     let runs = self.parse_statement()?;
                     arms.push(MatchArm::Literal(matching, runs));
+                    self.match_kind(TokenKind::Comma);
                 }
             }
 
@@ -2450,8 +2625,11 @@ impl Parser {
         } else if self.match_kind(TokenKind::While) {
             // Parse while loop condition
             let expr = self.expression()?;
+            let cond_line = self.previous().line;
             // Static type checking: ensure condition is boolean
-            let cond_type = expr.get_type( &self.pctx)?;
+            let cond_type = self
+                .pctx
+                .with_line(Some(cond_line), || expr.get_type(&self.pctx))?;
             if cond_type != Type::Bool {
                 return Err(format!(
                     "Condition in 'while' statement must be a boolean, found {:?}",
@@ -2476,9 +2654,8 @@ impl Parser {
                 condition: expr,
             })
         } else if self.match_kind(TokenKind::Let) {
-            let var_name = if let TokenKind::Identifier(n) = self.peek().kind.clone() {
-                self.advance();
-                n
+            let (expr_line,var_name) = if let TokenKind::Identifier(n) = self.peek().kind.clone() {
+                (self.advance().line, n)
             } else {
                 return Err("Expected a variable name after 'let'".into());
             };
@@ -2497,7 +2674,9 @@ impl Parser {
                 let name = var_name.clone();
                 // Register the inferred list type for static checking
                 let inner_type = if let Some(first) = items.first() {
-                    first.get_type( &self.pctx)?
+                    self
+                        .pctx
+                        .with_line(Some(expr_line), || first.get_type(&self.pctx))?
                 } else {
                     Type::Nil
                 };
@@ -2506,7 +2685,9 @@ impl Parser {
                     .insert(name.clone(), Type::List(Box::new(inner_type)));
             }
             // Static type checking: infer expression type and enforce consistency
-            let expr_type = expr.get_type( &self.pctx)?;
+            let expr_type = self
+                .pctx
+                .with_line(Some(expr_line), || expr.get_type(&self.pctx))?;
             let real_type = if let Some(hint) = type_hint {
                 match (expr_type.clone(), (hint)) {
                     (Type::Kv(l), Type::Kv(y)) => Type::Kv(y),
@@ -2555,13 +2736,17 @@ impl Parser {
         } else {
             // expression statement or assignment with complex left-hand side
             let expr: Expr = self.expression()?;
+            let lhs_line = self.previous().line;
 
             if self.match_kind(TokenKind::Equal) {
                 if !valid_left_hand(&expr) {
                     return Err("Invalid assignment target".to_string());
                 }
                 let value_expr = self.expression()?;
-                let value_type = value_expr.get_type( &self.pctx)?;
+                let value_line = self.previous().line;
+                let value_type = self
+                    .pctx
+                    .with_line(Some(value_line), || value_expr.get_type(&self.pctx))?;
 
                 // Perform type enforcement based on left-hand side kind
                 let types_compatible = |expected: &Type, value: &Type| -> bool {
@@ -2593,7 +2778,9 @@ impl Parser {
                         }
                     }
                     _ => {
-                        let target_type = expr.get_type( &self.pctx)?;
+                        let target_type = self
+                            .pctx
+                            .with_line(Some(lhs_line), || expr.get_type(&self.pctx))?;
                         if !types_compatible(&target_type, &value_type) {
                             return Err(format!(
                                 "Assignment type mismatch: expected {:?}, got {:?}",
@@ -2607,7 +2794,9 @@ impl Parser {
                 return Ok(Instruction::Assign(expr, value_expr, Some(value_type)));
             }
 
-            let expr_type = expr.get_type( &self.pctx)?;
+            let expr_type = self
+                .pctx
+                .with_line(Some(lhs_line), || expr.get_type(&self.pctx))?;
             if self.inside_maybe.is_none() {
                 if let Type::Option(_) = expr_type {
                     return Err(
@@ -2624,7 +2813,9 @@ impl Parser {
                                 self.pctx.var_types.get(var_name).cloned()
                             {
                                 if *inner == Type::Nil {
-                                    let val_ty = args[1].get_type( &self.pctx)?;
+                                    let val_ty = self
+                                        .pctx
+                                        .with_line(Some(lhs_line), || args[1].get_type(&self.pctx))?;
                                     self.pctx
                                         .var_types
                                         .insert(var_name.clone(), Type::Kv(Box::new(val_ty)));
@@ -2935,7 +3126,9 @@ impl Parser {
                             ));
                         }
                         for (i, arg) in args.iter().enumerate() {
-                            let ty = arg.get_type( &self.pctx)?;
+                            let ty = self
+                                .pctx
+                                .with_line(None, || arg.get_type(&self.pctx))?;
                             let (_, te) = &f[i];
                             if *te != ty {
                                 return Err(format!(
@@ -2995,7 +3188,7 @@ impl Parser {
                     let expr = self.expression()?;
                     vals.insert(key, expr);
 
-                    if self.match_kind(TokenKind::Comma) {
+                    if self.match_kind(TokenKind::Comma) || self.check(&TokenKind::RBrace) {
                         continue;
                     }
 
@@ -3016,7 +3209,9 @@ impl Parser {
                 let mut all_fields_present = true;
                 for (name, typ) in r.iter() {
                     if let Some(r_val) = vals.get(name) {
-                        let real_type = r_val.get_type( &self.pctx)?;
+                        let real_type = self
+                            .pctx
+                            .with_line(None, || r_val.get_type(&self.pctx))?;
 
                         if real_type.infer(typ).is_none() {
                             return Err(format!(
@@ -3035,6 +3230,7 @@ impl Parser {
             }
             // start with a variable reference
             let expr = Expr::Variable(i.clone());
+
             // Continue in calling code (postfix) to allow chaining
             return Ok(expr);
         }
@@ -3350,120 +3546,147 @@ fn else_certifies(elses: &Option<Box<Instruction>>) -> bool {
 }
 
 #[derive(Clap, Debug)]
-#[command( about, long_about = None)]
+#[command(about, long_about = None, subcommand_required = false, arg_required_else_help = false)]
 struct Args {
     /// Shows debugging info
     #[arg(short, long, default_value_t = false)]
     debug: bool,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Clap, Debug)]
 enum Commands {
     Run { filename: Option<String> },
     Format { filename: Option<String> },
+    #[command(external_subcommand)]
+    Fallback(Vec<String>),
+}
+
+fn execute_run(filename: String, debug: bool) {
+    let Ok(contents) = std::fs::read_to_string(&filename) else {
+        eprintln!("Os error while reading file {filename}. Please try again later");
+        std::process::exit(70);
+    };
+    let tokens = tokenize(contents.chars().collect());
+
+    // Lexical error check
+    if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
+        for t in tokens.iter() {
+            t.print();
+        }
+        std::process::exit(65);
+    }
+    let mut parser = Parser::new(tokens);
+    match parser.parse_program() {
+        Ok(p) => {
+            for ins in p.clone() {
+                if let Instruction::FunctionDef {
+                    name,
+                    params: _,
+                    return_type: _,
+                    body,
+                } = ins
+                {
+                    if !returns_on_all_paths(body) {
+                        eprintln!(
+                            "Body of function '{name}' does not return a value every time. Try adding `return none` at the end of the function"
+                        );
+                        std::process::exit(70);
+                    }
+                }
+            }
+            ensure_llvm_ready();
+            let context = context::Context::create();
+            let module = context.create_module("sum");
+            let execution_engine = module
+                .create_jit_execution_engine(OptimizationLevel::Aggressive)
+                .unwrap();
+            let initial_quick_types = parser.pctx.var_types.clone();
+            let parser_ctx = parser.pctx;
+            let codegen = Compiler {
+                context: &context,
+                module,
+                builder: context.create_builder(),
+                execution_engine,
+                instructions: p,
+                vars: RefCell::new(HashMap::new()),
+                var_types: RefCell::new(HashMap::new()),
+                quick_var_types: RefCell::new(initial_quick_types),
+                pctx: RefCell::new(parser_ctx),
+                current_module: RefCell::new(None),
+                closure_envs: RefCell::new(HashMap::new()),
+                current_function: RefCell::new(Vec::new()),
+                loop_stack: RefCell::new(Vec::new()),
+            };
+
+            // seed the C PRNG so io.random() varies each run
+            unsafe {
+                // get current epoch seconds
+                let now = time(ptr::null_mut());
+                srand(now as u32);
+            }
+            let sum = codegen
+                .run_code()
+                .ok_or("Unable to JIT compile code")
+                .unwrap();
+            if debug {
+                let _ = codegen.module.print_to_file("./ll.v");
+            }
+
+            unsafe {
+                let res = sum.call();
+                if res != 0.0 {
+                    std::process::exit(res as i32);
+                }
+            }
+
+            // If an HTTP server was started, keep the process alive.
+            // Wait briefly for the server to transition to running if needed.
+            let mut waited = 0u32;
+
+            while !SERVER_RUNNING.load(Ordering::Relaxed) && waited < 1 {
+                std::thread::sleep(Duration::from_millis(1));
+                waited += 1;
+            }
+            if SERVER_RUNNING.load(Ordering::Relaxed) {
+                // Park the main thread indefinitely. Ctrl+C will terminate the process.
+                std::thread::park();
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(65);
+        }
+    }
 }
 
 fn main() {
     let args = Args::parse();
+    let debug = args.debug;
 
-    match args.command {
+    let command = args
+        .command
+        .unwrap_or(Commands::Run { filename: None });
+
+    match command {
         Commands::Run { filename } => {
             let filename = filename.unwrap_or("./src/main.qx".to_string());
-            let Ok(contents) = std::fs::read_to_string(&filename) else {
-                eprintln!("Os error while reading file {filename}. Please try again later");
-                std::process::exit(70);
+            execute_run(filename, debug);
+        }
+        Commands::Fallback(mut extra) => {
+            let filename = if extra.is_empty() {
+                "./src/main.qx".to_string()
+            } else {
+                let filename = extra.remove(0);
+                if !extra.is_empty() {
+                    eprintln!("Unexpected arguments: {}", extra.join(" "));
+                    std::process::exit(64);
+                }
+                filename
             };
-            let tokens = tokenize(contents.chars().collect());
-
-            // Lexical error check
-            if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
-                for t in tokens {
-                        t.print();
-                }
-                std::process::exit(65);
-            }
-            let mut parser = Parser::new(tokens);
-            match parser.parse_program() {
-                Ok(p) => {
-                    for ins in p.clone() {
-                        if let Instruction::FunctionDef {
-                            name,
-                            params: _,
-                            return_type: _,
-                            body,
-                        } = ins
-                        {
-                            if !returns_on_all_paths(body) {
-                                eprintln!(
-                                    "Body of function '{name}' does not return a value every time. Try adding `return none` at the end of the function"
-                                );
-                                std::process::exit(70);
-                            }
-                        }
-                    }
-                    let context = context::Context::create();
-                    let module = context.create_module("sum");
-                    let execution_engine = module
-                        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-                        .unwrap();
-                    let initial_quick_types = parser.pctx.var_types.clone();
-                    let parser_ctx = parser.pctx;
-                    let codegen = Compiler {
-                        context: &context,
-                        module,
-                        builder: context.create_builder(),
-                        execution_engine,
-                        instructions: p,
-                        vars: RefCell::new(HashMap::new()),
-                        var_types: RefCell::new(HashMap::new()),
-                        quick_var_types: RefCell::new(initial_quick_types),
-                        pctx: RefCell::new(parser_ctx),
-                        current_module: RefCell::new(None),
-                        closure_envs: RefCell::new(HashMap::new()),
-                        current_function: RefCell::new(Vec::new()),
-                        loop_stack: RefCell::new(Vec::new()),
-                    };
-
-                    // seed the C PRNG so io.random() varies each run
-                    unsafe {
-                        // get current epoch seconds
-                        let now = time(ptr::null_mut());
-                        srand(now as u32);
-                    }
-                    let sum = codegen
-                        .run_code()
-                        .ok_or("Unable to JIT compile code")
-                        .unwrap();
-                    codegen.module.print_to_file("./ll.v");
-
-                    unsafe {
-                        let res = sum.call();
-                        if res != 0.0 {
-                            std::process::exit(res as i32);
-                        }
-                    }
-
-                    // If an HTTP server was started, keep the process alive.
-                    // Wait briefly for the server to transition to running if needed.
-                    let mut waited = 0u32;
-
-                    while !SERVER_RUNNING.load(Ordering::Relaxed) && waited < 1 {
-                        std::thread::sleep(Duration::from_millis(1));
-                        waited += 1;
-                    }
-                    if SERVER_RUNNING.load(Ordering::Relaxed) {
-                        // Park the main thread indefinitely. Ctrl+C will terminate the process.
-                        std::thread::park();
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(65);
-                }
-            }
+            execute_run(filename, debug);
         }
         Commands::Format { filename } => {
             let filename = filename.unwrap_or("./src/main.qx".to_string());
@@ -3768,7 +3991,7 @@ impl<'ctx> Compiler<'ctx> {
         for (name, ty) in quick_snapshot {
             ctx.var_types.insert(name, ty);
         }
-        expr.get_type(&ctx)
+        ctx.with_line(None, || expr.get_type(&ctx))
     }
 
     fn expr_type_matches<F>(&self, expr: &Expr, predicate: F) -> bool
@@ -4695,8 +4918,60 @@ impl<'ctx> Compiler<'ctx> {
                             "printf_int",
                         )?;
                     }
-
-                    l => panic!("{l}"),
+                    BasicValueEnum::IntValue(i) => {
+                        let bit_width = i.get_type().get_bit_width();
+                        if bit_width == 1 {
+                            // boolean case; select "true"/"false"
+                            let fmt = self
+                                .builder
+                                .build_global_string_ptr("%s\n\0", "fmt_b")
+                                .unwrap();
+                            let true_str = self
+                                .builder
+                                .build_global_string_ptr("true\0", "bool_true")
+                                .unwrap();
+                            let false_str = self
+                                .builder
+                                .build_global_string_ptr("false\0", "bool_false")
+                                .unwrap();
+                            let bool_text = self
+                                .builder
+                                .build_select(
+                                    i,
+                                    true_str.as_pointer_value().as_basic_value_enum(),
+                                    false_str.as_pointer_value().as_basic_value_enum(),
+                                    "bool_str",
+                                )?
+                                .into_pointer_value();
+                            self.builder.build_call(
+                                printf_fn,
+                                &[fmt.as_pointer_value().into(), bool_text.into()],
+                                "printf_bool",
+                            )?;
+                        } else {
+                            // other integers; normalize to 64-bit and print
+                            let fmt = self
+                                .builder
+                                .build_global_string_ptr("%ld\n\0", "fmt_i")
+                                .unwrap();
+                            let i64_ty = self.context.i64_type();
+                            let widened = if bit_width < 64 {
+                                self.builder
+                                    .build_int_s_extend(i, i64_ty, "print_int_sext")?
+                            } else if bit_width > 64 {
+                                self.builder
+                                    .build_int_truncate(i, i64_ty, "print_int_trunc")?
+                            } else {
+                                i
+                            };
+                            self.builder.build_call(
+                                printf_fn,
+                                &[fmt.as_pointer_value().into(), widened.into()],
+                                "printf_int",
+                            )?;
+                        }
+                    }
+                    other => panic!("Unsupported value passed to print: {other:?}"),
                 }
                 Ok(())
             }
@@ -4822,9 +5097,8 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(())
             }
             Instruction::Maybe(maybe, block, otherwise) => {
-                let Expr::Variable(var_name) = maybe else {
-                    unreachable!()
-                };
+                let saved_quick = match maybe {
+Expr::Variable(var_name) =>{
                 let var_name = var_name.clone();
                 let saved_quick = self.quick_var_types.borrow().clone();
                 if let Some(Type::Option(inner)) = saved_quick.get(&var_name).cloned() {
@@ -4832,6 +5106,14 @@ impl<'ctx> Compiler<'ctx> {
                         .borrow_mut()
                         .insert(var_name.clone(), (*inner).clone());
                 }
+                saved_quick
+                }
+                other =>self.quick_var_types.borrow().clone()
+                };
+                // let Expr::Variable(var_name) = maybe else {
+                //     unreachable!()
+                // };
+
                 // Evaluate the maybe expression
                 let val = self.compile_expr(maybe)?;
                 // Build a nil comparison: non-nil => true branch
@@ -4958,63 +5240,92 @@ impl<'ctx> Compiler<'ctx> {
             Instruction::Match { expr, arms } => {
                 let scrutinee_type = self.infer_expr_type(expr).unwrap();
                 let mut else_branch: Option<Instruction> = None;
-                enum Possible {
+
+                enum MatchKind {
                     NeedsCatchAll,
-                    Enum(Vec<String>),
                     Bool,
+                    Enum { variants: Vec<String> },
                 }
-                let  possibles= match scrutinee_type.clone() {
-                    Type::Num => Possible::NeedsCatchAll,
-                    Type::Str => Possible::NeedsCatchAll,
-                    Type::Bool => Possible::Bool,
-                    Type::Custom(Custype::Enum(e)) =>Possible::Enum(e),
+
+                let match_kind = match scrutinee_type.clone() {
+                    Type::Num | Type::Str => MatchKind::NeedsCatchAll,
+                    Type::Bool => MatchKind::Bool,
+                    Type::Custom(Custype::Enum(variants)) => MatchKind::Enum { variants },
                     other => {
-                        eprintln!("Can't match on a {scrutinee_type:?}");
+                        eprintln!("Can't match on a {other:?}");
                         std::process::exit(70);
                     }
                 };
+
                 let mut saw_catchall = false;
-                let mut saw_true_false = (false, false);
+                let mut saw_true = false;
+                let mut saw_false = false;
+                let mut seen_variants: HashSet<String> = HashSet::new();
 
                 for arm in arms {
                     match arm {
-                        MatchArm::CatchAll(_, _) => {saw_catchall = true; break;},
-                        MatchArm::Literal(e, _) => {
-                            if let Type::Bool = scrutinee_type {
-                                if let Expr::Literal(Value::Bool(b)) = e {
-                                    if *b {
-                                        saw_true_false.0 = true;
-                                    } else {
-                                        saw_true_false.1 = true;
-                                    }
-                                } else {
-                                    eprintln!("{e:?} is not a valid match arm for Bool type");
+                        MatchArm::CatchAll(_, _) => {
+                            saw_catchall = true;
+                            break;
+                        }
+                        MatchArm::Literal(pattern, _) => match (&match_kind, pattern) {
+                            (MatchKind::Bool, Expr::Literal(Value::Bool(true))) => saw_true = true,
+                            (MatchKind::Bool, Expr::Literal(Value::Bool(false))) => {
+                                saw_false = true;
+                            }
+                            (MatchKind::Bool, other) => {
+                                eprintln!("{other:?} is not a valid match arm for Bool type");
+                                std::process::exit(70);
+                            }
+                            (MatchKind::Enum { .. }, Expr::Get(enum_expr, variant)) => {
+                                if !matches!(**enum_expr, Expr::Variable(_)) {
+                                    eprintln!(
+                                        "Enum match arms must reference a variant like Type.Variant"
+                                    );
                                     std::process::exit(70);
                                 }
+                                seen_variants.insert(variant.clone());
                             }
-                            continue;
-                        }
+                            (MatchKind::Enum { .. }, other) => {
+                                eprintln!(
+                                    "{other:?} is not a valid enum variant in this match statement"
+                                );
+                                std::process::exit(70);
+                            }
+                            _ => {}
+                        },
                     }
                 }
-                match possibles {
-                    Possible::NeedsCatchAll => {
+
+                match match_kind {
+                    MatchKind::NeedsCatchAll => {
                         if !saw_catchall {
                             eprintln!("All variants of {scrutinee_type:?} not covered in match statement");
                             std::process::exit(70);
                         }
                     }
-                    Possible::Bool => {
-                        match saw_true_false {
-                            (true, true) => {
-
-                            }
-                            _ => if !saw_catchall {
-                                eprintln!("Not all Bool variants found in match statement");
+                    MatchKind::Bool => {
+                        if !saw_catchall && !(saw_true && saw_false) {
+                            eprintln!("Boolean match must handle both true and false or provide a catch-all arm");
+                            std::process::exit(70);
+                        }
+                    }
+                    MatchKind::Enum { variants } => {
+                        if !saw_catchall {
+                            let missing: Vec<_> = variants
+                                .iter()
+                                .filter(|name| !seen_variants.contains(*name))
+                                .cloned()
+                                .collect();
+                            if !missing.is_empty() {
+                                eprintln!(
+                                    "Match missing enum variant arm(s): {}",
+                                    missing.join(", ")
+                                );
                                 std::process::exit(70);
                             }
                         }
                     }
-                    _ => panic!(),
                 }
                 for arm in arms.iter().rev() {
                     match arm {
@@ -5222,11 +5533,31 @@ impl<'ctx> Compiler<'ctx> {
 
     fn compile_expr(&self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, BuilderError> {
         match expr {
-            Expr::Variable(var_name) => {
-                let ptr = *self.vars.borrow().get(var_name).unwrap();
+            Expr::Variable( var_name) => {
+                let ptr = *self.vars.borrow().get(var_name).unwrap_or_else(||panic!("{var_name}"));
                 let ty = *self.var_types.borrow().get(var_name).unwrap();
                 let loaded = self.builder.build_load(ty, ptr, var_name)?;
                  Ok(loaded)
+            }
+
+            Expr::Get(ex, prop)if   matches!(*ex.clone(), Expr::Variable(i) if matches!(self.pctx.borrow().types.get(&i), Some(Custype::Enum(_)))) =>{
+                let Expr::Variable(ref i) = **ex else {panic!()};
+                let binding = self.pctx.borrow();
+                let Custype::Enum(inna) = binding.types.get(i).unwrap() else {panic!()};
+                let mut item = None;
+
+                for (i, thing) in inna.iter().enumerate() {
+                    if thing == prop {
+                        item = Some(i);
+                    }
+                }
+
+                let Some(index) = item else {
+                    eprintln!("Could not find enum variant {prop} on enum {i}");
+                    std::process::exit(70);
+                };
+
+                Ok(self.context.i64_type().const_int(index as u64, false).as_basic_value_enum())
             }
 
 
@@ -5260,7 +5591,7 @@ impl<'ctx> Compiler<'ctx> {
                 let result = self
                     .builder
                     .build_float_div(raw_f64, rand_max, "rand_div")?;
-                return Ok(result.as_basic_value_enum());
+                 Ok(result.as_basic_value_enum())
             }
 
             // io.listen(port: Num, callback: Function)

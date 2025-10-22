@@ -1,10 +1,53 @@
-let web = io.web();
-io.listen(8087, fun(req: Request){
-	match req.path {
-		"/hi" => return web.text("Hello!");
-		"/api/data" => return web.json("{\"message\": \"Hello!\"}");
-		"/redirect" => return web.redirect("/hi", false);
-		"/" => return web.file("./test/index.html");
-		other => return web.page(io.read("./test/404.html").default("Not found!").replace("{path}", other));
-	}
+let web = io.web()
+object User{
+    name: Str,
+    username: Str,
+    messages: [Str]
+}
+
+let users: Obj(User) = Obj.new()
+
+io.listen(6767, fun(req:Request)
+{
+    match req.path{
+        "/" => web.file("index.html"),
+        "/about" => web.file("about.html"),
+        "/getmessage" => {
+            let body = req.body
+            maybe body{
+                let user = users.get(body)
+                maybe user{
+                    return(user.messages.str())
+                }
+            }
+            return web.text("error: fuck you")
+        }
+        "/register" => {
+            let body = req.body
+            maybe body{
+                let parts = body.split(",")
+                let name = parts[0]
+                let username = parts[1]
+                users.insert(username, User{
+                    name: name, username: username, messages: [];
+                })
+            }
+            return web.text("error: fuck you")
+        }
+        "/message" => {
+            let body = req.body
+            maybe body{
+                let parts = body.split(",")
+                let sender  = parts[0]
+                let receiver = parts[1]
+                let message = parts[2]
+                let user = users.get(receiver)
+                maybe user{
+                    user.messages.push(message)
+                }
+            }
+            return(web.text("get out"))
+        }
+        other => web.file("404.html")
+    }
 })
