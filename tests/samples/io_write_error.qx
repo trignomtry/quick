@@ -1,0 +1,4 @@
+match io.write("target/does_not_exist/out.txt", "data") {
+    Ok(msg) => print("ok:" + msg),
+    Err(msg) => print("err:" + msg),
+}

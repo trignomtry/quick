@@ -1,0 +1,14 @@
+enum Mode { Alpha, Beta(Str), }
+
+let parsed = Mode.from_json("{\"variant\":\"Beta\",\"value\":\"hi\"}");
+
+let mode = parsed.unwrap();
+
+match mode {
+    Mode.Alpha => {
+        print("alpha");
+    }
+    Mode.Beta(msg) => {
+        print("beta:" + msg);
+    }
+}

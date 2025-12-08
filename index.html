@@ -1,0 +1,838 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>QuickScript Messenger</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        :root {
+            color-scheme: light;
+            --bg: #f3f4f7;
+            --surface: #ffffff;
+            --surface-alt: #f8f9fb;
+            --border: #d8deea;
+            --accent: #4f46e5;
+            --accent-soft: rgba(79, 70, 229, 0.12);
+            --text-primary: #1f2937;
+            --text-secondary: #6b7280;
+            --shadow: 0 30px 60px rgba(15, 23, 42, 0.18);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                color-scheme: dark;
+                --bg: #0f172a;
+                --surface: #111827;
+                --surface-alt: #1f2937;
+                --border: #1f2937;
+                --accent: #818cf8;
+                --accent-soft: rgba(129, 140, 248, 0.2);
+                --text-primary: #e2e8f0;
+                --text-secondary: #9ca3af;
+                --shadow: 0 30px 60px rgba(2, 6, 23, 0.6);
+            }
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(80% 120% at 20% 20%, rgba(79, 70, 229, 0.3), transparent),
+                radial-gradient(80% 120% at 80% 0%, rgba(59, 130, 246, 0.25), transparent), var(--bg);
+            font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+            color: var(--text-primary);
+            padding: 32px 12px;
+        }
+
+        .overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            background: rgba(15, 23, 42, 0.65);
+            backdrop-filter: blur(18px);
+            transition: opacity 0.35s ease;
+            z-index: 999;
+        }
+
+        .overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .overlay-content {
+            width: min(420px, 100%);
+        }
+
+        .overlay-card {
+            background: var(--surface);
+            border-radius: 24px;
+            padding: 36px 32px;
+            box-shadow: 0 30px 60px rgba(15, 23, 42, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.28);
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .overlay-card h1 {
+            margin: 0;
+            font-size: 2rem;
+        }
+
+        .overlay-card p {
+            margin: 0;
+            color: var(--text-secondary);
+        }
+
+        .overlay-form {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .overlay-form .hint {
+            text-align: center;
+        }
+
+        .overlay-submit {
+            width: 100%;
+            padding: 12px;
+            font-weight: 600;
+        }
+
+        .overlay-status {
+            min-height: 1.2em;
+            text-align: center;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .overlay-status.error {
+            color: #ef4444;
+        }
+
+        .overlay-status.success {
+            color: #22c55e;
+        }
+
+        .app {
+            display: flex;
+            width: min(1120px, 100%);
+            height: min(760px, 95vh);
+            background: var(--surface);
+            border-radius: 26px;
+            overflow: hidden;
+            box-shadow: var(--shadow);
+        }
+
+        .sidebar {
+            flex: 0 0 320px;
+            display: flex;
+            flex-direction: column;
+            gap: 28px;
+            padding: 36px 28px;
+            background: linear-gradient(160deg, rgba(79, 70, 229, 0.14), rgba(14, 165, 233, 0.05));
+            border-right: 1px solid var(--border);
+        }
+
+        .brand {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .brand-title {
+            margin: 0;
+            font-weight: 700;
+            font-size: 1.8rem;
+        }
+
+        .brand-subtitle {
+            margin: 0;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .card {
+            background: var(--surface);
+            border-radius: 18px;
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            box-shadow: 0 15px 35px rgba(15, 23, 42, 0.12);
+            padding: 18px 20px;
+        }
+
+        .card h2 {
+            margin: 0 0 16px;
+            font-size: 1.1rem;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: var(--text-secondary);
+        }
+
+        input,
+        textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--surface-alt);
+            color: inherit;
+            font: inherit;
+            transition: border 0.2s, box-shadow 0.2s;
+        }
+
+        input:focus,
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-soft);
+        }
+
+        textarea {
+            resize: none;
+        }
+
+        button {
+            font: inherit;
+            cursor: pointer;
+            border-radius: 12px;
+            border: none;
+            padding: 10px 14px;
+            transition: transform 0.15s ease, box-shadow 0.2s ease;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .primary-button {
+            background: var(--accent);
+            color: #fff;
+            box-shadow: 0 10px 20px rgba(79, 70, 229, 0.3);
+        }
+
+        .secondary-button {
+            width: 100%;
+            background: var(--surface-alt);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+        }
+
+        .ghost-button {
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text-secondary);
+            padding: 8px 12px;
+        }
+
+        .primary-button:hover,
+        .secondary-button:hover,
+        .ghost-button:hover {
+            transform: translateY(-1px);
+        }
+
+        .hint {
+            margin-top: 12px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ef4444;
+            box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
+        }
+
+        .status-indicator.online {
+            background: #22c55e;
+            box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18);
+        }
+
+        .status-title {
+            font-weight: 600;
+            margin-bottom: 2px;
+        }
+
+        .status-subtitle {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .chat {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: var(--surface-alt);
+        }
+
+        .chat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 28px 32px 20px;
+            border-bottom: 1px solid var(--border);
+            gap: 16px;
+        }
+
+        .chat-header h2 {
+            margin: 0;
+            font-size: 1.4rem;
+        }
+
+        .chat-header p {
+            margin: 4px 0 0;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .user-chip {
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: var(--accent-soft);
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        .messages {
+            flex: 1;
+            padding: 28px 32px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .message {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            max-width: 75%;
+        }
+
+        .message.system {
+            max-width: 100%;
+            align-items: center;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+
+        .bubble {
+            padding: 12px 16px;
+            border-radius: 18px;
+            background: var(--surface);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            line-height: 1.5;
+            word-break: break-word;
+        }
+
+        .message.incoming .bubble {
+            background: #484848;
+        }
+
+        .message.outgoing {
+            align-self: flex-end;
+        }
+
+        .message.outgoing .bubble {
+            background: var(--accent);
+            color: #fff;
+            border-color: transparent;
+        }
+
+        .message.system .bubble {
+            background: transparent;
+            border: none;
+            padding: 0;
+        }
+
+        .meta {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .message.outgoing .meta {
+            align-self: flex-end;
+        }
+
+        .composer {
+            display: grid;
+            grid-template-columns: 160px 1fr auto;
+            gap: 16px;
+            padding: 20px 24px 24px;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+        }
+
+        .field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .field-grow {
+            grid-column: span 1;
+        }
+
+        #sendBtn {
+            align-self: end;
+            padding: 12px 22px;
+            background: var(--accent);
+            color: #fff;
+            font-weight: 600;
+            box-shadow: 0 12px 22px rgba(79, 70, 229, 0.28);
+            border-radius: 18px;
+        }
+
+        #sendBtn:hover {
+            transform: translateY(-1px);
+        }
+
+        @media (max-width: 980px) {
+            .app {
+                flex-direction: column;
+                height: auto;
+            }
+
+            .sidebar {
+                flex-direction: row;
+                flex-wrap: wrap;
+                gap: 16px;
+                border-right: none;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .sidebar .card,
+            .sidebar .status {
+                flex: 1 1 280px;
+            }
+
+            .chat {
+                min-height: 520px;
+            }
+
+            .messages {
+                padding: 24px;
+            }
+
+            .composer {
+                grid-template-columns: 1fr;
+            }
+
+            #sendBtn {
+                justify-self: stretch;
+            }
+        }
+
+        @media (max-width: 620px) {
+            body {
+                padding: 0;
+            }
+
+            .app {
+                border-radius: 0;
+                height: 100vh;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div id="registrationOverlay" class="overlay">
+        <div class="overlay-content">
+            <div class="overlay-card">
+                <h1>Welcome to QuickScript Messenger</h1>
+                <p id="overlaySubtitle">Create a profile to join the live inbox.</p>
+                <form id="registerForm" class="overlay-form" autocomplete="off">
+                    <div>
+                        <label for="name">Display name</label>
+                        <input id="name" name="name" placeholder="Jane Doe" />
+                    </div>
+                    <div>
+                        <label for="username">Username</label>
+                        <input id="username" name="username" placeholder="janed" />
+                    </div>
+                    <button type="submit" class="primary-button overlay-submit">Enter chat</button>
+                    <p class="hint overlay-hint">Sends <code>"Name,username"</code> to <code>POST /register</code>.</p>
+                    <div id="overlayStatus" class="overlay-status" role="status" aria-live="polite"></div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="app">
+        <aside class="sidebar">
+            <div class="brand">
+                <h1 class="brand-title">QuickScript Messenger</h1>
+                <p class="brand-subtitle">Powered by the <code>main.qx</code> backend</p>
+            </div>
+
+            <div class="card status">
+                <div id="statusIndicator" class="status-indicator"></div>
+                <div>
+                    <div id="statusTitle" class="status-title">Awaiting registration</div>
+                    <div id="statusSubtitle" class="status-subtitle">Complete the dialog to unlock chat.</div>
+                </div>
+            </div>
+        </aside>
+
+        <main class="chat">
+            <header class="chat-header">
+                <div>
+                    <h2 id="chatTitle">Registration required</h2>
+                    <p id="chatSubtitle">Complete the dialog to unlock chat.</p>
+                </div>
+                <div class="header-actions">
+                    <div id="userChip" class="user-chip">Guest</div>
+                    <button id="clearBtn" type="button" class="ghost-button">Clear history</button>
+                </div>
+            </header>
+
+            <section id="messages" class="messages" aria-live="polite"></section>
+
+            <form id="messageForm" class="composer" autocomplete="off">
+                <div class="field">
+                    <label for="receiver">To</label>
+                    <input id="receiver" name="receiver" placeholder="Recipient username" />
+                </div>
+                <div class="field field-grow">
+                    <label for="message">Message</label>
+                    <textarea id="message" name="message" rows="2" placeholder="Write a message…"></textarea>
+                </div>
+                <button id="sendBtn" type="submit">Send</button>
+            </form>
+        </main>
+    </div>
+
+    <script>
+        (function () {
+            const registerForm = document.getElementById('registerForm');
+            const messageForm = document.getElementById('messageForm');
+            const nameInput = document.getElementById('name');
+            const usernameInput = document.getElementById('username');
+            const receiverInput = document.getElementById('receiver');
+            const messageInput = document.getElementById('message');
+            const sendBtn = document.getElementById('sendBtn');
+            const clearBtn = document.getElementById('clearBtn');
+            const messagesEl = document.getElementById('messages');
+            const statusIndicator = document.getElementById('statusIndicator');
+            const statusTitle = document.getElementById('statusTitle');
+            const statusSubtitle = document.getElementById('statusSubtitle');
+            const chatTitle = document.getElementById('chatTitle');
+            const chatSubtitle = document.getElementById('chatSubtitle');
+            const userChip = document.getElementById('userChip');
+            const overlay = document.getElementById('registrationOverlay');
+            const overlayStatus = document.getElementById('overlayStatus');
+
+            const messages = [];
+            const POLL_INTERVAL_MS = 3000;
+            const conversationCounters = new Map();
+
+            let registeredUser = { name: '', username: '' };
+            let pollId = null;
+
+            function formatTime(date) {
+                return new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit' }).format(date);
+            }
+
+            function addMessage(type, text, meta = {}) {
+                messages.push({
+                    type,
+                    text,
+                    timestamp: meta.timestamp || new Date(),
+                    from: meta.from || '',
+                    to: meta.to || ''
+                });
+                if (messages.length > 400) {
+                    messages.shift();
+                }
+                renderMessages();
+            }
+
+            function renderMessages() {
+                messagesEl.innerHTML = '';
+                for (const msg of messages) {
+                    const item = document.createElement('div');
+                    item.className = `message ${msg.type}`;
+
+                    const bubble = document.createElement('div');
+                    bubble.className = 'bubble';
+                    bubble.textContent = msg.text;
+                    item.appendChild(bubble);
+
+                    const metaEl = document.createElement('div');
+                    metaEl.className = 'meta';
+                    const time = formatTime(msg.timestamp);
+                    if (msg.type === 'outgoing') {
+                        metaEl.textContent = msg.to ? `You → ${msg.to} • ${time}` : `You • ${time}`;
+                    } else if (msg.type === 'incoming') {
+                        metaEl.textContent = `${msg.from || 'Inbox'} • ${time}`;
+                    } else {
+                        metaEl.textContent = time;
+                    }
+                    item.appendChild(metaEl);
+
+                    messagesEl.appendChild(item);
+                }
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+            }
+
+            async function postPlain(url, bodyText) {
+                try {
+                    const res = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'text/plain' },
+                        body: bodyText
+                    });
+                    const text = await res.text();
+                    return { ok: res.ok, text, status: res.status };
+                } catch (err) {
+                    return { ok: false, text: String(err), status: 0 };
+                }
+            }
+
+            function showOverlayStatus(text, state) {
+                if (!overlayStatus) {
+                    return;
+                }
+                overlayStatus.textContent = text;
+                overlayStatus.classList.remove('error', 'success');
+                if (state === 'error') {
+                    overlayStatus.classList.add('error');
+                } else if (state === 'success') {
+                    overlayStatus.classList.add('success');
+                }
+            }
+
+            function setComposerEnabled(enabled) {
+                receiverInput.disabled = !enabled;
+                messageInput.disabled = !enabled;
+                sendBtn.disabled = !enabled;
+                messageInput.placeholder = enabled ? 'Write a message…' : 'Register to start messaging';
+            }
+
+            function updateChatContext() {
+                if (!registeredUser.username) {
+                    chatTitle.textContent = 'Registration required';
+                    chatSubtitle.textContent = 'Complete the dialog to unlock chat.';
+                    return;
+                }
+                const receiver = receiverInput.value.trim();
+                if (receiver) {
+                    chatTitle.textContent = `Chat with ${receiver}`;
+                    chatSubtitle.textContent = `Messages will deliver to @${receiver}.`;
+                } else {
+                    chatTitle.textContent = 'New conversation';
+                    chatSubtitle.textContent = 'Choose a recipient and send a message to begin.';
+                }
+            }
+
+            function startPolling() {
+                if (pollId) {
+                    return;
+                }
+                conversationCounters.clear();
+                pollId = setInterval(pollOnce, POLL_INTERVAL_MS);
+                pollOnce();
+            }
+
+            function setRegisteredState(name, username) {
+                registeredUser = { name, username };
+                nameInput.value = name;
+                usernameInput.value = username;
+                const isRegistered = Boolean(username);
+                if (isRegistered) {
+                    statusIndicator.classList.add('online');
+                    statusTitle.textContent = `Signed in as @${username}`;
+                    statusSubtitle.textContent = name ? `${name} is listening for updates.` : 'Listening for new updates.';
+                    userChip.textContent = `@${username}`;
+                } else {
+                    statusIndicator.classList.remove('online');
+                    statusTitle.textContent = 'Awaiting registration';
+                    statusSubtitle.textContent = 'Complete the dialog to unlock chat.';
+                    userChip.textContent = 'Guest';
+                }
+
+                setComposerEnabled(isRegistered);
+                conversationCounters.clear();
+
+                if (overlay) {
+                    overlay.classList.toggle('hidden', isRegistered);
+                }
+
+                updateChatContext();
+
+                if (isRegistered) {
+                    addMessage('system', `Registered as @${username}.`);
+                    addMessage('system', 'Listening for new messages…');
+                    startPolling();
+                }
+            }
+
+            registerForm.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const name = nameInput.value.trim();
+                const username = usernameInput.value.trim();
+                if (!name || !username) {
+                    showOverlayStatus('Please provide both a display name and a username.', 'error');
+                    return;
+                }
+                const payload = `${name},${username}`;
+                showOverlayStatus(`Registering @${username}…`);
+                const response = await postPlain('/register', payload);
+                if (!response.ok) {
+                    showOverlayStatus(`Registration failed (${response.status}): ${response.text}`, 'error');
+                    addMessage('system', `Registration failed (${response.status}): ${response.text}`);
+                    return;
+                }
+                showOverlayStatus('Registration successful! Entering the chat…', 'success');
+                setRegisteredState(name, username);
+            });
+
+            messageForm.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const receiver = receiverInput.value.trim();
+                const message = messageInput.value.trim();
+                const sender = registeredUser.username.trim();
+                if (!sender) {
+                    addMessage('system', 'Please complete registration before sending messages.');
+                    return;
+                }
+                if (!receiver || !message) {
+                    addMessage('system', 'Receiver and message are required.');
+                    return;
+                }
+                const payload = `${sender},${receiver},${message}`;
+                addMessage('outgoing', message, { to: receiver });
+                messageInput.value = '';
+                messageInput.focus();
+                const response = await postPlain('/message', payload);
+                if (!response.ok) {
+                    addMessage('system', `Delivery failed (${response.status}): ${response.text}`);
+                } else {
+                    addMessage('system', `Delivered to @${receiver} (${response.status}): ${response.text}`);
+                    // Let the next poll refresh from the server’s history; do not pre-increment the counter,
+                    // otherwise first messages for a peer get skipped.
+                    conversationCounters.delete(receiver);
+                }
+            });
+
+            clearBtn.addEventListener('click', () => {
+                messages.length = 0;
+                renderMessages();
+                addMessage('system', 'Conversation cleared locally.');
+            });
+
+            receiverInput.addEventListener('input', updateChatContext);
+
+            async function pollOnce() {
+                const username = registeredUser.username.trim();
+                if (!username) {
+                    return;
+                }
+                const response = await postPlain('/getmessage', username);
+                console.log(response);
+                if (!response.ok) {
+                    addMessage('system', `Polling error (${response.status}): ${response.text}`);
+                    return;
+                }
+                const text = response.text.trim();
+                if (!text) {
+                    return;
+                }
+                try {
+                    const payload = JSON.parse(text);
+                    if (!Array.isArray(payload)) {
+                        addMessage('system', `Unexpected payload: ${text}`);
+                        return;
+                    }
+                    if (payload.length === 0) {
+                        return;
+                    }
+
+                    for (const conversation of payload) {
+                        if (!conversation || typeof conversation !== 'object') {
+                            continue;
+                        }
+                        const peer = typeof conversation.with === 'string' ? conversation.with : '';
+                        if (!peer) {
+                            continue;
+                        }
+                        const history = Array.isArray(conversation.messages) ? conversation.messages : [];
+                        const processed = conversationCounters.get(peer) || 0;
+
+                        for (let idx = processed; idx < history.length; idx += 1) {
+                            const entry = history[idx];
+                            if (!entry || typeof entry !== 'object') {
+                                continue;
+                            }
+                            const sender = typeof entry.sender === 'string' ? entry.sender : '';
+                            const receiver = typeof entry.receiver === 'string' ? entry.receiver : '';
+                            const body = typeof entry.body === 'string' ? entry.body : '';
+                            if (!body) {
+                                continue;
+                            }
+
+                            const direction = sender === registeredUser.username ? 'outgoing' : 'incoming';
+                            const meta = direction === 'outgoing'
+                                ? { to: receiver || peer }
+                                : { from: sender || peer };
+                            addMessage(direction, body, meta);
+
+                            if (!receiverInput.value && direction === 'incoming') {
+                                receiverInput.value = sender || peer;
+                                updateChatContext();
+                            }
+                        }
+
+                        conversationCounters.set(peer, history.length);
+                    }
+                } catch (err) {
+                    addMessage('system', `Failed to parse inbox: ${err}`);
+                }
+            }
+
+            window.addEventListener('beforeunload', () => {
+                if (pollId) {
+                    clearInterval(pollId);
+                }
+            });
+
+            setRegisteredState('', '');
+            showOverlayStatus('QuickScript Messenger polls automatically once you register.');
+            addMessage('system', 'Welcome! Register to start messaging.');
+        })();
+    </script>
+</body>
+
+</html>

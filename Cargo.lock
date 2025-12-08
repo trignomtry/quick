@@ -884,6 +884,8 @@ dependencies = [
  "hyper 0.14.32",
  "inkwell",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

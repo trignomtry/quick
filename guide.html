@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>QuickScript Guide</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #0f172a;
+            --panel: #0b1220;
+            --surface: #0f192b;
+            --border: #1f2a3d;
+            --accent: #22d3ee;
+            --accent-soft: rgba(34, 211, 238, 0.12);
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --code: #0b1020;
+            --shadow: 0 30px 50px rgba(0, 0, 0, 0.35);
+            font-family: "DM Sans", "Inter", "Segoe UI", system-ui, sans-serif;
+        }
+
+        body {
+            margin: 0;
+            background: radial-gradient(60% 50% at 25% 25%, rgba(34, 211, 238, 0.08), transparent),
+                radial-gradient(50% 50% at 80% 10%, rgba(59, 130, 246, 0.06), transparent),
+                var(--bg);
+            color: var(--text);
+            display: grid;
+            grid-template-columns: 320px 1fr;
+            min-height: 100vh;
+        }
+
+        .sidebar {
+            position: sticky;
+            top: 0;
+            align-self: start;
+            height: 100vh;
+            padding: 32px 28px;
+            background: var(--panel);
+            border-right: 1px solid var(--border);
+            box-shadow: var(--shadow);
+        }
+
+        .logo {
+            font-weight: 800;
+            font-size: 1.6rem;
+            letter-spacing: -0.02em;
+            margin: 0 0 6px;
+        }
+
+        .tagline {
+            margin: 0 0 24px;
+            color: var(--muted);
+        }
+
+        .toc {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .toc a {
+            color: var(--text);
+            text-decoration: none;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid transparent;
+            transition: border 0.2s, background 0.2s, color 0.2s;
+        }
+
+        .toc a:hover {
+            border-color: var(--accent);
+            background: var(--accent-soft);
+            color: #e0faff;
+        }
+
+        main {
+            padding: 48px 52px 64px;
+            max-width: 920px;
+        }
+
+        section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            padding: 24px 28px;
+            margin-bottom: 24px;
+            box-shadow: var(--shadow);
+        }
+
+        h1,
+        h2 {
+            margin: 0 0 12px;
+            letter-spacing: -0.01em;
+        }
+
+        p {
+            margin: 0 0 12px;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+
+        pre {
+            margin: 14px 0;
+            background: var(--code);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 14px 16px;
+            overflow-x: auto;
+        }
+
+        code {
+            font-family: "Berkeley Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+            color: #b4e2ff;
+            font-size: 0.95rem;
+        }
+
+        ul {
+            margin: 0 0 12px 18px;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+    </style>
+</head>
+
+<body>
+    <aside class="sidebar">
+        <h1 class="logo">QuickScript</h1>
+        <p class="tagline">A small, typed scripting language. This is the short guide—enough to start shipping.</p>
+        <nav class="toc">
+            <a href="#intro">Why QuickScript</a>
+            <a href="#hello">Hello, QuickScript</a>
+            <a href="#values">Values & Types</a>
+            <a href="#flow">Control Flow</a>
+            <a href="#funcs">Functions & Objects</a>
+            <a href="#options">Options & Results</a>
+            <a href="#ranges">Ranges & Loops</a>
+            <a href="#io">I/O & Web</a>
+            <a href="#run">Build & Run</a>
+        </nav>
+    </aside>
+
+    <main>
+        <section id="intro">
+            <h2>Why QuickScript</h2>
+            <p>QuickScript aims to feel like a script while delivering compile-time guarantees and native speed.
+                The surface area stays small: typed control flow, async I/O, HTTP helpers, and JSON. No frameworks,
+                no surprises.</p>
+            <ul>
+                <li>Strong typing everywhere (objects, enums, options/results, built-ins).</li>
+                <li>LLVM-backed JIT for fast execution.</li>
+                <li>Batteries included: files, ranges, random, web responses.</li>
+            </ul>
+        </section>
+
+        <section id="hello">
+            <h2>Hello, QuickScript</h2>
+            <pre><code>let web = io.web()
+
+io.listen(9123, fun(req: Request) {
+    match req.path {
+        "/" => return web.page("&lt;h1&gt;Hello from QuickScript&lt;/h1&gt;"),
+        "/ping" => return web.json("{\"ok\":true}"),
+        other => return web.error.text(404, "Unknown route: " + other),
+    }
+})</code></pre>
+            <p>Handlers return typed responses; the compiler verifies signatures before codegen.</p>
+        </section>
+
+        <section id="values">
+            <h2>Values & Types</h2>
+            <pre><code>let name: Str = "Ada"
+let lucky: Num = 7
+let flags: [Bool] = [true, false]
+
+object User { name: Str, admin: Bool }
+let user = User { name: name, admin: false }</code></pre>
+            <p>Lists are typed, objects declare fields, and the compiler enforces shapes on access.</p>
+        </section>
+
+        <section id="flow">
+            <h2>Control Flow</h2>
+            <pre><code>if user.admin {
+    print("admin mode")
+} else {
+    print("limited access")
+}
+
+match lucky {
+    7 => print("classic"),
+    other => print("lucky: " + other),
+}</code></pre>
+            <p><code>if</code> expects booleans. <code>match</code> is exhaustive for enums; numbers/strings match literals.</p>
+        </section>
+
+        <section id="funcs">
+            <h2>Functions & Objects</h2>
+            <pre><code>fun greet(name: Str): Str {
+    return "Hello, " + name
+}
+
+let reply = greet("Ada")</code></pre>
+            <p>Functions must return on all paths. Object literals must satisfy their declared fields.</p>
+        </section>
+
+        <section id="options">
+            <h2>Options & Results</h2>
+            <pre><code>let maybe_name: Option(Str) = Some("Ada")
+maybe maybe_name {
+    print("Hi " + maybe_name)
+} else {
+    print("No name provided")
+}
+
+let write_res = io.write("out.txt", "hello")
+match write_res {
+    Ok(msg) => print("wrote file"),
+    Err(err) => print("write failed: " + err),
+}</code></pre>
+            <p>Options and Results are checked statically; <code>maybe</code> helps unwrap options safely.</p>
+        </section>
+
+        <section id="ranges">
+            <h2>Ranges & Loops</h2>
+            <pre><code>for i in io.range().from(1).to(5).step(2) {
+    print(i) // 1, 3
+}</code></pre>
+            <p><code>io.range()</code> builds numeric sequences with <code>from</code>, <code>to</code>, and <code>step</code>.
+                Loop variables are numeric and type-checked.</p>
+        </section>
+
+        <section id="io">
+            <h2>I/O & Web</h2>
+            <pre><code>let text = io.read("greeting.txt").default("missing")
+print(text)
+
+let web = io.web()
+return web.json("{\"ok\":true}")</code></pre>
+            <p><code>io.read</code> and <code>io.write</code> return <code>Result</code>. Web helpers are typed objects that
+                enforce valid response shapes.</p>
+        </section>
+
+        <section id="run">
+            <h2>Build & Run</h2>
+            <ul>
+                <li>Install: <code>cargo install --path .</code></li>
+                <li>Run a file: <code>quick run path/to/file.qx</code></li>
+                <li>Format: <code>quick format file.qx</code></li>
+            </ul>
+            <p>That’s the essentials. For deeper dives, patterns, and runtime internals, head to the full docs on the
+                website.</p>
+        </section>
+    </main>
+</body>
+
+</html>
