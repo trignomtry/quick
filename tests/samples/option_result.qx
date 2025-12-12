@@ -1,0 +1,32 @@
+let val = Some("nine");
+let parsed = io.json("{\"name\":null}").unwrap();
+let none = parsed.get("name").unwrap().str();
+
+match val {
+    Some(v) => {
+        print("opt:is_some");
+        print("opt:match_some:" + v);
+    }
+    None => print("opt:not_some"),
+}
+
+match none {
+    None => print("opt:is_none"),
+    Some(_) => print("opt:not_none"),
+}
+
+let ok = io.read("tests/samples/enum_from_json.qx");
+let err = io.read("tests/samples/missing_file.txt");
+
+match ok {
+    Ok(text) => {
+        let head = text.split("\n")[0];
+        print("res:is_ok:" + head);
+    }
+    Err(_) => print("res:read_err"),
+}
+
+match err {
+    Ok(_) => print("res:err_unexpected"),
+    Err(_) => print("res:is_err"),
+}

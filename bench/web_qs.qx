@@ -1,0 +1,6 @@
+let web = io.web();
+
+io.listen(9310, fun(req: Request) {
+    let body = "ok";
+    return web.text(body);
+});

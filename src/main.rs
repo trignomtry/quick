@@ -146,13 +146,15 @@ pub extern "C" fn qs_obj_new() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_obj_insert_str(map: *mut c_void, key: *const c_char, val: *mut c_void) {
-    if map.is_null() || key.is_null() {
+    if map.is_null() || key.is_null() || val.is_null() {
         return;
     }
-    let m = &mut *(map as *mut KvMap);
-    // Key stays as Rust String for hashing; value is stored as an opaque pointer
-    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
-    m.inner.insert(k, val);
+    unsafe {
+        let m = &mut *(map as *mut KvMap);
+        // Key stays as Rust String for hashing; value is stored as an opaque pointer
+        let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+        m.inner.insert(k, val);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -160,11 +162,13 @@ pub unsafe extern "C" fn qs_obj_get_str(map: *mut c_void, key: *const c_char) ->
     if map.is_null() || key.is_null() {
         return std::ptr::null_mut();
     }
-    let m = &mut *(map as *mut KvMap);
-    let k = CStr::from_ptr(key).to_string_lossy().into_owned();
-    match m.inner.get(&k) {
-        Some(ptr) => *ptr,
-        None => std::ptr::null_mut(),
+    unsafe {
+        let m = &mut *(map as *mut KvMap);
+        let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+        match m.inner.get(&k) {
+            Some(ptr) => *ptr,
+            None => std::ptr::null_mut(),
+        }
     }
 }
 
@@ -363,7 +367,7 @@ use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
 use std::ops::Index;
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 use std::convert::Infallible;
 use std::ffi::c_void;
@@ -865,7 +869,7 @@ fn build_enum_from_json_value(
                 return Err(format!(
                     "Variant '{}' expects payload but 'value' was missing",
                     variant_schema.name
-                ))
+                ));
             }
         }
     } else {
@@ -905,7 +909,12 @@ fn build_enum_from_json_value(
         (buffer as *mut u64).write(variant_index as u64);
     }
 
-    for (idx, (schema, value)) in variant_schema.payload.iter().zip(payload_values.iter()).enumerate() {
+    for (idx, (schema, value)) in variant_schema
+        .payload
+        .iter()
+        .zip(payload_values.iter())
+        .enumerate()
+    {
         let slot_ptr = unsafe { (buffer as *mut u8).add((idx + 1) * slot_bytes) };
         let repr = coerce_json_to_value(schema, value)?;
         unsafe { store_value(slot_ptr, repr) };
@@ -981,13 +990,15 @@ fn read_field_value(schema: &SchemaType, slot_ptr: *mut u8) -> JsonValue {
             let tag = unsafe { *(ptr as *mut u64) } as usize;
             let mut obj = serde_json::Map::new();
             if let Some(variant) = variants.get(tag) {
-                obj.insert("variant".to_string(), JsonValue::String(variant.name.clone()));
+                obj.insert(
+                    "variant".to_string(),
+                    JsonValue::String(variant.name.clone()),
+                );
                 if !variant.payload.is_empty() {
                     let mut values = Vec::new();
                     for (idx, payload_schema) in variant.payload.iter().enumerate() {
-                        let slot = unsafe {
-                            (ptr as *mut u8).add((idx + 1) * std::mem::size_of::<u64>())
-                        };
+                        let slot =
+                            unsafe { (ptr as *mut u8).add((idx + 1) * std::mem::size_of::<u64>()) };
                         values.push(read_field_value(payload_schema, slot));
                     }
                     if variant.payload.len() == 1 {
@@ -1078,10 +1089,7 @@ pub unsafe extern "C" fn qs_register_enum_variant(
     payload_count: usize,
     payload_types: *const *const c_char,
 ) {
-    if canonical_name.is_null()
-        || structural_signature.is_null()
-        || variant_name.is_null()
-    {
+    if canonical_name.is_null() || structural_signature.is_null() || variant_name.is_null() {
         return;
     }
 
@@ -1091,9 +1099,7 @@ pub unsafe extern "C" fn qs_register_enum_variant(
     let structural = CStr::from_ptr(structural_signature)
         .to_string_lossy()
         .into_owned();
-    let vname = CStr::from_ptr(variant_name)
-        .to_string_lossy()
-        .into_owned();
+    let vname = CStr::from_ptr(variant_name).to_string_lossy().into_owned();
 
     let mut payload = Vec::with_capacity(payload_count);
     for idx in 0..payload_count {
@@ -1108,11 +1114,13 @@ pub unsafe extern "C" fn qs_register_enum_variant(
     }
 
     if let Ok(mut registry) = enum_registry().lock() {
-        let entry = registry.entry(canonical.clone()).or_insert_with(|| EnumDescriptor {
-            canonical_name: canonical.clone(),
-            structural_signature: structural.clone(),
-            variants: Vec::new(),
-        });
+        let entry = registry
+            .entry(canonical.clone())
+            .or_insert_with(|| EnumDescriptor {
+                canonical_name: canonical.clone(),
+                structural_signature: structural.clone(),
+                variants: Vec::new(),
+            });
         entry.variants.push(EnumVariantSchema {
             name: vname.clone(),
             payload,
@@ -1271,38 +1279,44 @@ pub unsafe extern "C" fn qs_json_parse(source: *const c_char) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qs_json_stringify(handle: *mut JsonHandle) -> *mut c_char {
-    if handle.is_null() {
-        return std::ptr::null_mut();
+pub extern "C" fn qs_json_stringify(handle: *mut JsonHandle) -> *mut c_char {
+    match NonNull::new(handle) {
+        Some(handle) => unsafe {
+            match serde_json::to_string(&handle.as_ref().value) {
+                Ok(rendered) => std::ffi::CString::new(rendered)
+                    .map(|c| c.into_raw())
+                    .unwrap_or_else(|_| std::ptr::null_mut()),
+                Err(err) => {
+                    eprintln!("Failed to stringify JSON value: {err}");
+                    std::ptr::null_mut()
+                }
+            }
+        },
+        None => std::ptr::null_mut(),
     }
-    match serde_json::to_string(&(*handle).value) {
-        Ok(rendered) => std::ffi::CString::new(rendered)
-            .map(|c| c.into_raw())
-            .unwrap_or_else(|_| std::ptr::null_mut()),
-        Err(err) => {
-            eprintln!("Failed to stringify JSON value: {err}");
-            std::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn qs_json_is_null(handle: *mut JsonHandle) -> bool {
+    unsafe {
+        match NonNull::new(handle) {
+            Some(nn) => matches!(nn.as_ref().value, JsonValue::Null),
+            None => true,
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qs_json_is_null(handle: *mut JsonHandle) -> bool {
-    if handle.is_null() {
-        return true;
-    }
-    matches!((*handle).value, JsonValue::Null)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn qs_json_len(handle: *mut JsonHandle) -> i64 {
-    if handle.is_null() {
-        return 0;
-    }
-    match &(*handle).value {
-        JsonValue::Array(items) => items.len() as i64,
-        JsonValue::Object(map) => map.len() as i64,
-        _ => 0,
+pub extern "C" fn qs_json_len(handle: *mut JsonHandle) -> i64 {
+    unsafe {
+        match NonNull::new(handle) {
+            Some(handle) => match &handle.as_ref().value {
+                JsonValue::Array(items) => items.len() as i64,
+                JsonValue::Object(map) => map.len() as i64,
+                _ => 0,
+            },
+            None => 0,
+        }
     }
 }
 
@@ -2786,10 +2800,7 @@ impl Expr {
                                     ("path".to_string(), Type::Str),
                                     ("content".to_string(), Type::Str),
                                 ],
-                                Box::new(Type::Result(
-                                    Box::new(Type::Str),
-                                    Box::new(Type::Str),
-                                )),
+                                Box::new(Type::Result(Box::new(Type::Str), Box::new(Type::Str))),
                             )),
                             "web" => Ok(Type::Function(
                                 vec![],
@@ -2982,7 +2993,9 @@ impl Expr {
                         if is_type_reference {
                             return type_error(
                                 format!("'{prop}' is not available on enum type references"),
-                                Some("Use TypeName.from_json(payload) to construct an enum from JSON."),
+                                Some(
+                                    "Use TypeName.from_json(payload) to construct an enum from JSON.",
+                                ),
                             );
                         }
 
@@ -4333,15 +4346,8 @@ fn execute_run(filename: String, debug: bool) {
                 }
             }
 
-            // If an HTTP server was started, keep the process alive.
-            // Wait briefly for the server to transition to running if needed.
-            let mut waited_ms = 0u64;
-            while !SERVER_RUNNING.load(Ordering::Relaxed) && waited_ms < 5_000 {
-                std::thread::sleep(Duration::from_millis(10));
-                waited_ms += 10;
-            }
+            // If an HTTP server was started, keep the process alive by parking the main thread.
             if SERVER_RUNNING.load(Ordering::Relaxed) {
-                // Park the main thread indefinitely. Ctrl+C will terminate the process.
                 std::thread::park();
             }
         }
@@ -5036,4 +5042,22 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
     });
 
     tokens
+}
+
+#[cfg(test)]
+mod ffi_safety_tests {
+    use super::*;
+
+    #[test]
+    fn obj_insert_ignores_null_inputs() {
+        unsafe {
+            qs_obj_insert_str(std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn obj_get_returns_null_on_null_inputs() {
+        let ptr = unsafe { qs_obj_get_str(std::ptr::null_mut(), std::ptr::null()) };
+        assert!(ptr.is_null());
+    }
 }

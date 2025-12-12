@@ -1,136 +1,100 @@
-let web = io.web()
-
-object Message {
-    sender: Str,
-    receiver: Str,
-    body: Str,
+ let web = io.web() object Message{
+	sender: Str, receiver: Str, body: Str,
 }
-
-object User {
-    name: Str,
-    username: Str,
-    messages: [Message],
+object User{
+	name: Str, username: Str, messages:[Message],
 }
-
-let users: Obj(User) = Obj.new()
-
-io.listen(8080, fun(req: Request) {
-    match req.path {
-        "/" => return web.file("index.html"),
-        "/about" => return web.file("about.html"),
-        "/getmessage" => {
-            let body = req.body;
-            match body {
-                Some(body_text) => {
-                    match users.get(body_text) {
-                        Some(user_obj) => {
-                            let msg_count = user_obj.messages.len();
-                            if msg_count == 0 {
-                                return web.json("[]");
-                            }
-
-                            // Collect unique senders
-                            let senders: [Str] = [];
-                            for i in io.range().from(0).to(msg_count) {
-                                let m = user_obj.messages[i];
-                                let sender = m.sender;
-                                let exists = false;
-                                for j in io.range().from(0).to(senders.len()) {
-                                    if senders[j] == sender {
-                                        exists = true;
-                                    }
-                                }
-                                if !exists {
-                                    senders.push(sender);
-                                }
-                            }
-
-                            // Build JSON response grouped by sender
-                            let parts: [Str] = [];
-                            for i in io.range().from(0).to(senders.len()) {
-                                let sender = senders[i];
-                                let entries: [Str] = [];
-                                for j in io.range().from(0).to(msg_count) {
-                                    let m = user_obj.messages[j];
-                                    if m.sender == sender {
-                                        entries.push(
-                                            "{\"sender\":\""
-                                                + m.sender
-                                                + "\",\"receiver\":\""
-                                                + m.receiver
-                                                + "\",\"body\":\""
-                                                + m.body
-                                                + "\"}",
-                                        );
-                                    }
-                                }
-                                parts.push(
-                                    "{\"with\":\""
-                                        + sender
-                                        + "\",\"messages\":["
-                                        + entries.join(",")
-                                        + "]}",
-                                );
-                            }
-
-                            return web.json("[" + parts.join(",") + "]");
-                        }
-                        None => return web.text("user not found"),
-                    }
-                }
-                None => return web.error.text(400, "Missing username"),
-            }
-        }
-        "/register" => {
-            let body = req.body;
-            match body {
-                Some(body_text) => {
-                    let parts = body_text.split(",");
-                    if parts.len() < 2 {
-                        return web.error.text(400, "Invalid payload");
-                    }
-                    let name = parts[0];
-                    let username = parts[1];
-                    users.insert(
-                        username,
-                        User {
-                            name: name,
-                            username: username,
-                            messages: [],
-                        },
-                    );
-                    return web.text("Success!");
-                }
-                None => return web.text("error: fuck you"),
-            }
-        }
-        "/message" => {
-            let body = req.body;
-            match body {
-                Some(body_text) => {
-                    let parts = body_text.split(",");
-                    if parts.len() < 3 {
-                        return web.error.text(400, "Invalid payload");
-                    }
-                    let sender = parts[0];
-                    let receiver = parts[1];
-                    let message = parts[2];
-
-                    match users.get(receiver) {
-                        Some(user_obj) => {
-                            user_obj.messages.push(Message {
-                                sender: sender,
-                                receiver: receiver,
-                                body: message,
-                            });
-                            return web.text("success");
-                        }
-                        None => return web.text("Unknown user"),
-                    }
-                }
-                None => return web.text("get out"),
-            }
-        }
-        other => return web.file("404.html"),
-    }
-});
+let users: Obj(User) = Obj.new() io.listen(8080, fun(req: Request){
+	match req.path{
+		"/" => return web.file("index.html"), "/about" => return web.file("about.html"), "/getmessage" =>{
+			let body = req.body;
+			match body{
+				Some(body_text) =>{
+					match users.get(body_text){
+						Some(user_obj) =>{
+							let msg_count = user_obj.messages.len();
+							if msg_count == 0{
+								return web.json("[]");
+							}
+							let senders:[Str] =[];
+							for i in io.range().from(0).to(msg_count){
+								let m = user_obj.messages[i];
+								let sender = m.sender;
+								let exists = false;
+								for j in io.range().from(0).to(senders.len()){
+									if senders[j] == sender{
+										exists = true;
+									}
+								}
+								if! exists{
+									senders.push(sender);
+								}
+							}
+							let parts:[Str] =[];
+							for i in io.range().from(0).to(senders.len()){
+								let sender = senders[i];
+								let entries:[Str] =[];
+								for j in io.range().from(0).to(msg_count){
+									let m = user_obj.messages[j];
+									if m.sender == sender{
+										entries.push("{\"sender\":\"" + m.sender + "\",\"receiver\":\"" + m.receiver + "\",\"body\":\"" + m.body + "\"}",);
+									}
+								}
+								parts.push("{\"with\":\"" + sender + "\",\"messages\":[" + entries.join(",") + "]}",);
+							}
+							return web.json("[" + parts.join(",") + "]");
+						}
+						None => return web.text("user not found"),
+					}
+				}
+				None => return web.error.text(400, "Missing username"),
+			}
+		}
+		"/register" =>{
+			let body = req.body;
+			match body{
+				Some(body_text) =>{
+					let parts = body_text.split(",");
+					if parts.len() < 2{
+						return web.error.text(400, "Invalid payload");
+					}
+					let name = parts[0];
+					let username = parts[1];
+					users.insert(username, User{
+						name: name, username: username, messages:[],
+					}
+					,);
+					return web.text("Success!");
+				}
+				None => return web.text("error: fuck you"),
+			}
+		}
+		"/message" =>{
+			let body = req.body;
+			match body{
+				Some(body_text) =>{
+					let parts = body_text.split(",");
+					if parts.len() < 3{
+						return web.error.text(400, "Invalid payload");
+					}
+					let sender = parts[0];
+					let receiver = parts[1];
+					let message = parts[2];
+					match users.get(receiver){
+						Some(user_obj) =>{
+							user_obj.messages.push(Message{
+								sender: sender, receiver: receiver, body: message,
+							}
+							);
+							return web.text("success");
+						}
+						None => return web.text("Unknown user"),
+					}
+				}
+				None => return web.text("get out"),
+			}
+		}
+		other => return web.file("404.html"),
+	}
+}
+);

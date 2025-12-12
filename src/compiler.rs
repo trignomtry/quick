@@ -4,6 +4,9 @@ use inkwell::builder::{Builder, BuilderError};
 use inkwell::context;
 use inkwell::execution_engine::{ExecutionEngine, FunctionLookupError, JitFunction};
 use inkwell::module::{Linkage, Module};
+use inkwell::passes::PassBuilderOptions;
+use inkwell::targets::{CodeModel, RelocMode, Target, TargetMachine};
+use inkwell::OptimizationLevel;
 use inkwell::types::{BasicType, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, IntValue, PointerValue,
@@ -1298,6 +1301,32 @@ impl<'ctx> Compiler<'ctx> {
                 self.builder
                     .build_return(Some(&f64_type.const_float(0.0)))
                     .unwrap();
+            }
+        }
+
+        // Run a full aggressive optimization pipeline over the module so hot loops shed allocas and dead code.
+        {
+            let target_triple = TargetMachine::get_default_triple();
+            let target = Target::from_triple(&target_triple)
+                .expect("Failed to look up native target for optimization");
+            let target_machine = target
+                .create_target_machine(
+                    &target_triple,
+                    "generic",
+                    "",
+                    OptimizationLevel::Aggressive,
+                    RelocMode::Default,
+                    CodeModel::Default,
+                )
+                .expect("Failed to create native target machine for optimization");
+
+            let pass_opts = PassBuilderOptions::create();
+            // default<O3> mirrors opt -O3 with the new pass manager
+            if let Err(err) = self
+                .module
+                .run_passes("default<O3>", &target_machine, pass_opts)
+            {
+                eprintln!("LLVM optimization pipeline failed: {err}");
             }
         }
 
@@ -3263,6 +3292,71 @@ impl<'ctx> Compiler<'ctx> {
                     .unwrap();
                 return Ok(result);
             }
+
+            // num.str()
+            Expr::Call(callee, args)
+                if args.is_empty()
+                    && matches!(
+                        &**callee,
+                        Expr::Get(obj, method)
+                            if method == "str"
+                                && self
+                                    .expr_type_matches(obj, |t| matches!(t.unwrap(), Type::Num))
+                    ) =>
+            {
+                let Expr::Get(obj, _) = &**callee else {
+                    unreachable!("Guard ensures Expr::Get");
+                };
+                let compiled_val = self.compile_expr(obj)?;
+                let num_val = match compiled_val {
+                    BasicValueEnum::FloatValue(f) => f,
+                    BasicValueEnum::IntValue(iv) => self.builder.build_signed_int_to_float(
+                        iv,
+                        self.context.f64_type(),
+                        "int_to_float",
+                    )?,
+                    BasicValueEnum::PointerValue(ptr) => {
+                        let loaded = self
+                            .builder
+                            .build_load(self.context.f64_type(), ptr, "load_num_str")?;
+                        if let BasicValueEnum::FloatValue(f) = loaded {
+                            f
+                        } else if let BasicValueEnum::IntValue(iv) = loaded {
+                            self.builder.build_signed_int_to_float(
+                                iv,
+                                self.context.f64_type(),
+                                "ptr_int_to_float",
+                            )?
+                        } else {
+                            panic!(".str() pointer did not contain a numeric value: {loaded:?}")
+                        }
+                    }
+                    other => panic!(".str() called on non-numeric object: {:?}", other),
+                };
+                let fmt = self
+                    .builder
+                    .build_global_string_ptr("%f\0", "fmt_str_call")
+                    .unwrap();
+                let size = self.context.i64_type().const_int(128, false);
+                let malloc_fn = self.get_or_create_malloc();
+                let buf_ptr = self
+                    .builder
+                    .build_call(malloc_fn, &[size.into()], "malloc_buf_call")
+                    .unwrap();
+                let buf_ptr = buf_ptr
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+                let sprintf_fn = self.get_or_create_sprintf();
+                self.builder.build_call(
+                    sprintf_fn,
+                    &[buf_ptr.into(), fmt.as_pointer_value().into(), num_val.into()],
+                    "sprintf_num_str_call",
+                )?;
+                return Ok(buf_ptr.as_basic_value_enum());
+            }
+
             // json.stringify()
             Expr::Call(callee, args)
                 if args.is_empty()

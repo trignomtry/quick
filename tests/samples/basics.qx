@@ -1,0 +1,96 @@
+let add = 1 + 2;
+print("add:" + add.str());
+
+let mul = 3 * 4;
+print("mul:" + mul.str());
+
+let div = 8 / 2;
+print("div:" + div.str());
+
+let sub = 10 - 3;
+print("sub:" + sub.str());
+
+if 2 < 3 {
+    print("cmp:true");
+} else {
+    print("cmp:false");
+}
+
+if 3 == 3 {
+    print("eq:true");
+} else {
+    print("eq:false");
+}
+
+if true and false {
+    print("and:true");
+} else {
+    print("and:false");
+}
+
+if true or false {
+    print("or:true");
+} else {
+    print("or:false");
+}
+
+let text = "hello.txt";
+print("strlen:" + text.len().str());
+
+if text.starts_with("hel") {
+    print("starts:true");
+} else {
+    print("starts:false");
+}
+
+if text.ends_with(".txt") {
+    print("ends:true");
+} else {
+    print("ends:false");
+}
+
+if text.contains("ell") {
+    print("contains:true");
+} else {
+    print("contains:false");
+}
+
+print("replace:" + text.replace("ll", "XX"));
+
+let split = "a,b,c".split(",");
+print("splitlen:" + split.len().str());
+print("splitmid:" + split[1]);
+print("join:" + split.join("-"));
+
+let parsed = "42".num().default(0);
+print("num:" + parsed.str());
+print("index:" + "code"[1]);
+
+let rand = io.random();
+print("random:" + rand.str());
+
+for n in io.range().from(2).to(8).step(2) {
+    print("range:" + n.str());
+}
+
+let count = 0;
+let acc = 0;
+while count < 3 {
+    acc = acc + count;
+    count = count + 1;
+}
+print("while:" + acc.str());
+
+let nums: [Num] = [];
+nums.push(2);
+nums.push(4);
+print("listlen:" + nums.len().str());
+print("listidx:" + nums[1].str());
+print("listafter:" + nums.len().str());
+
+let _write_res = io.write("target/tmp_read_write.txt", "read contents");
+let read_back = io.read("target/tmp_read_write.txt");
+match read_back {
+    Ok(text) => print("read:" + text),
+    Err(msg) => print("read_err:" + msg),
+}

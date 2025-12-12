@@ -1,0 +1,39 @@
+let parsed = io.json("{\"name\":\"quick\",\"nums\":[1,2,null]}");
+
+match parsed {
+    Ok(obj) => {
+        match obj.get("name") {
+            Some(name_val) => {
+                print("json:name:" + name_val.str().unwrap());
+            }
+            None => {
+                print("json:err:name");
+            }
+        }
+
+        match obj.get("nums") {
+            Some(nums) => {
+                let first = nums.at(0).unwrap().stringify();
+                print("json:first:" + first);
+
+                let third = nums.at(2).unwrap();
+                if third.is_null() {
+                    print("json:null:true");
+                } else {
+                    print("json:null:false");
+                }
+            }
+            None => {
+                print("json:err:nums");
+            }
+        }
+
+        match obj.get("missing") {
+            Some(_) => print("json:missing-unexpected"),
+            None => print("json:missing"),
+        }
+    }
+    Err(msg) => {
+        print("json:err:" + msg);
+    }
+}

@@ -1,0 +1,50 @@
+use test: "test";
+
+object BoxNum {
+    value: Num,
+    note: Str,
+}
+
+object Pair {
+    left: Num,
+    right: Num,
+}
+
+enum Mood {
+    Happy,
+    Sad(Str),
+    Combo(Num, Str),
+}
+
+let bx: BoxNum = BoxNum { value: 5, note: "hi" };
+print("box:" + bx.value.str() + ":" + bx.note);
+
+let boxed_from_json = BoxNum.from_json("{\"value\":7,\"note\":\"json\"}");
+print("box_from_json:" + boxed_from_json.unwrap().note);
+
+let pairs: [Pair] = [];
+pairs.push(Pair { left: 1, right: 2 });
+print("pair_sum:" + (pairs[0].left + pairs[0].right).str());
+
+let mood = Mood.from_json("{\"variant\":\"Sad\",\"value\":\"wow\"}").unwrap();
+match mood {
+    Mood.Sad(msg) => print("mood:sad:" + msg),
+    _ => print("mood:other"),
+}
+
+let store = Obj.new();
+store.insert("a", "one");
+store.insert("b", "two");
+let got = store.get("a");
+match got {
+    Some(v) => print("obj:a:" + v),
+    None => print("obj:a:none"),
+}
+let missing = store.get("z");
+match missing {
+    Some(_) => print("obj:missing-unexpected"),
+    None => print("obj:missing"),
+}
+
+print("module:" + test.do_something());
+print("module_const:" + test.this_thing.str());
