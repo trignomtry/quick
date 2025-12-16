@@ -49,6 +49,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install LLVM / deps
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-*) 
+              sudo apt-get update
+              sudo apt-get install -y llvm-18-dev clang-18 libzstd-dev
+              echo "LLVM_CONFIG_PATH=/usr/lib/llvm-18/bin/llvm-config" >> "$GITHUB_ENV"
+              echo "CC=clang-18" >> "$GITHUB_ENV"
+              ;;
+            macos-*)
+              brew install llvm@18 zstd
+              if [ -d /usr/local/opt/llvm@18/bin ]; then
+                echo "LLVM_CONFIG_PATH=/usr/local/opt/llvm@18/bin/llvm-config" >> "$GITHUB_ENV"
+              else
+                echo "LLVM_CONFIG_PATH=/opt/homebrew/opt/llvm@18/bin/llvm-config" >> "$GITHUB_ENV"
+              fi
+              ;;
+            windows-*)
+              choco install -y llvm
+              echo "LLVM_CONFIG_PATH=C:\\Program Files\\LLVM\\bin\\llvm-config.exe" >> "$GITHUB_ENV"
+              ;;
+          esac
+
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
