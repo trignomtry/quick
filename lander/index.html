@@ -7,7 +7,9 @@
     <title>QuickScript</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=Source+Code+Pro:wght@500&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=Source+Code+Pro:wght@500&display=swap"
+        rel="stylesheet">
     <style>
         :root {
             --bg: #0f172a;
@@ -104,13 +106,18 @@
     <div class="page">
         <header>
             <h1>QuickScript</h1>
-            <p>Small, strongly typed, async-first, and LLVM-backed. Build servers, scripts, and services with predictable speed.</p>
+            <p>Small, strongly typed, async-first, and LLVM-backed. Build servers, scripts, and services with
+                predictable speed.</p>
             <div class="cta-row">
                 <a class="btn primary" href="/docs/">Read the Docs</a>
                 <a class="btn" href="/docs/#quickstart">Quickstart</a>
             </div>
+            <code>
+                <h1>Install It Now</h1>
+                curl -fsSL https://quick-script.dev/install.sh | sh
+            </code>
             <div class="code">
-<pre>let web = io.web()
+                <pre>let web = io.web()
 
 io.listen(8087, fun(req: Request) {
     match req.path {

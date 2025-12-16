@@ -2,6 +2,12 @@
 
 QuickScript is a micro-precise language built for Direct Execution. It keeps a predictable mental model while giving you Flow I/O, Web Primitives, ranges, objects, and typed Forms backed by Static Trust. The Kit stays small, performance stays metal-fast, and every new feature follows the same Patterns so nothing ever feels bolted on. The goal is simple: compiled-level speed, zero surprises, and an API surface you can understand at a glance.
 
+### Install it now
+
+```bash
+curl -fsSL https://quick-script.dev/install.sh | sh
+```
+
 ### One File to Try
 
 ```swift
