@@ -62,7 +62,7 @@ jobs:
           case "${{ matrix.os }}" in
             ubuntu-*) 
               sudo apt-get update
-              sudo apt-get install -y llvm-18 llvm-18-dev llvm-18-tools clang-18 libzstd-dev
+              sudo apt-get install -y llvm-18 llvm-18-dev llvm-18-tools clang-18 libzstd-dev libpolly-18-dev
               echo "LLVM_CONFIG_PATH=/usr/lib/llvm-18/bin/llvm-config" >> "$GITHUB_ENV"
               echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
               echo "CC=clang-18" >> "$GITHUB_ENV"
@@ -78,9 +78,10 @@ jobs:
               fi
               ;;
             windows-*)
-              choco install -y llvm
+              choco install -y --no-progress llvm --version=18.1.8
               echo "LLVM_CONFIG_PATH=C:\\Program Files\\LLVM\\bin\\llvm-config.exe" >> "$GITHUB_ENV"
               echo "LLVM_SYS_181_PREFIX=C:\\Program Files\\LLVM" >> "$GITHUB_ENV"
+              echo "PATH=C:\\Program Files\\LLVM\\bin;$PATH" >> "$GITHUB_ENV"
               ;;
           esac
 
@@ -93,7 +94,7 @@ jobs:
       - name: Prepare artifact
         shell: bash
         run: |
-          mkdir dist
+          mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.out }}
           cd dist
           tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.out }}
