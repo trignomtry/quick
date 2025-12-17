@@ -14,10 +14,17 @@ if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
     green="$(tput setaf 2)"
     yellow="$(tput setaf 3)"
     red="$(tput setaf 1)"
+    blue="$(tput setaf 4)"
+    bold="$(tput bold)"
     reset="$(tput sgr0)"
 else
-    green=""; yellow=""; red=""; reset=""
+    green=""; yellow=""; red=""; blue=""; bold=""; reset=""
 fi
+
+info()   { echo "${blue}==>${reset} ${bold}$*${reset}"; }
+warn()   { echo "${yellow}!!${reset} ${bold}$*${reset}"; }
+error()  { echo "${red}xx${reset} ${bold}$*${reset}" >&2; }
+success(){ echo "${green}ok${reset} ${bold}$*${reset}"; }
 
 uname_s="$(uname -s)"
 uname_m="$(uname -m)"
@@ -25,13 +32,13 @@ uname_m="$(uname -m)"
 case "${uname_s}" in
     Linux)   os="linux" ;;
     Darwin)  os="darwin" ;;
-    *)       echo "Unsupported OS: ${uname_s}" >&2; exit 1 ;;
+    *)       error "Unsupported OS: ${uname_s}"; exit 1 ;;
 esac
 
 case "${uname_m}" in
     x86_64|amd64) arch="x86_64" ;;
     arm64|aarch64) arch="arm64" ;;
-    *)            echo "Unsupported arch: ${uname_m}" >&2; exit 1 ;;
+    *)            error "Unsupported arch: ${uname_m}"; exit 1 ;;
 esac
 
 artifact_base="quick-${os}-${arch}"
@@ -56,16 +63,21 @@ url="${base}/${artifact}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
 
-echo "Downloading ${artifact} from ${url}..."
+info "QuickScript installer"
+info "Target: ${os}/${arch}"
+info "Install dir: ${INSTALL_DIR%/}"
+echo
+
+info "Downloading ${artifact} from ${url}..."
 if ! curl -fsSL "${url}" -o "${tmpdir}/${download_target}"; then
-    echo "Download failed. Check QS_BASE/QS_VERSION or connectivity." >&2
+    error "Download failed. Check QS_BASE/QS_VERSION or connectivity."
     exit 1
 fi
 
 case "${unpack}" in
     tar)
         if ! tar -xzf "${tmpdir}/${download_target}" -C "${tmpdir}"; then
-            echo "Failed to extract archive ${download_target}" >&2
+            error "Failed to extract archive ${download_target}"
             exit 1
         fi
         bin_src="${tmpdir}/${artifact_base}"
@@ -89,32 +101,33 @@ ensure_writable_dir() {
 
 if ! ensure_writable_dir "${dest_dir}"; then
     if [ "${target_dir}" != "/usr/local/bin" ]; then
-        echo "Install dir ${target_dir} not writable, trying /usr/local/bin"
+        warn "Install dir ${target_dir} not writable, trying /usr/local/bin"
         target_dir="/usr/local/bin"
         dest="${target_dir}/quick"
         dest_dir="$(dirname "${dest}")"
     fi
 
     if ! ensure_writable_dir "${dest_dir}"; then
-        echo "${red}No writable install dir. Set INSTALL_DIR to a writable path (e.g. ${HOME}/.quick/bin) or run with sudo for a system path.${reset}" >&2
+        error "No writable install dir. Set INSTALL_DIR to a writable path (e.g. ${HOME}/.quick/bin) or run with sudo for a system path."
         exit 1
     fi
 fi
 
 if [ -e "${dest}" ] && [ ! -w "${dest}" ]; then
-    echo "${red}Existing ${dest} is not writable. Remove it or set INSTALL_DIR to a writable location.${reset}" >&2
+    error "Existing ${dest} is not writable. Remove it or set INSTALL_DIR to a writable location."
     exit 1
 fi
 
 install -m 755 "${bin_src}" "${dest}"
 
-echo "${green}Installed to ${dest}${reset}"
+success "Installed to ${dest}"
 case ":${PATH}:" in
     *:"${dest_dir}":*)
-        echo "${green}${dest_dir}${reset} is already on your PATH."
+        success "${dest_dir} is already on your PATH."
         ;;
     *)
-        echo "${yellow}${dest_dir} is not on your PATH.${reset}"
-        echo "Add it with: ${yellow}echo 'export PATH=\"${dest_dir}:\$PATH\"' >> ~/.zprofile && source ~/.zprofile${reset}"
+        warn "${dest_dir} is not on your PATH."
+        echo "Add it with:"
+        echo "  ${yellow}echo 'export PATH=\"${dest_dir}:\$PATH\"' >> ~/.zprofile && source ~/.zprofile${reset}"
         ;;
 esac
