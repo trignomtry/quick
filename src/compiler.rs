@@ -1,12 +1,12 @@
 use crate::*;
 use inkwell::AddressSpace;
+use inkwell::OptimizationLevel;
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context;
 use inkwell::execution_engine::{ExecutionEngine, FunctionLookupError, JitFunction};
 use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, RelocMode, Target, TargetMachine};
-use inkwell::OptimizationLevel;
 use inkwell::types::{BasicType, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, IntValue, PointerValue,
@@ -121,7 +121,10 @@ impl<'ctx> Compiler<'ctx> {
 
                     let canonical_ptr = self
                         .builder
-                        .build_global_string_ptr(&type_name, &format!("json_type_name_{sanitized}"))?
+                        .build_global_string_ptr(
+                            &type_name,
+                            &format!("json_type_name_{sanitized}"),
+                        )?
                         .as_pointer_value();
 
                     let structural_signature = {
@@ -215,12 +218,16 @@ impl<'ctx> Compiler<'ctx> {
                         self.builder.build_store(slot, *ptr)?;
                     }
 
-                    let names_ptr =
-                        self.builder
-                            .build_pointer_cast(names_alloca, ptr_ptr_ty, "json_names_ptr")?;
-                    let types_ptr =
-                        self.builder
-                            .build_pointer_cast(types_alloca, ptr_ptr_ty, "json_types_ptr")?;
+                    let names_ptr = self.builder.build_pointer_cast(
+                        names_alloca,
+                        ptr_ptr_ty,
+                        "json_names_ptr",
+                    )?;
+                    let types_ptr = self.builder.build_pointer_cast(
+                        types_alloca,
+                        ptr_ptr_ty,
+                        "json_types_ptr",
+                    )?;
 
                     let count_val = i64_ty.const_int(field_count as u64, false);
 
@@ -240,7 +247,10 @@ impl<'ctx> Compiler<'ctx> {
                     let sanitized = sanitize(&type_name);
                     let canonical_ptr = self
                         .builder
-                        .build_global_string_ptr(&type_name, &format!("json_enum_name_{sanitized}"))?
+                        .build_global_string_ptr(
+                            &type_name,
+                            &format!("json_enum_name_{sanitized}"),
+                        )?
                         .as_pointer_value();
                     let structural_signature = {
                         let ctx_ref = self.pctx.borrow();
@@ -297,14 +307,15 @@ impl<'ctx> Compiler<'ctx> {
                                 self.builder.build_store(slot, payload_ptr)?;
                             }
 
-                            let payload_ptr_cast = self
-                                .builder
-                                .build_pointer_cast(
-                                    payload_alloca,
-                                    ptr_ptr_ty,
-                                    &format!("json_enum_payload_ptr_{sanitized}_{idx}"),
-                                )?;
-                            (payload_ptr_cast, i64_ty.const_int(payload_count as u64, false))
+                            let payload_ptr_cast = self.builder.build_pointer_cast(
+                                payload_alloca,
+                                ptr_ptr_ty,
+                                &format!("json_enum_payload_ptr_{sanitized}_{idx}"),
+                            )?;
+                            (
+                                payload_ptr_cast,
+                                i64_ty.const_int(payload_count as u64, false),
+                            )
                         };
 
                         self.builder.build_call(

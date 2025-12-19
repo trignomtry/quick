@@ -1,0 +1,11 @@
+[env]
+LLVM_SYS_181_STATIC = "1"
+LLVM_SYS_181_PREFIX = "/opt/homebrew/opt/llvm@18"
+
+[target.'cfg(target_os = "macos")']
+rustflags = [
+  "-L", "/opt/homebrew/opt/zstd/lib",
+  "-l", "static=zstd",
+  "-L", "/opt/homebrew/opt/llvm@18/lib",
+  "-l", "static=unwind",
+]

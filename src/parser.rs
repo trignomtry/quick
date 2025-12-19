@@ -423,7 +423,10 @@ impl Parser {
             self.is_global = false;
             let debug_brace = std::env::var("QS_DEBUG_BRACE").is_ok();
             if debug_brace {
-                eprintln!("debug: enter block starting at line {}", self.previous().line);
+                eprintln!(
+                    "debug: enter block starting at line {}",
+                    self.previous().line
+                );
             }
             // Static type scope for block: save outer types
             let saved_types = self.pctx.var_types.clone();

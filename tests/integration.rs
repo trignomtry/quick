@@ -86,7 +86,11 @@ fn range_builder_supports_positive_step() {
         .filter(|l| !l.is_empty())
         .map(|l| l.parse::<f64>().expect("range output should be numeric"))
         .collect();
-    assert_eq!(lines, vec![1.0, 3.0], "unexpected positive-step range output");
+    assert_eq!(
+        lines,
+        vec![1.0, 3.0],
+        "unexpected positive-step range output"
+    );
 }
 
 #[test]
@@ -98,7 +102,11 @@ fn range_builder_supports_negative_step() {
         .filter(|l| !l.is_empty())
         .map(|l| l.parse::<f64>().expect("range output should be numeric"))
         .collect();
-    assert_eq!(lines, vec![5.0, 3.0, 1.0], "unexpected negative-step range output");
+    assert_eq!(
+        lines,
+        vec![5.0, 3.0, 1.0],
+        "unexpected negative-step range output"
+    );
 }
 
 #[test]
@@ -155,8 +163,7 @@ fn basics_cover_math_strings_collections_io() {
         "read:read contents",
     ];
     assert_eq!(
-        remaining,
-        expected_tail,
+        remaining, expected_tail,
         "unexpected tail output from basics sample"
     );
 }

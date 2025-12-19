@@ -36,7 +36,6 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> usize;
     fn fclose(stream: *mut std::ffi::c_void) -> i32;
-    fn fgets(s: *mut i8, size: i32, stream: *mut std::ffi::c_void) -> *mut i8;
     fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
     fn LLVMLinkInMCJIT();
     fn LLVMLinkInInterpreter();
@@ -54,7 +53,7 @@ pub extern "C" fn get_stdin() -> *mut std::ffi::c_void {
 // ───── Minimal KV Object Runtime (string -> string) ─────
 // Fast baseline using std HashMap; can swap to ahash/hashbrown later
 struct KvMap {
-    inner: HashMap<String, *mut c_void>,
+    inner: HashMap<CString, *mut c_void>,
 }
 
 #[repr(C)]
@@ -81,13 +80,6 @@ fn qs_result_err(err: *mut c_void) -> *mut c_void {
         err,
     };
     Box::into_raw(Box::new(result)) as *mut c_void
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct QsOption {
-    is_some: bool,
-    some: *mut c_void,
 }
 
 #[derive(Clone)]
@@ -151,8 +143,10 @@ pub unsafe extern "C" fn qs_obj_insert_str(map: *mut c_void, key: *const c_char,
     }
     unsafe {
         let m = &mut *(map as *mut KvMap);
-        // Key stays as Rust String for hashing; value is stored as an opaque pointer
-        let k = CStr::from_ptr(key).to_string_lossy().into_owned();
+        // Key is stored as owned CString; lookups borrow as &CStr to avoid reallocation
+        let Ok(k) = CString::new(CStr::from_ptr(key).to_bytes()) else {
+            return;
+        };
         m.inner.insert(k, val);
     }
 }
@@ -164,8 +158,8 @@ pub unsafe extern "C" fn qs_obj_get_str(map: *mut c_void, key: *const c_char) ->
     }
     unsafe {
         let m = &mut *(map as *mut KvMap);
-        let k = CStr::from_ptr(key).to_string_lossy().into_owned();
-        match m.inner.get(&k) {
+        let k = CStr::from_ptr(key);
+        match m.inner.get(k) {
             Some(ptr) => *ptr,
             None => std::ptr::null_mut(),
         }
@@ -361,6 +355,7 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::targets::InitializationConfig;
 use inkwell::types::BasicTypeEnum;
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -374,6 +369,7 @@ use std::ffi::c_void;
 use std::ffi::{CStr, CString};
 use std::future::Future;
 use std::os::raw::c_char;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -394,7 +390,7 @@ unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+    unsafe { CStr::from_ptr(ptr).to_string_lossy().to_string() }
 }
 
 unsafe fn cstr_to_option_string(ptr: *const c_char) -> Option<String> {
@@ -402,6 +398,28 @@ unsafe fn cstr_to_option_string(ptr: *const c_char) -> Option<String> {
         None
     } else {
         Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
+}
+
+fn cstr_to_path<'a>(ptr: *const c_char) -> Option<Cow<'a, Path>> {
+    if ptr.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let cstr = CStr::from_ptr(ptr);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let os = std::ffi::OsStr::from_bytes(cstr.to_bytes());
+            return Some(Cow::Borrowed(Path::new(os)));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let owned = cstr.to_string_lossy().to_string();
+            return Some(Cow::Owned(PathBuf::from(owned)));
+        }
     }
 }
 
@@ -1247,7 +1265,7 @@ pub unsafe extern "C" fn qs_json_parse(source: *const c_char) -> *mut c_void {
             .into_raw();
         return qs_result_err(msg as *mut c_void);
     }
-    let text = CStr::from_ptr(source).to_string_lossy().into_owned();
+    let text = CStr::from_ptr(source).to_str().unwrap_or_default();
     let parsed = match serde_json::from_str::<JsonValue>(&text) {
         Ok(value) => value,
         Err(err) => {
@@ -1681,13 +1699,13 @@ pub unsafe extern "C" fn range_builder_get_step(buil: *const RangeBuilder) -> f6
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_text(content: *const c_char) -> *mut ResponseObject {
-    let content_str = if content.is_null() {
-        String::new()
+    let content_bytes = if content.is_null() {
+        Vec::new()
     } else {
-        unsafe { cstr_to_string(content) }
+        unsafe { CStr::from_ptr(content).to_bytes().to_owned() }
     };
 
-    let (body_ptr, body_len) = leak_string_as_body(content_str);
+    let (body_ptr, body_len) = leak_bytes_as_body(content_bytes);
 
     let response = Box::new(ResponseObject {
         status_code: 200,
@@ -1704,13 +1722,13 @@ pub unsafe extern "C" fn web_text(content: *const c_char) -> *mut ResponseObject
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_json(content: *const c_char) -> *mut ResponseObject {
-    let content_str = if content.is_null() {
-        String::new()
+    let content_bytes = if content.is_null() {
+        Vec::new()
     } else {
-        unsafe { cstr_to_string(content) }
+        unsafe { CStr::from_ptr(content).to_bytes().to_owned() }
     };
 
-    let (body_ptr, body_len) = leak_string_as_body(content_str);
+    let (body_ptr, body_len) = leak_bytes_as_body(content_bytes);
 
     let response = Box::new(ResponseObject {
         status_code: 200,
@@ -1727,13 +1745,13 @@ pub unsafe extern "C" fn web_json(content: *const c_char) -> *mut ResponseObject
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_page(content: *const c_char) -> *mut ResponseObject {
-    let content_str = if content.is_null() {
-        String::new()
+    let content_bytes = if content.is_null() {
+        Vec::new()
     } else {
-        unsafe { cstr_to_string(content) }
+        unsafe { CStr::from_ptr(content).to_bytes().to_owned() }
     };
 
-    let (body_ptr, body_len) = leak_string_as_body(content_str);
+    let (body_ptr, body_len) = leak_bytes_as_body(content_bytes);
 
     let response = Box::new(ResponseObject {
         status_code: 200,
@@ -1753,13 +1771,13 @@ pub unsafe extern "C" fn web_error_text(
     status_code: i32,
     content: *const c_char,
 ) -> *mut ResponseObject {
-    let content_str = if content.is_null() {
-        String::new()
+    let content_bytes = if content.is_null() {
+        Vec::new()
     } else {
-        unsafe { cstr_to_string(content) }
+        unsafe { CStr::from_ptr(content).to_bytes().to_owned() }
     };
 
-    let (body_ptr, body_len) = leak_string_as_body(content_str);
+    let (body_ptr, body_len) = leak_bytes_as_body(content_bytes);
 
     let response = Box::new(ResponseObject {
         status_code,
@@ -1779,13 +1797,13 @@ pub unsafe extern "C" fn web_error_page(
     status_code: i32,
     content: *const c_char,
 ) -> *mut ResponseObject {
-    let content_str = if content.is_null() {
-        String::new()
+    let content_bytes = if content.is_null() {
+        Vec::new()
     } else {
-        unsafe { cstr_to_string(content) }
+        unsafe { CStr::from_ptr(content).to_bytes().to_owned() }
     };
 
-    let (body_ptr, body_len) = leak_string_as_body(content_str);
+    let (body_ptr, body_len) = leak_bytes_as_body(content_bytes);
 
     let response = Box::new(ResponseObject {
         status_code,
@@ -1839,9 +1857,14 @@ pub unsafe extern "C" fn io_read_file(filename: *const c_char) -> *mut c_void {
         return qs_result_err(msg as *mut c_void);
     }
 
-    let filename_str = unsafe { cstr_to_string(filename) };
+    let Some(path) = cstr_to_path(filename) else {
+        let msg = std::ffi::CString::new("io.read received invalid filename")
+            .unwrap()
+            .into_raw();
+        return qs_result_err(msg as *mut c_void);
+    };
 
-    let read_result = block_on_in_runtime(async { tokio::fs::read_to_string(&filename_str).await });
+    let read_result = block_on_in_runtime(async { tokio::fs::read_to_string(path.as_ref()).await });
 
     match read_result {
         Ok(content) => {
@@ -1871,10 +1894,16 @@ pub unsafe extern "C" fn io_write_file(
         return qs_result_err(msg as *mut c_void);
     }
 
-    let filename_str = unsafe { cstr_to_string(filename) };
-    let content_str = unsafe { cstr_to_string(content) };
+    let Some(path) = cstr_to_path(filename) else {
+        let msg = std::ffi::CString::new("io.write received invalid filename")
+            .unwrap()
+            .into_raw();
+        return qs_result_err(msg as *mut c_void);
+    };
 
-    match block_on_in_runtime(async { tokio::fs::write(&filename_str, &content_str).await }) {
+    let content_bytes = unsafe { CStr::from_ptr(content).to_bytes() };
+
+    match block_on_in_runtime(async { tokio::fs::write(path.as_ref(), content_bytes).await }) {
         Ok(_) => {
             let ok_msg = std::ffi::CString::new("").unwrap().into_raw();
             qs_result_ok(ok_msg as *mut c_void)
@@ -1894,8 +1923,8 @@ pub unsafe extern "C" fn qs_panic(message: *const c_char) -> ! {
     if message.is_null() {
         eprintln!("QuickScript panic");
     } else {
-        let text = CStr::from_ptr(message).to_string_lossy();
-        eprintln!("QuickScript panic: {text}");
+        let text = CStr::from_ptr(message).to_str().unwrap_or_default();
+        eprintln!("QuickScript panic: {text}",);
     }
     std::process::exit(70);
 }
@@ -1910,24 +1939,29 @@ pub unsafe extern "C" fn io_exit(code: f64) {
 }
 
 // MIME type detection based on file extension
-fn get_mime_type(filename: &str) -> &'static str {
-    let extension = filename.split('.').next_back().unwrap_or("").to_lowercase();
-    match extension.as_str() {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" => "application/javascript; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
-        "xml" => "application/xml; charset=utf-8",
-        "txt" => "text/plain; charset=utf-8",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "mov" => "video/quicktime",
-        "mp4" => "video/mp4",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "pdf" => "application/pdf",
-        "zip" => "application/zip",
+fn get_mime_type(path: &Path) -> &'static str {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return "application/octet-stream";
+    };
+
+    match ext {
+        e if e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm") => {
+            "text/html; charset=utf-8"
+        }
+        e if e.eq_ignore_ascii_case("css") => "text/css; charset=utf-8",
+        e if e.eq_ignore_ascii_case("js") => "application/javascript; charset=utf-8",
+        e if e.eq_ignore_ascii_case("json") => "application/json; charset=utf-8",
+        e if e.eq_ignore_ascii_case("xml") => "application/xml; charset=utf-8",
+        e if e.eq_ignore_ascii_case("txt") => "text/plain; charset=utf-8",
+        e if e.eq_ignore_ascii_case("png") => "image/png",
+        e if e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg") => "image/jpeg",
+        e if e.eq_ignore_ascii_case("gif") => "image/gif",
+        e if e.eq_ignore_ascii_case("mov") => "video/quicktime",
+        e if e.eq_ignore_ascii_case("mp4") => "video/mp4",
+        e if e.eq_ignore_ascii_case("svg") => "image/svg+xml",
+        e if e.eq_ignore_ascii_case("ico") => "image/x-icon",
+        e if e.eq_ignore_ascii_case("pdf") => "application/pdf",
+        e if e.eq_ignore_ascii_case("zip") => "application/zip",
         _ => "application/octet-stream",
     }
 }
@@ -1950,17 +1984,35 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
         return Box::into_raw(response);
     }
 
-    let mut filename_str = unsafe { cstr_to_string(filename) };
-    if filename_str.ends_with("/") {
-        filename_str.push_str("index.html");
+    let filename_cstr = unsafe { CStr::from_ptr(filename) };
+    let append_index = filename_cstr.to_bytes().ends_with(b"/");
+
+    let Some(path_cow) = cstr_to_path(filename) else {
+        let (body_ptr, body_len) = leak_string_as_body("File not found".to_string());
+        let response = Box::new(ResponseObject {
+            status_code: 404,
+            content_type: std::ffi::CString::new("text/plain; charset=utf-8")
+                .unwrap()
+                .into_raw(),
+            body: body_ptr,
+            body_len,
+            headers: std::ffi::CString::new("").unwrap().into_raw(),
+            missing_file_path: std::ptr::null_mut(),
+        });
+        return Box::into_raw(response);
+    };
+
+    let mut path_buf = path_cow.into_owned();
+    if append_index {
+        path_buf.push("index.html");
     }
 
     // Read file contents using the runtime helper, but expose a sync C ABI
-    let read_result = block_on_in_runtime(async { tokio::fs::read(&filename_str).await });
+    let read_result = block_on_in_runtime(async { tokio::fs::read(&path_buf).await });
 
     match read_result {
         Ok(content) => {
-            let mime_type = get_mime_type(&filename_str);
+            let mime_type = get_mime_type(&path_buf);
             let (body_ptr, body_len) = leak_bytes_as_body(content);
             let response = Box::new(ResponseObject {
                 status_code: 200,
@@ -1974,7 +2026,9 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
         }
         Err(err) => {
             let missing_ptr = if err.kind() == std::io::ErrorKind::NotFound {
-                std::ffi::CString::new(filename_str).unwrap().into_raw()
+                std::ffi::CString::new(path_buf.to_string_lossy().into_owned())
+                    .unwrap()
+                    .into_raw()
             } else {
                 std::ptr::null_mut()
             };
@@ -2002,11 +2056,11 @@ pub unsafe extern "C" fn web_file_not_found(
     if response.is_null() {
         // No original response; fall back to default handling
         let body = if fallback.is_null() {
-            String::from("Not Found")
+            b"Not Found".to_vec()
         } else {
-            cstr_to_string(fallback)
+            CStr::from_ptr(fallback).to_bytes().to_owned()
         };
-        let (body_ptr, body_len) = leak_string_as_body(body);
+        let (body_ptr, body_len) = leak_bytes_as_body(body);
         let response = Box::new(ResponseObject {
             status_code: 404,
             content_type: std::ffi::CString::new("text/plain; charset=utf-8")
@@ -2029,9 +2083,9 @@ pub unsafe extern "C" fn web_file_not_found(
     let fallback_path = if fallback.is_null() {
         None
     } else {
-        Some(cstr_to_string(fallback))
+        cstr_to_path(fallback).map(|p| p.into_owned())
     }
-    .filter(|s| !s.is_empty());
+    .filter(|p| !p.as_os_str().is_empty());
 
     let _ = ResponseObject::take_owned_string(&mut original.content_type);
     let _ = ResponseObject::take_owned_string(&mut original.headers);
@@ -2040,7 +2094,7 @@ pub unsafe extern "C" fn web_file_not_found(
     drop(original);
 
     if let Some(path) = fallback_path {
-        if !path.is_empty() {
+        if !path.as_os_str().is_empty() {
             if let Ok(content) = block_on_in_runtime(async { tokio::fs::read(&path).await }) {
                 let mime_type = get_mime_type(&path);
                 let (body_ptr, body_len) = leak_bytes_as_body(content);
@@ -2124,30 +2178,9 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i32, callback: *const c_v
         .set(callback_addr)
         .expect("Callback already set");
 
-    if std::env::var("QS_TEST_REQUEST").is_ok() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("failed to build test runtime");
-        let request = HyperRequest::builder()
-            .method("GET")
-            .uri("http://localhost/trignomtry")
-            .body(Body::empty())
-            .expect("failed to build request");
-        for n in 0..2 {
-            let request = HyperRequest::builder()
-                .method("GET")
-                .uri("http://localhost/trignomtry")
-                .body(Body::empty())
-                .expect("failed to build request");
-            let response = rt
-                .block_on(handle_hyper_request(request, callback_addr))
-                .expect("handler error");
-            eprintln!("test handler #{} status: {}", n + 1, response.status());
-        }
-        return;
-    }
+    // Mark the server as running immediately so the main thread parks
+    // even if the async task hasn't been polled yet.
+    SERVER_RUNNING.store(true, Ordering::Relaxed);
 
     // Use same runtime configuration as original
     let cpu_count = std::thread::available_parallelism()
@@ -2165,7 +2198,6 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i32, callback: *const c_v
                 return;
             }
         };
-        SERVER_RUNNING.store(true, Ordering::Relaxed);
 
         let make_svc = make_service_fn(move |_conn| {
             let handler_addr = callback_addr;
@@ -2174,6 +2206,9 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i32, callback: *const c_v
                     handle_hyper_request(req, handler_addr)
                 }))
             }
+        });
+        tokio::spawn(async move {
+            std::thread::park();
         });
 
         if let Err(e) = hyper::Server::bind(&socket_addr).serve(make_svc).await {
