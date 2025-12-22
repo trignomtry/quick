@@ -22,7 +22,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin_ext: ""
             package: tar
-            rustflags: "-C target-feature=+crt-static -C link-arg=-static"
+            rustflags: ""
           - name: macos-arm64
             runner: macos-14
             os_id: darwin
@@ -77,8 +77,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install zstd
 
+      - name: Enable Rosetta for x86 build (macOS)
+        if: runner.os == 'macOS' && matrix.arch == 'x86_64'
+        run: softwareupdate --install-rosetta --agree-to-license
+
       - name: Install LLVM (Linux/macOS)
         if: runner.os != 'Windows'
+        env:
+          LLVM_ARCHIVE: ${{ (matrix.os_id == 'darwin' && matrix.arch == 'x86_64') && 'clang+llvm-18.1.4-x86_64-apple-darwin22.0.tar.xz' || '' }}
         run: |
           chmod +x scripts/vendor_llvm.sh
           LLVM_PREFIX="${{ github.workspace }}/llvm/install" LLVM_TAG="${{ env.LLVM_TAG }}" scripts/vendor_llvm.sh
