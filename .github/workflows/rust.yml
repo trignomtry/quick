@@ -62,6 +62,7 @@ jobs:
       - name: Install deps / vendor LLVM
         if: startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')
         shell: bash
+        working-directory: ${{ github.workspace }}
         run: |
           case "${{ matrix.os }}" in
             ubuntu-*)
@@ -74,7 +75,8 @@ jobs:
               ;;
           esac
 
-          LLVM_TAG=llvmorg-18.1.8 ./scripts/vendor_llvm.sh
+          chmod +x scripts/vendor_llvm.sh
+          LLVM_TAG=llvmorg-18.1.8 bash scripts/vendor_llvm.sh
           echo "LLVM_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/bin/llvm-config" >> "$GITHUB_ENV"
           echo "LLVM_SYS_181_PREFIX=${GITHUB_WORKSPACE}/llvm/install" >> "$GITHUB_ENV"
           echo "CC=clang" >> "$GITHUB_ENV"
@@ -82,10 +84,11 @@ jobs:
       - name: Install deps / vendor LLVM (Windows)
         if: startsWith(matrix.os, 'windows')
         shell: powershell
+        working-directory: ${{ github.workspace }}
         run: |
           choco install -y --no-progress ninja cmake git
           $env:LLVM_TAG="llvmorg-18.1.8"
-          ./scripts/vendor_llvm.ps1
+          powershell -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\scripts\vendor_llvm.ps1"
           "LLVM_CONFIG_PATH=$env:GITHUB_WORKSPACE\llvm\install\bin\llvm-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LLVM_SYS_181_PREFIX=$env:GITHUB_WORKSPACE\llvm\install" | Out-File -FilePath $env:GITHUB_ENV -Append
           "CC=cl" | Out-File -FilePath $env:GITHUB_ENV -Append
