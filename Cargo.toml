@@ -7,8 +7,14 @@ rust-version = "1.85"
 description = "The QuickScript CLI tool, inspired by cargo"
 
 [lib]
+name = "quick"
 path = "src/lib.rs"
-crate-type = ["rlib", "staticlib"]
+crate-type = ["staticlib"]
+required-features = ["runtime-lib"]
+
+[[bin]]
+name = "quick"
+path = "src/main.rs"
 
 [dependencies]
 actix = "0.13.5"

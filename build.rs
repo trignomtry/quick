@@ -102,6 +102,7 @@ fn main() {
     emit_system_libraries(&llvm_config, link_mode);
     emit_ldflags(&llvm_config, link_mode);
     emit_additional_search_paths();
+    emit_forced_library_search_paths();
     emit_cxx_runtime();
 }
 
@@ -402,6 +403,19 @@ fn emit_additional_search_paths() {
         let dir = Path::new(path);
         if dir.exists() {
             println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+}
+
+fn emit_forced_library_search_paths() {
+    let mut seen = HashSet::new();
+
+    for lib in FORCED_LIBRARIES {
+        for dir in lib.search_dirs {
+            let path = Path::new(dir);
+            if path.exists() && seen.insert(path.to_path_buf()) {
+                println!("cargo:rustc-link-search=native={}", path.display());
+            }
         }
     }
 }

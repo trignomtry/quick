@@ -358,6 +358,7 @@ use inkwell::types::BasicTypeEnum;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
@@ -4559,10 +4560,41 @@ fn execute_build(filename: String, debug: bool) {
 
             let runtime_lib_path = build_dir.join("libquick.a");
             if !runtime_lib_path.exists() {
-                eprintln!(
-                    r"Missing build/libquick.a. Prebuild the runtime once with \`cargo build --release --lib --features runtime-lib\` on your host and copy target/release/libquick.a to build/libquick.a."
-                );
-                std::process::exit(65);
+                eprintln!("Missing build/libquick.a; building runtime-lib once...");
+
+                let status = Command::new("cargo")
+                    .args(["build", "--release", "--lib", "--features", "runtime-lib"])
+                    .status();
+
+                match status {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        eprintln!("cargo build for runtime-lib failed with status {status}");
+                        std::process::exit(65);
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to invoke cargo to build runtime-lib: {err}");
+                        std::process::exit(65);
+                    }
+                }
+
+                let target_dir = env::var("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("target"));
+
+                let Some(runtime_src) = find_runtime_archive(&target_dir) else {
+                    eprintln!("Unable to locate libquick.a after runtime build in {target_dir:?}");
+                    std::process::exit(65);
+                };
+
+                if let Err(err) = fs::copy(&runtime_src, &runtime_lib_path) {
+                    eprintln!(
+                        "Failed to copy runtime archive from {} to {}: {err}",
+                        runtime_src.display(),
+                        runtime_lib_path.display()
+                    );
+                    std::process::exit(65);
+                }
             }
 
             let mut link_args = vec![
@@ -4926,6 +4958,27 @@ fn format_float(lexeme: &str) -> String {
     } else {
         format!("{}.0", lexeme)
     }
+}
+
+fn find_runtime_archive(target_dir: &Path) -> Option<PathBuf> {
+    let release_dir = target_dir.join("release");
+    let direct = release_dir.join("libquick.a");
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    fs::read_dir(&release_dir).ok()?.find_map(|entry| {
+        let path = entry.ok()?.path();
+        let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
+            return None;
+        };
+
+        if file_name.starts_with("libquick") && path.extension().is_some_and(|ext| ext == "a") {
+            Some(path)
+        } else {
+            None
+        }
+    })
 }
 
 fn tokenize(chars: Vec<char>) -> Vec<Token> {
