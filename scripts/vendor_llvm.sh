@@ -106,6 +106,21 @@ for archive in "${archives[@]}"; do
 done
 
 if [ -z "${archive_file}" ]; then
+  if [ "${os}" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+    echo "No prebuilt LLVM archive found; falling back to Homebrew llvm@18" >&2
+    brew install llvm@18
+    brew_prefix=$(brew --prefix llvm@18)
+    if [ -z "${brew_prefix}" ] || [ ! -d "${brew_prefix}" ]; then
+      echo "Homebrew llvm@18 prefix not found" >&2
+      exit 1
+    fi
+    rm -rf "${PREFIX}"
+    mkdir -p "${PREFIX}"
+    cp -R "${brew_prefix}"/* "${PREFIX}/"
+    echo "LLVM installed via Homebrew to ${PREFIX}" >&2
+    exit 0
+  fi
+
   echo "Failed to download LLVM archive; tried: ${archives[*]}" >&2
   exit 1
 fi

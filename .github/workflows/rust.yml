@@ -76,7 +76,7 @@ jobs:
           esac
 
           chmod +x "$GITHUB_WORKSPACE/scripts/vendor_llvm.sh"
-          LLVM_TAG=llvmorg-18.1.8 bash "$GITHUB_WORKSPACE/scripts/vendor_llvm.sh"
+          LLVM_TAG=llvmorg-18.1.4 bash "$GITHUB_WORKSPACE/scripts/vendor_llvm.sh"
           echo "LLVM_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/bin/llvm-config" >> "$GITHUB_ENV"
           echo "LLVM_SYS_181_PREFIX=${GITHUB_WORKSPACE}/llvm/install" >> "$GITHUB_ENV"
           echo "CC=clang" >> "$GITHUB_ENV"
@@ -87,7 +87,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           choco install -y --no-progress ninja cmake git
-          $env:LLVM_TAG="llvmorg-18.1.8"
+          $env:LLVM_TAG="llvmorg-18.1.4"
           powershell -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\scripts\vendor_llvm.ps1"
           "LLVM_CONFIG_PATH=$env:GITHUB_WORKSPACE\llvm\install\bin\llvm-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LLVM_SYS_181_PREFIX=$env:GITHUB_WORKSPACE\llvm\install" | Out-File -FilePath $env:GITHUB_ENV -Append
