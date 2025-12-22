@@ -1,12 +1,7 @@
 name: Rust
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,17 +59,17 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install build dependencies (Linux)
-        if: matrix.os_id == 'linux'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential musl-tools zstd libzstd-dev xz-utils pkg-config
 
       - name: Install build dependencies (macOS)
-        if: matrix.os_id == 'darwin'
+        if: runner.os == 'macOS'
         run: brew install zstd
 
       - name: Install LLVM (Linux/macOS)
-        if: matrix.os_id != 'windows'
+        if: runner.os != 'Windows'
         run: |
           chmod +x scripts/vendor_llvm.sh
           LLVM_PREFIX="${{ github.workspace }}/llvm/install" LLVM_TAG="${{ env.LLVM_TAG }}" scripts/vendor_llvm.sh

@@ -70,19 +70,31 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", llvm_config.display());
 
-    let (link_mode, libraries) = match collect_library_paths(&llvm_config, LinkMode::Static) {
-        Ok(libs) if !libs.is_empty() => (LinkMode::Static, libs),
-        _ => {
+    let static_libs = collect_library_paths(&llvm_config, LinkMode::Static).ok();
+    let missing_forced_static =
+        static_libs.is_some() && missing_forced_static_archives();
+    let use_static =
+        static_libs.as_ref().is_some_and(|libs| !libs.is_empty()) && !missing_forced_static;
+
+    let (link_mode, libraries) = if use_static {
+        (LinkMode::Static, static_libs.unwrap())
+    } else {
+        if missing_forced_static {
+            println!(
+                "cargo:warning=Missing static copies of forced libraries; using shared LLVM libraries."
+            );
+        } else {
             println!(
                 "cargo:warning=Falling back to shared LLVM libraries; static archives were not found."
             );
-            let libs = collect_library_paths(&llvm_config, LinkMode::Dynamic)
-                .expect("Failed to query shared LLVM libraries via llvm-config");
-            if libs.is_empty() {
-                panic!("llvm-config did not return any libraries to link against");
-            }
-            (LinkMode::Dynamic, libs)
         }
+
+        let libs = collect_library_paths(&llvm_config, LinkMode::Dynamic)
+            .expect("Failed to query shared LLVM libraries via llvm-config");
+        if libs.is_empty() {
+            panic!("llvm-config did not return any libraries to link against");
+        }
+        (LinkMode::Dynamic, libs)
     };
 
     emit_library_search_paths(&libraries);
@@ -341,6 +353,16 @@ fn is_skipped_system_lib(name: &str) -> bool {
     SKIP_SYSTEM_LIBS
         .iter()
         .any(|&skip| name == skip || name.starts_with(&format!("{skip}.")))
+}
+
+fn missing_forced_static_archives() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+
+    FORCED_LIBRARIES
+        .iter()
+        .any(|lib| locate_static_archive(lib, lib.name).is_none())
 }
 
 fn emit_ldflags(llvm_config: &Path, mode: LinkMode) {
