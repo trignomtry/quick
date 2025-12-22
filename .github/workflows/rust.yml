@@ -75,8 +75,8 @@ jobs:
               ;;
           esac
 
-          chmod +x scripts/vendor_llvm.sh
-          LLVM_TAG=llvmorg-18.1.8 bash scripts/vendor_llvm.sh
+          chmod +x "$GITHUB_WORKSPACE/scripts/vendor_llvm.sh"
+          LLVM_TAG=llvmorg-18.1.8 bash "$GITHUB_WORKSPACE/scripts/vendor_llvm.sh"
           echo "LLVM_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/bin/llvm-config" >> "$GITHUB_ENV"
           echo "LLVM_SYS_181_PREFIX=${GITHUB_WORKSPACE}/llvm/install" >> "$GITHUB_ENV"
           echo "CC=clang" >> "$GITHUB_ENV"
