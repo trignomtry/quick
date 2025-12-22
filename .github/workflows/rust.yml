@@ -32,7 +32,7 @@ jobs:
             package: tar
             rustflags: ""
           - name: macos-x86_64
-            runner: macos-12
+            runner: macos-14
             os_id: darwin
             arch: x86_64
             target: x86_64-apple-darwin
@@ -71,7 +71,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential musl-tools zstd libzstd-dev xz-utils pkg-config
+          sudo apt-get install -y build-essential musl-tools zstd libzstd-dev xz-utils pkg-config libtinfo5 libncurses5
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
