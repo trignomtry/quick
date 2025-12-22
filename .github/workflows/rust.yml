@@ -32,7 +32,7 @@ jobs:
             package: tar
             rustflags: ""
           - name: macos-x86_64
-            runner: macos-13
+            runner: macos-12
             os_id: darwin
             arch: x86_64
             target: x86_64-apple-darwin
@@ -58,6 +58,12 @@ jobs:
           toolchain: nightly
           targets: ${{ matrix.target }}
 
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -82,6 +88,12 @@ jobs:
           LLVM_TAG: ${{ env.LLVM_TAG }}
         run: |
           & scripts/vendor_llvm.ps1
+
+      - name: Install libxml2 (Windows)
+        if: matrix.os_id == 'windows'
+        shell: pwsh
+        run: |
+          choco install -y libxml2
 
       - name: Build release
         env:
