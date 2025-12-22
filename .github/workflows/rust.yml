@@ -73,10 +73,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential musl-tools zstd libzstd-dev xz-utils pkg-config libtinfo5 libncurses5
 
-      - name: Install build dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install zstd
-
       - name: Enable Rosetta for x86 build (macOS)
         if: runner.os == 'macOS' && matrix.arch == 'x86_64'
         run: softwareupdate --install-rosetta --agree-to-license
@@ -120,6 +116,9 @@ jobs:
           LLVM_PREFIX: ${{ github.workspace }}/llvm/install
           LLVM_SYS_181_PREFIX: ${{ github.workspace }}/llvm/install
           LLVM_CONFIG_PATH: ${{ github.workspace }}/llvm/install/bin/llvm-config
+          LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
