@@ -890,20 +890,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quick-runtime"
-version = "0.1.0"
-dependencies = [
- "actix",
- "clap",
- "hyper 0.14.32",
- "inkwell",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

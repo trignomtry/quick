@@ -1,131 +1,174 @@
-name: Release
+name: Rust
 
 on:
+  release:
+    types: [published]
+  workflow_dispatch:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  LLVM_LINK_STATIC: "1"
-
-permissions:
-  contents: write
+  LLVM_TAG: llvmorg-18.1.4
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux
           - name: linux-x86_64
-            os: ubuntu-latest
+            runner: ubuntu-22.04
+            os_id: linux
+            arch: x86_64
             target: x86_64-unknown-linux-gnu
-            out: quick-linux-x86_64
-            bin: quick
-
-          # Windows
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            out: quick-windows-x86_64.exe
-            bin: quick.exe
-
-          # macOS Intel
-          - name: darwin-x86_64
-            os: macos-15-intel # Intel runners; avoids arm64-only Homebrew bottles
-            target: x86_64-apple-darwin
-            out: quick-darwin-x86_64
-            bin: quick
-
-          # macOS Apple Silicon
-          - name: darwin-arm64
-            os: macos-15-arm64
+            bin_ext: ""
+            package: tar
+            rustflags: "-C target-feature=+crt-static -C link-arg=-static"
+          - name: macos-arm64
+            runner: macos-14
+            os_id: darwin
+            arch: arm64
             target: aarch64-apple-darwin
-            out: quick-darwin-arm64
-            bin: quick
+            bin_ext: ""
+            package: tar
+            rustflags: ""
+          - name: macos-x86_64
+            runner: macos-13
+            os_id: darwin
+            arch: x86_64
+            target: x86_64-apple-darwin
+            bin_ext: ""
+            package: tar
+            rustflags: ""
+          - name: windows-x86_64
+            runner: windows-latest
+            os_id: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            bin_ext: ".exe"
+            package: zip
+            rustflags: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
-          override: true
+          toolchain: nightly
+          targets: ${{ matrix.target }}
 
-      - name: Install deps / vendor LLVM
-        if: startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')
-        shell: bash
-        working-directory: ${{ github.workspace }}
+      - name: Install build dependencies (Linux)
+        if: matrix.os_id == 'linux'
         run: |
-          case "${{ matrix.os }}" in
-            ubuntu-*)
-              sudo apt-get update
-              sudo apt-get install -y ninja-build cmake git python3 build-essential libzstd-dev
-              ;;
-            macos-*)
-              brew update
-              brew install ninja cmake git zstd
-              ;;
-          esac
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools zstd libzstd-dev xz-utils pkg-config
 
-          chmod +x "$GITHUB_WORKSPACE/scripts/vendor_llvm.sh"
-          LLVM_TAG=llvmorg-18.1.4 bash "$GITHUB_WORKSPACE/scripts/vendor_llvm.sh"
-          echo "LLVM_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/bin/llvm-config" >> "$GITHUB_ENV"
-          echo "LLVM_SYS_181_PREFIX=${GITHUB_WORKSPACE}/llvm/install" >> "$GITHUB_ENV"
-          echo "CC=clang" >> "$GITHUB_ENV"
-          brew_zstd_prefix=$(brew --prefix zstd)
-          echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/lib/pkgconfig:${brew_zstd_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-          echo "LIBRARY_PATH=${GITHUB_WORKSPACE}/llvm/install/lib:${brew_zstd_prefix}/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          if command -v pkg-config >/dev/null 2>&1; then
-            echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-          fi
-          echo "LIBRARY_PATH=${GITHUB_WORKSPACE}/llvm/install/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+      - name: Install build dependencies (macOS)
+        if: matrix.os_id == 'darwin'
+        run: brew install zstd
 
-      - name: Install deps / vendor LLVM (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: powershell
-        working-directory: ${{ github.workspace }}
+      - name: Install LLVM (Linux/macOS)
+        if: matrix.os_id != 'windows'
         run: |
-          choco install -y --no-progress ninja cmake git
-          $env:LLVM_TAG="llvmorg-18.1.4"
-          powershell -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\scripts\vendor_llvm.ps1"
-          "LLVM_CONFIG_PATH=$env:GITHUB_WORKSPACE\llvm\install\bin\llvm-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LLVM_SYS_181_PREFIX=$env:GITHUB_WORKSPACE\llvm\install" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CC=cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          chmod +x scripts/vendor_llvm.sh
+          LLVM_PREFIX="${{ github.workspace }}/llvm/install" LLVM_TAG="${{ env.LLVM_TAG }}" scripts/vendor_llvm.sh
 
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Extract version
-        shell: bash
+      - name: Install LLVM (Windows)
+        if: matrix.os_id == 'windows'
+        shell: pwsh
+        env:
+          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
+          LLVM_TAG: ${{ env.LLVM_TAG }}
         run: |
-          ver=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="quick").version')
-          echo "PKG_VERSION=${ver}" >> "$GITHUB_ENV"
-          echo "TAG_NAME=v${ver}" >> "$GITHUB_ENV"
+          & scripts/vendor_llvm.ps1
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Prepare artifact
-        shell: bash
+        env:
+          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
+          LLVM_SYS_181_PREFIX: ${{ github.workspace }}/llvm/install
+          LLVM_CONFIG_PATH: ${{ github.workspace }}/llvm/install/bin/llvm-config
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.out }}
-          if [ -f "${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.so" ]; then cp ${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.so dist/; fi
-          if [ -f "${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.dylib" ]; then cp ${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.dylib dist/; fi
-          cd dist
-          tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.out }} libLLVM.* 2>/dev/null || tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.out }}
+          cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: github.event_name != 'pull_request'
+      - name: Package artifact (Linux/macOS)
+        if: matrix.os_id != 'windows'
+        id: package-unix
+        run: |
+          set -euo pipefail
+          ARTIFACT_BASE="quick-${{ matrix.os_id }}-${{ matrix.arch }}"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          BIN_SRC="${TARGET_DIR}/quick${{ matrix.bin_ext }}"
+          OUT_DIR="${GITHUB_WORKSPACE}/dist/${{ matrix.name }}"
+          mkdir -p "${OUT_DIR}"
+          cp "${BIN_SRC}" "${OUT_DIR}/${ARTIFACT_BASE}${{ matrix.bin_ext }}"
+
+          LIB_SRC=""
+          if compgen -G "${TARGET_DIR}/libquick.*" > /dev/null; then
+            LIB_SRC=$(ls "${TARGET_DIR}/libquick."* | head -n1)
+          elif compgen -G "${TARGET_DIR}/quick.*" > /dev/null; then
+            LIB_SRC=$(ls "${TARGET_DIR}/quick."* | head -n1)
+          fi
+
+          if [ -n "${LIB_SRC}" ]; then
+            cp "${LIB_SRC}" "${OUT_DIR}/$(basename "${LIB_SRC}")"
+            EXTRA="$(basename "${LIB_SRC}")"
+          else
+            EXTRA=""
+          fi
+
+          if [ -n "${EXTRA}" ]; then
+            tar -czf "${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" -C "${OUT_DIR}" "${ARTIFACT_BASE}${{ matrix.bin_ext }}" "${EXTRA}"
+          else
+            tar -czf "${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" -C "${OUT_DIR}" "${ARTIFACT_BASE}${{ matrix.bin_ext }}"
+          fi
+          echo "asset=${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Package artifact (Windows)
+        if: matrix.os_id == 'windows'
+        id: package-win
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactBase = "quick-${{ matrix.os_id }}-${{ matrix.arch }}"
+          $targetDir = Join-Path $env:GITHUB_WORKSPACE "target/${{ matrix.target }}/release"
+          $outDir = Join-Path $env:GITHUB_WORKSPACE "dist/${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $binSrc = Join-Path $targetDir "quick${{ matrix.bin_ext }}"
+          Copy-Item $binSrc (Join-Path $outDir "$artifactBase${{ matrix.bin_ext }}")
+
+          $libSrc = Get-ChildItem -Path $targetDir -Filter "libquick.*" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $libSrc) {
+            $libSrc = Get-ChildItem -Path $targetDir -Filter "quick.*" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+
+          $entries = @((Join-Path $outDir "$artifactBase${{ matrix.bin_ext }}"))
+          if ($libSrc) {
+            Copy-Item $libSrc.FullName (Join-Path $outDir $libSrc.Name)
+            $entries += (Join-Path $outDir $libSrc.Name)
+          }
+
+          $zipPath = Join-Path $outDir "$artifactBase.zip"
+          Compress-Archive -Path $entries -DestinationPath $zipPath -Force
+          "asset=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ env.TAG_NAME }}
-          files: dist/*.tar.gz
+          name: ${{ matrix.name }}
+          path: ${{ steps.package-unix.outputs.asset || steps.package-win.outputs.asset }}
+
+      - name: Publish release asset
+        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package-unix.outputs.asset || steps.package-win.outputs.asset }}
+          fail_on_unmatched_files: true
