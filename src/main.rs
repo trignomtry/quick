@@ -23,7 +23,7 @@ unsafe extern "C" {
     fn srand(seed: u32);
     fn fdopen(fd: i32, mode: *const i8) -> *mut std::ffi::c_void;
     fn fopen(filename: *const i8, mode: *const i8) -> *mut std::ffi::c_void;
-    fn fwrite(
+    fn fwrite( 
         ptr: *const std::ffi::c_void,
         size: usize,
         count: usize,
