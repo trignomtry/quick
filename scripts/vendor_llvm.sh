@@ -8,54 +8,83 @@ PREFIX=${LLVM_PREFIX:-$(pwd)/llvm/install}
 os=$(uname -s)
 arch=$(uname -m)
 
-case "${os}" in
-  Linux)
-    case "${arch}" in
-      x86_64|amd64)
-        archive="clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
-        ;;
-      aarch64|arm64)
-        archive="clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu.tar.xz"
-        ;;
-      *)
-        echo "Unsupported Linux arch: ${arch}" >&2
-        exit 1
-        ;;
-    esac
-    ;;
-  Darwin)
-    case "${arch}" in
-      arm64)
-        archive="clang+llvm-${LLVM_VERSION}-arm64-apple-darwin23.0.tar.xz"
-        ;;
-      x86_64)
-        archive="clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin20.0.tar.xz"
-        ;;
-      *)
-        echo "Unsupported macOS arch: ${arch}" >&2
-        exit 1
-        ;;
-    esac
-    ;;
-  *)
-    echo "Unsupported OS: ${os}" >&2
-    exit 1
-    ;;
-esac
+if [ -n "${LLVM_ARCHIVE:-}" ]; then
+  archives=("${LLVM_ARCHIVE}")
+else
+  case "${os}" in
+    Linux)
+      case "${arch}" in
+        x86_64|amd64)
+          archives=(
+            "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu.tar.xz"
+          )
+          ;;
+        aarch64|arm64)
+          archives=(
+            "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu-ubuntu-22.04.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu-ubuntu-20.04.tar.xz"
+          )
+          ;;
+        *)
+          echo "Unsupported Linux arch: ${arch}" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    Darwin)
+      case "${arch}" in
+        arm64)
+          archives=(
+            "clang+llvm-${LLVM_VERSION}-arm64-apple-darwin23.0.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-arm64-apple-darwin22.0.tar.xz"
+          )
+          ;;
+        x86_64)
+          archives=(
+            "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin22.0.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin21.0.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin20.0.tar.xz"
+          )
+          ;;
+        *)
+          echo "Unsupported macOS arch: ${arch}" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      echo "Unsupported OS: ${os}" >&2
+      exit 1
+      ;;
+  esac
+fi
 
-url="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/${archive}"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
 
-echo "Downloading LLVM (${LLVM_VERSION}) from ${url}" >&2
-if ! curl -fsSL "${url}" -o "${tmpdir}/${archive}"; then
-  echo "Failed to download ${url}" >&2
+archive_file=""
+for archive in "${archives[@]}"; do
+  url="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/${archive}"
+  echo "Trying LLVM download: ${url}" >&2
+  if curl -fsSL "${url}" -o "${tmpdir}/${archive}"; then
+    archive_file="${tmpdir}/${archive}"
+    break
+  else
+    echo "Download failed for ${archive}, trying next candidate" >&2
+  fi
+done
+
+if [ -z "${archive_file}" ]; then
+  echo "Failed to download LLVM archive; tried: ${archives[*]}" >&2
   exit 1
 fi
 
-echo "Extracting ${archive}" >&2
-if ! tar -xJf "${tmpdir}/${archive}" -C "${tmpdir}"; then
-  echo "Failed to extract ${archive}" >&2
+echo "Extracting $(basename "${archive_file}")" >&2
+if ! tar -xJf "${archive_file}" -C "${tmpdir}"; then
+  echo "Failed to extract ${archive_file}" >&2
   exit 1
 fi
 
