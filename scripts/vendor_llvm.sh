@@ -141,4 +141,9 @@ rm -rf "${PREFIX}"
 mkdir -p "${PREFIX}"
 cp -R "${extracted_dir}"/* "${PREFIX}/"
 
+if [ ! -x "${PREFIX}/bin/llvm-config" ]; then
+  echo "llvm-config not found under ${PREFIX}; installation incomplete" >&2
+  exit 1
+fi
+
 echo "LLVM installed to ${PREFIX}" >&2

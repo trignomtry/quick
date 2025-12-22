@@ -67,7 +67,7 @@ jobs:
           case "${{ matrix.os }}" in
             ubuntu-*)
               sudo apt-get update
-              sudo apt-get install -y ninja-build cmake git python3 build-essential
+              sudo apt-get install -y ninja-build cmake git python3 build-essential libzstd-dev
               ;;
             macos-*)
               brew update
@@ -80,6 +80,13 @@ jobs:
           echo "LLVM_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/bin/llvm-config" >> "$GITHUB_ENV"
           echo "LLVM_SYS_181_PREFIX=${GITHUB_WORKSPACE}/llvm/install" >> "$GITHUB_ENV"
           echo "CC=clang" >> "$GITHUB_ENV"
+          brew_zstd_prefix=$(brew --prefix zstd)
+          echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/lib/pkgconfig:${brew_zstd_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=${GITHUB_WORKSPACE}/llvm/install/lib:${brew_zstd_prefix}/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          if command -v pkg-config >/dev/null 2>&1; then
+            echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          fi
+          echo "LIBRARY_PATH=${GITHUB_WORKSPACE}/llvm/install/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Install deps / vendor LLVM (Windows)
         if: startsWith(matrix.os, 'windows')
