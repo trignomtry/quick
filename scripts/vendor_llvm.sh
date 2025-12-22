@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LLVM_TAG=${LLVM_TAG:-llvmorg-18.1.8}
+LLVM_TAG=${LLVM_TAG:-llvmorg-18.1.4}
 LLVM_VERSION=${LLVM_TAG#llvmorg-}
 PREFIX=${LLVM_PREFIX:-$(pwd)/llvm/install}
 
@@ -22,6 +22,7 @@ else
           fallback_archives=(
             "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-18.04.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu.tar.xz"
           )
           ;;
@@ -31,6 +32,7 @@ else
             "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu.tar.xz"
             "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu-ubuntu-22.04.tar.xz"
             "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu-ubuntu-20.04.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu-ubuntu-18.04.tar.xz"
           )
           ;;
         *)
@@ -54,6 +56,7 @@ else
             "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin22.0.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin21.0.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin20.0.tar.xz"
+            "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin19.0.tar.xz"
           )
           ;;
         *)
