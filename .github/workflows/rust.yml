@@ -62,6 +62,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /opt/hostedtoolcache/go /opt/hostedtoolcache/Python /opt/hostedtoolcache/Ruby || true
+          sudo rm -rf /opt/google/chrome /usr/local/lib/android /usr/local/share/boost /home/linuxbrew || true
+          docker system prune -af || true
           df -h
 
       - name: Install build dependencies (Linux)
@@ -79,6 +82,17 @@ jobs:
         run: |
           chmod +x scripts/vendor_llvm.sh
           LLVM_PREFIX="${{ github.workspace }}/llvm/install" LLVM_TAG="${{ env.LLVM_TAG }}" scripts/vendor_llvm.sh
+
+      - name: Verify LLVM install
+        if: runner.os != 'Windows'
+        run: |
+          if [ -x "${{ github.workspace }}/llvm/install/bin/llvm-config" ]; then
+            "${{ github.workspace }}/llvm/install/bin/llvm-config" --version
+            echo "${{ github.workspace }}/llvm/install/bin" >> "$GITHUB_PATH"
+          else
+            echo "llvm-config not found under vendor prefix" >&2
+            exit 1
+          fi
 
       - name: Install LLVM (Windows)
         if: matrix.os_id == 'windows'
