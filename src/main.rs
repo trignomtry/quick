@@ -2,7 +2,7 @@ mod compiler;
 mod parser;
 use crate::TokenKind::*;
 use clap::Parser as Clap;
-use compiler::Compiler;
+use compiler::{CodegenMode, Compiler};
 use parser::Parser;
 unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
@@ -362,6 +362,7 @@ use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
 use std::ops::Index;
+use std::process::Command;
 use std::ptr::{self, NonNull};
 
 use std::convert::Infallible;
@@ -454,6 +455,29 @@ fn ensure_llvm_ready() {
             LLVMLinkInMCJIT();
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_deployment_target() -> Option<String> {
+    if let Ok(val) = env::var("MACOSX_DEPLOYMENT_TARGET") {
+        if !val.trim().is_empty() {
+            return Some(val);
+        }
+    }
+
+    if let Ok(output) = Command::new("sw_vers").arg("-productVersion").output() {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                let mut parts = text.trim().split('.').take(2).collect::<Vec<_>>();
+                if parts.len() == 1 {
+                    parts.push("0");
+                }
+                return Some(parts.join("."));
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -4254,6 +4278,7 @@ fn else_certifies(elses: &Option<Box<Instruction>>) -> bool {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clap, Debug)]
 #[command(about, long_about = None, subcommand_required = false, arg_required_else_help = false)]
 struct Args {
@@ -4265,9 +4290,13 @@ struct Args {
     command: Option<Commands>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clap, Debug)]
 enum Commands {
     Run {
+        filename: Option<String>,
+    },
+    Build {
         filename: Option<String>,
     },
     Format {
@@ -4277,6 +4306,7 @@ enum Commands {
     Fallback(Vec<String>),
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn execute_run(filename: String, debug: bool) {
     let Ok(contents) = std::fs::read_to_string(&filename) else {
         eprintln!("Os error while reading file {filename}. Please try again later");
@@ -4367,7 +4397,7 @@ fn execute_run(filename: String, debug: bool) {
                 srand(now as u32);
             }
             let sum = codegen
-                .run_code()
+                .run_code(CodegenMode::Jit)
                 .ok_or("Unable to JIT compile code")
                 .unwrap();
             if debug {
@@ -4393,6 +4423,202 @@ fn execute_run(filename: String, debug: bool) {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
+fn execute_build(filename: String, debug: bool) {
+    let Ok(contents) = std::fs::read_to_string(&filename) else {
+        eprintln!("Os error while reading file {filename}. Please try again later");
+        std::process::exit(70);
+    };
+
+    let tokens = tokenize(contents.chars().collect());
+
+    if tokens.iter().any(|t| matches!(t.kind, Error(_, _))) {
+        for t in tokens.iter() {
+            t.print();
+        }
+        std::process::exit(65);
+    }
+
+    let mut parser = Parser::new(tokens);
+    match parser.parse_program() {
+        Ok(p) => {
+            for ins in p.clone() {
+                if let Instruction::FunctionDef {
+                    name,
+                    params: _,
+                    return_type: _,
+                    body,
+                } = ins
+                {
+                    if !returns_on_all_paths(body) {
+                        eprintln!(
+                            "Body of function '{name}' does not return a value every time. Try adding `return none` at the end of the function"
+                        );
+                        std::process::exit(70);
+                    }
+                }
+            }
+
+            ensure_llvm_ready();
+            let context = inkwell::context::Context::create();
+            let module = context.create_module("sum");
+            let execution_engine = module
+                .create_jit_execution_engine(inkwell::OptimizationLevel::Aggressive)
+                .unwrap();
+            let initial_quick_types = parser.pctx.var_types.clone();
+            let parser_ctx = parser.pctx;
+            let warnings = parser_ctx.take_warnings();
+            for warning in warnings {
+                let reset = "\x1b[0m";
+                let line_color = "\x1b[1;37m";
+                let label_color = "\x1b[1;33m";
+                let message_color = "\x1b[33m";
+                let tip_label_color = "\x1b[1;33m";
+                let tip_color = "\x1b[36m";
+
+                let mut text = String::new();
+                if let Some(line) = warning.line {
+                    text.push_str(&format!("{line_color}[Line {line}]:{reset} "));
+                }
+                text.push_str(&format!(
+                    "{label_color}Warning:{reset} {message_color}{}{reset}",
+                    warning.message
+                ));
+                if let Some(note) = warning.note {
+                    if !note.is_empty() {
+                        text.push_str(&format!(
+                            "\n  {tip_label_color}Tip:{reset} {tip_color}{note}{reset}"
+                        ));
+                    }
+                }
+                eprintln!("{text}");
+            }
+
+            let codegen = Compiler {
+                context: &context,
+                module,
+                builder: context.create_builder(),
+                execution_engine,
+                instructions: p,
+                vars: RefCell::new(HashMap::new()),
+                var_types: RefCell::new(HashMap::new()),
+                quick_var_types: RefCell::new(initial_quick_types),
+                pctx: RefCell::new(parser_ctx),
+                current_module: RefCell::new(None),
+                closure_envs: RefCell::new(HashMap::new()),
+                current_function: RefCell::new(Vec::new()),
+                loop_stack: RefCell::new(Vec::new()),
+            };
+
+            unsafe {
+                let now = time(ptr::null_mut());
+                srand(now as u32);
+            }
+
+            if codegen.run_code(CodegenMode::EmitObject).is_none() {
+                eprintln!("Failed to lower program");
+                std::process::exit(65);
+            }
+
+            let build_dir = Path::new("build");
+            if let Err(err) = std::fs::create_dir_all(build_dir) {
+                eprintln!("Failed to create build directory: {err}");
+                std::process::exit(70);
+            }
+
+            if debug {
+                let _ = codegen.module.print_to_file(build_dir.join("ll.v"));
+            }
+
+            let triple = inkwell::targets::TargetMachine::get_default_triple();
+            let target = inkwell::targets::Target::from_triple(&triple).unwrap();
+            let cpu = inkwell::targets::TargetMachine::get_host_cpu_name();
+            let features = inkwell::targets::TargetMachine::get_host_cpu_features();
+            let machine = target
+                .create_target_machine(
+                    &triple,
+                    &cpu.to_string(),
+                    &features.to_string(),
+                    inkwell::OptimizationLevel::Aggressive,
+                    inkwell::targets::RelocMode::Default,
+                    inkwell::targets::CodeModel::Default,
+                )
+                .expect("Could not create target machine");
+
+            let obj_path = build_dir.join("program.o");
+            if let Err(err) = machine.write_to_file(
+                &codegen.module,
+                inkwell::targets::FileType::Object,
+                &obj_path,
+            ) {
+                eprintln!("Failed to emit object file: {err}");
+                std::process::exit(65);
+            }
+
+            let output_bin = build_dir.join("program");
+
+            let runtime_lib_path = build_dir.join("libquick.a");
+            if !runtime_lib_path.exists() {
+                eprintln!(
+                    r"Missing build/libquick.a. Prebuild the runtime once with \`cargo build --release --lib --features runtime-lib\` on your host and copy target/release/libquick.a to build/libquick.a."
+                );
+                std::process::exit(65);
+            }
+
+            let mut link_args = vec![
+                obj_path.to_string_lossy().to_string(),
+                runtime_lib_path.to_string_lossy().to_string(),
+                "-o".to_string(),
+                output_bin.to_string_lossy().to_string(),
+                "-lm".to_string(),
+                "-ldl".to_string(),
+                "-lpthread".to_string(),
+            ];
+
+            #[cfg(target_os = "macos")]
+            {
+                link_args.push("-framework".to_string());
+                link_args.push("CoreServices".to_string());
+
+                if let Some(target) = detect_macos_deployment_target() {
+                    link_args.push(format!("-mmacosx-version-min={target}"));
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                link_args.push("-Wl,-e,_qs_run_main".to_string());
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                link_args.push("-Wl,-e,qs_run_main".to_string());
+            }
+
+            let link_status = std::process::Command::new("cc").args(&link_args).status();
+
+            match link_status {
+                Ok(status) if status.success() => {
+                    eprintln!("Built {}/program", build_dir.display());
+                }
+                Ok(status) => {
+                    eprintln!("Linker failed with status {status}");
+                    std::process::exit(65);
+                }
+                Err(err) => {
+                    eprintln!("Failed to invoke linker: {err}");
+                    std::process::exit(65);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(65);
+        }
+    }
+}
+
+#[cfg(not(feature = "runtime-lib"))]
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -4404,6 +4630,10 @@ async fn main() {
         Commands::Run { filename } => {
             let filename = filename.unwrap_or("./src/main.qx".to_string());
             execute_run(filename, debug);
+        }
+        Commands::Build { filename } => {
+            let filename = filename.unwrap_or("./src/main.qx".to_string());
+            execute_build(filename, debug);
         }
         Commands::Fallback(mut extra) => {
             let filename = if extra.is_empty() {
@@ -4665,6 +4895,23 @@ async fn main() {
             std::fs::write(filename, final_output).unwrap();
         }
     }
+}
+
+#[cfg(feature = "runtime-lib")]
+fn main() {}
+
+#[cfg(feature = "runtime-lib")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qs_run_main() -> i32 {
+    unsafe extern "C" {
+        fn main() -> f64;
+    }
+
+    let res = unsafe { main() };
+    if SERVER_RUNNING.load(Ordering::Relaxed) {
+        std::thread::park();
+    }
+    res.round() as i32
 }
 
 type SumFunc = unsafe extern "C" fn() -> f64;

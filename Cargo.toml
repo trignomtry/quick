@@ -1,10 +1,17 @@
+[workspace]
+members = ["runtime"]
+
 [package]
 name = "quick"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Trig Northrup <northruptrig@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
 description = "The QuickScript CLI tool, inspired by cargo"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 actix = "0.13.5"
@@ -25,6 +32,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 clap = { version = "4.5.53", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[features]
+runtime-lib = []
 [profile.release]
 lto = true
 codegen-units = 1

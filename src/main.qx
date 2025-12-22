@@ -2,6 +2,10 @@ let maybe_val = Some("Hello, World!");
 let maybe_v = None;
 
 
-print maybe_val.unwrap()
-print maybe_v.unwrap()
+print maybe_val 
+print maybe_v
 print "Wow"
+print "runnning web server"
+io.listen(8080, fun(req: Request) {
+  return io.web().text(req.path)
+})

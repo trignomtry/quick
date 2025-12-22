@@ -12,6 +12,11 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
 
+pub enum CodegenMode {
+    Jit,
+    EmitObject,
+}
+
 pub struct Compiler<'ctx> {
     pub context: &'ctx context::Context,
     pub module: Module<'ctx>,
@@ -1202,7 +1207,7 @@ impl<'ctx> Compiler<'ctx> {
     // Module functions are compiled in run_code by synthesizing namespaced
     // Instruction::FunctionDef entries and feeding them through compile_instruction.
 
-    pub fn run_code(&self) -> Option<JitFunction<'_, SumFunc>> {
+    pub fn run_code(&self, mode: CodegenMode) -> Option<JitFunction<'_, SumFunc>> {
         let f64_type = self.context.f64_type();
         // Match SumFunc signature: three u64 parameters
         let fn_type = f64_type.fn_type(&[], false);
@@ -1348,227 +1353,234 @@ impl<'ctx> Compiler<'ctx> {
             return None;
         }
 
-        // Ensure C library functions are resolved at runtime to prevent segfaults
-        let strcmp_fn = self.get_or_create_strcmp();
-        self.execution_engine
-            .add_global_mapping(&strcmp_fn, strcmp as usize);
-        let strncmp_fn = self.get_or_create_strncmp();
-        self.execution_engine
-            .add_global_mapping(&strncmp_fn, strncmp as usize);
-        let printf_fn = self.get_or_create_printf();
-        self.execution_engine
-            .add_global_mapping(&printf_fn, printf as usize);
-        let malloc_fn = self.get_or_create_malloc();
-        self.execution_engine
-            .add_global_mapping(&malloc_fn, malloc as usize);
-        let strcpy_fn = self.get_or_create_strcpy();
-        self.execution_engine
-            .add_global_mapping(&strcpy_fn, strcpy as usize);
-        let option_unwrap_fn = self.get_or_create_option_unwrap();
-        self.execution_engine
-            .add_global_mapping(&option_unwrap_fn, qs_option_unwrap as usize);
-        let result_unwrap_fn = self.get_or_create_result_unwrap();
-        self.execution_engine
-            .add_global_mapping(&result_unwrap_fn, qs_result_unwrap as usize);
-        let strcat_fn = self.get_or_create_strcat_c();
-        self.execution_engine
-            .add_global_mapping(&strcat_fn, strcat as usize);
-        let strlen_fn = self.get_or_create_strlen();
-        self.execution_engine
-            .add_global_mapping(&strlen_fn, strlen as usize);
-        let realloc_fn = self.get_or_create_realloc();
-        self.execution_engine
-            .add_global_mapping(&realloc_fn, realloc as usize);
-        let atoi_fn = self.get_or_create_atoi();
-        self.execution_engine
-            .add_global_mapping(&atoi_fn, atoi as usize);
-        let strstr_fn = self.get_or_create_strstr();
-        self.execution_engine
-            .add_global_mapping(&strstr_fn, strstr as usize);
-        let str_replace_fn = self.get_or_create_str_replace();
-        self.execution_engine
-            .add_global_mapping(&str_replace_fn, qs_str_replace as usize);
-        let str_split_fn = self.get_or_create_str_split();
-        self.execution_engine
-            .add_global_mapping(&str_split_fn, qs_str_split as usize);
-        let list_join_fn = self.get_or_create_list_join();
-        self.execution_engine
-            .add_global_mapping(&list_join_fn, qs_list_join as usize);
-        let sprintf_fn = self.get_or_create_sprintf();
-        self.execution_engine
-            .add_global_mapping(&sprintf_fn, sprintf as usize);
-        let rand_fn = self.get_or_create_rand();
-        self.execution_engine
-            .add_global_mapping(&rand_fn, rand as usize);
-        let exit_fn = self.get_or_create_io_exit();
-        self.execution_engine
-            .add_global_mapping(&exit_fn, io_exit as usize);
+        if let CodegenMode::Jit = mode {
+            // Ensure C library functions are resolved at runtime to prevent segfaults
+            let strcmp_fn = self.get_or_create_strcmp();
+            self.execution_engine
+                .add_global_mapping(&strcmp_fn, strcmp as usize);
+            let strncmp_fn = self.get_or_create_strncmp();
+            self.execution_engine
+                .add_global_mapping(&strncmp_fn, strncmp as usize);
+            let printf_fn = self.get_or_create_printf();
+            self.execution_engine
+                .add_global_mapping(&printf_fn, printf as usize);
+            let malloc_fn = self.get_or_create_malloc();
+            self.execution_engine
+                .add_global_mapping(&malloc_fn, malloc as usize);
+            let strcpy_fn = self.get_or_create_strcpy();
+            self.execution_engine
+                .add_global_mapping(&strcpy_fn, strcpy as usize);
+            let option_unwrap_fn = self.get_or_create_option_unwrap();
+            self.execution_engine
+                .add_global_mapping(&option_unwrap_fn, qs_option_unwrap as usize);
+            let result_unwrap_fn = self.get_or_create_result_unwrap();
+            self.execution_engine
+                .add_global_mapping(&result_unwrap_fn, qs_result_unwrap as usize);
+            let strcat_fn = self.get_or_create_strcat_c();
+            self.execution_engine
+                .add_global_mapping(&strcat_fn, strcat as usize);
+            let strlen_fn = self.get_or_create_strlen();
+            self.execution_engine
+                .add_global_mapping(&strlen_fn, strlen as usize);
+            let realloc_fn = self.get_or_create_realloc();
+            self.execution_engine
+                .add_global_mapping(&realloc_fn, realloc as usize);
+            let atoi_fn = self.get_or_create_atoi();
+            self.execution_engine
+                .add_global_mapping(&atoi_fn, atoi as usize);
+            let strstr_fn = self.get_or_create_strstr();
+            self.execution_engine
+                .add_global_mapping(&strstr_fn, strstr as usize);
+            let str_replace_fn = self.get_or_create_str_replace();
+            self.execution_engine
+                .add_global_mapping(&str_replace_fn, qs_str_replace as usize);
+            let str_split_fn = self.get_or_create_str_split();
+            self.execution_engine
+                .add_global_mapping(&str_split_fn, qs_str_split as usize);
+            let list_join_fn = self.get_or_create_list_join();
+            self.execution_engine
+                .add_global_mapping(&list_join_fn, qs_list_join as usize);
+            let sprintf_fn = self.get_or_create_sprintf();
+            self.execution_engine
+                .add_global_mapping(&sprintf_fn, sprintf as usize);
+            let rand_fn = self.get_or_create_rand();
+            self.execution_engine
+                .add_global_mapping(&rand_fn, rand as usize);
+            let exit_fn = self.get_or_create_io_exit();
+            self.execution_engine
+                .add_global_mapping(&exit_fn, io_exit as usize);
 
-        let fopen_fn = self.get_or_create_fopen();
-        self.execution_engine
-            .add_global_mapping(&fopen_fn, fopen as usize);
-        let fread_fn = self.get_or_create_fread();
-        self.execution_engine
-            .add_global_mapping(&fread_fn, fread as usize);
-        let fwrite_fn = self.get_or_create_fwrite();
-        self.execution_engine
-            .add_global_mapping(&fwrite_fn, fwrite as usize);
-        let fclose_fn = self.get_or_create_fclose();
-        self.execution_engine
-            .add_global_mapping(&fclose_fn, fclose as usize);
-        let get_stdin_fn = self.get_or_create_get_stdin();
-        self.execution_engine
-            .add_global_mapping(&get_stdin_fn, get_stdin as usize);
+            let fopen_fn = self.get_or_create_fopen();
+            self.execution_engine
+                .add_global_mapping(&fopen_fn, fopen as usize);
+            let fread_fn = self.get_or_create_fread();
+            self.execution_engine
+                .add_global_mapping(&fread_fn, fread as usize);
+            let fwrite_fn = self.get_or_create_fwrite();
+            self.execution_engine
+                .add_global_mapping(&fwrite_fn, fwrite as usize);
+            let fclose_fn = self.get_or_create_fclose();
+            self.execution_engine
+                .add_global_mapping(&fclose_fn, fclose as usize);
+            let get_stdin_fn = self.get_or_create_get_stdin();
+            self.execution_engine
+                .add_global_mapping(&get_stdin_fn, get_stdin as usize);
 
-        let qs_lst_cb = self.get_or_create_qs_listen_with_callback();
-        self.execution_engine
-            .add_global_mapping(&qs_lst_cb, qs_listen_with_callback as usize);
+            let qs_lst_cb = self.get_or_create_qs_listen_with_callback();
+            self.execution_engine
+                .add_global_mapping(&qs_lst_cb, qs_listen_with_callback as usize);
 
-        // Map Request object functions
-        let create_req = self.get_or_create_create_request_object();
-        self.execution_engine
-            .add_global_mapping(&create_req, create_request_object as usize);
-        let get_method = self.get_or_create_get_request_method();
-        self.execution_engine
-            .add_global_mapping(&get_method, get_request_method as usize);
-        let get_path = self.get_or_create_get_request_path();
-        self.execution_engine
-            .add_global_mapping(&get_path, get_request_path as usize);
-        // Additional Request getters
-        let get_body = self.get_or_create_get_request_body();
-        self.execution_engine
-            .add_global_mapping(&get_body, get_request_body as usize);
-        let get_query = self.get_or_create_get_request_query();
-        self.execution_engine
-            .add_global_mapping(&get_query, get_request_query as usize);
-        let get_headers = self.get_or_create_get_request_headers();
-        self.execution_engine
-            .add_global_mapping(&get_headers, get_request_headers as usize);
+            // Map Request object functions
+            let create_req = self.get_or_create_create_request_object();
+            self.execution_engine
+                .add_global_mapping(&create_req, create_request_object as usize);
+            let get_method = self.get_or_create_get_request_method();
+            self.execution_engine
+                .add_global_mapping(&get_method, get_request_method as usize);
+            let get_path = self.get_or_create_get_request_path();
+            self.execution_engine
+                .add_global_mapping(&get_path, get_request_path as usize);
+            // Additional Request getters
+            let get_body = self.get_or_create_get_request_body();
+            self.execution_engine
+                .add_global_mapping(&get_body, get_request_body as usize);
+            let get_query = self.get_or_create_get_request_query();
+            self.execution_engine
+                .add_global_mapping(&get_query, get_request_query as usize);
+            let get_headers = self.get_or_create_get_request_headers();
+            self.execution_engine
+                .add_global_mapping(&get_headers, get_request_headers as usize);
 
-        // Map Web helper functions
-        let web_helper = self.get_or_create_web_helper();
-        self.execution_engine
-            .add_global_mapping(&web_helper, create_web_helper as usize);
-        let range_builder = self.get_or_create_range_builder();
-        self.execution_engine
-            .add_global_mapping(&range_builder, create_range_builder as usize);
-        let create_range_builder_to = self.get_or_create_range_builder_to();
-        self.execution_engine
-            .add_global_mapping(&create_range_builder_to, range_builder_to as usize);
-        self.execution_engine
-            .add_global_mapping(&range_builder, create_range_builder as usize);
-        let create_range_builder_from = self.get_or_create_range_builder_from();
-        self.execution_engine
-            .add_global_mapping(&create_range_builder_from, range_builder_from as usize);
+            // Map Web helper functions
+            let web_helper = self.get_or_create_web_helper();
+            self.execution_engine
+                .add_global_mapping(&web_helper, create_web_helper as usize);
+            let range_builder = self.get_or_create_range_builder();
+            self.execution_engine
+                .add_global_mapping(&range_builder, create_range_builder as usize);
+            let create_range_builder_to = self.get_or_create_range_builder_to();
+            self.execution_engine
+                .add_global_mapping(&create_range_builder_to, range_builder_to as usize);
+            self.execution_engine
+                .add_global_mapping(&range_builder, create_range_builder as usize);
+            let create_range_builder_from = self.get_or_create_range_builder_from();
+            self.execution_engine
+                .add_global_mapping(&create_range_builder_from, range_builder_from as usize);
 
-        let create_range_builder_step = self.get_or_create_range_builder_step();
-        self.execution_engine
-            .add_global_mapping(&create_range_builder_step, range_builder_step as usize);
+            let create_range_builder_step = self.get_or_create_range_builder_step();
+            self.execution_engine
+                .add_global_mapping(&create_range_builder_step, range_builder_step as usize);
 
-        let range_get_from = self.get_or_create_range_builder_get_from();
-        self.execution_engine
-            .add_global_mapping(&range_get_from, range_builder_get_from as usize);
-        let range_get_to = self.get_or_create_range_builder_get_to();
-        self.execution_engine
-            .add_global_mapping(&range_get_to, range_builder_get_to as usize);
-        let range_get_step = self.get_or_create_range_builder_get_step();
-        self.execution_engine
-            .add_global_mapping(&range_get_step, range_builder_get_step as usize);
+            let range_get_from = self.get_or_create_range_builder_get_from();
+            self.execution_engine
+                .add_global_mapping(&range_get_from, range_builder_get_from as usize);
+            let range_get_to = self.get_or_create_range_builder_get_to();
+            self.execution_engine
+                .add_global_mapping(&range_get_to, range_builder_get_to as usize);
+            let range_get_step = self.get_or_create_range_builder_get_step();
+            self.execution_engine
+                .add_global_mapping(&range_get_step, range_builder_get_step as usize);
 
-        let io_read = self.get_or_create_io_read_file();
-        self.execution_engine
-            .add_global_mapping(&io_read, io_read_file as usize);
+            let io_read = self.get_or_create_io_read_file();
+            self.execution_engine
+                .add_global_mapping(&io_read, io_read_file as usize);
 
-        let io_write = self.get_or_create_io_write_file();
-        self.execution_engine
-            .add_global_mapping(&io_write, io_write_file as usize);
-        let panic_fn = self.get_or_create_qs_panic();
-        self.execution_engine
-            .add_global_mapping(&panic_fn, qs_panic as usize);
-        let web_text_fn = self.get_or_create_web_text();
-        self.execution_engine
-            .add_global_mapping(&web_text_fn, web_text as usize);
-        let web_page_fn = self.get_or_create_web_page();
-        self.execution_engine
-            .add_global_mapping(&web_page_fn, web_page as usize);
-        // Map web.file correctly (was incorrectly mapped to web_page symbol)
-        let web_file_fn = self.get_or_create_web_file();
-        self.execution_engine
-            .add_global_mapping(&web_file_fn, web_file as usize);
-        let web_file_not_found_fn = self.get_or_create_web_file_not_found();
-        self.execution_engine
-            .add_global_mapping(&web_file_not_found_fn, web_file_not_found as usize);
-        // Map web.json
-        let web_json_fn = self.get_or_create_web_json();
-        self.execution_engine
-            .add_global_mapping(&web_json_fn, web_json as usize);
-        let web_error_text_fn = self.get_or_create_web_error_text();
-        self.execution_engine
-            .add_global_mapping(&web_error_text_fn, web_error_text as usize);
-        let web_error_page_fn = self.get_or_create_web_error_page();
-        self.execution_engine
-            .add_global_mapping(&web_error_page_fn, web_error_page as usize);
-        let web_redirect_fn = self.get_or_create_web_redirect();
-        self.execution_engine
-            .add_global_mapping(&web_redirect_fn, web_redirect as usize);
+            let io_write = self.get_or_create_io_write_file();
+            self.execution_engine
+                .add_global_mapping(&io_write, io_write_file as usize);
+            let panic_fn = self.get_or_create_qs_panic();
+            self.execution_engine
+                .add_global_mapping(&panic_fn, qs_panic as usize);
+            let web_text_fn = self.get_or_create_web_text();
+            self.execution_engine
+                .add_global_mapping(&web_text_fn, web_text as usize);
+            let web_page_fn = self.get_or_create_web_page();
+            self.execution_engine
+                .add_global_mapping(&web_page_fn, web_page as usize);
+            // Map web.file correctly (was incorrectly mapped to web_page symbol)
+            let web_file_fn = self.get_or_create_web_file();
+            self.execution_engine
+                .add_global_mapping(&web_file_fn, web_file as usize);
+            let web_file_not_found_fn = self.get_or_create_web_file_not_found();
+            self.execution_engine
+                .add_global_mapping(&web_file_not_found_fn, web_file_not_found as usize);
+            // Map web.json
+            let web_json_fn = self.get_or_create_web_json();
+            self.execution_engine
+                .add_global_mapping(&web_json_fn, web_json as usize);
+            let web_error_text_fn = self.get_or_create_web_error_text();
+            self.execution_engine
+                .add_global_mapping(&web_error_text_fn, web_error_text as usize);
+            let web_error_page_fn = self.get_or_create_web_error_page();
+            self.execution_engine
+                .add_global_mapping(&web_error_page_fn, web_error_page as usize);
+            let web_redirect_fn = self.get_or_create_web_redirect();
+            self.execution_engine
+                .add_global_mapping(&web_redirect_fn, web_redirect as usize);
 
-        // Map Obj (Kv) functions
-        let obj_new_fn = self.get_or_create_qs_obj_new();
-        self.execution_engine
-            .add_global_mapping(&obj_new_fn, qs_obj_new as usize);
-        let obj_insert_fn = self.get_or_create_qs_obj_insert_str();
-        self.execution_engine
-            .add_global_mapping(&obj_insert_fn, qs_obj_insert_str as usize);
-        let obj_get_fn = self.get_or_create_qs_obj_get_str();
-        self.execution_engine
-            .add_global_mapping(&obj_get_fn, qs_obj_get_str as usize);
+            // Map Obj (Kv) functions
+            let obj_new_fn = self.get_or_create_qs_obj_new();
+            self.execution_engine
+                .add_global_mapping(&obj_new_fn, qs_obj_new as usize);
+            let obj_insert_fn = self.get_or_create_qs_obj_insert_str();
+            self.execution_engine
+                .add_global_mapping(&obj_insert_fn, qs_obj_insert_str as usize);
+            let obj_get_fn = self.get_or_create_qs_obj_get_str();
+            self.execution_engine
+                .add_global_mapping(&obj_get_fn, qs_obj_get_str as usize);
 
-        let register_desc_fn = self.get_or_create_qs_register_struct_descriptor();
-        self.execution_engine
-            .add_global_mapping(&register_desc_fn, qs_register_struct_descriptor as usize);
-        let register_enum_fn = self.get_or_create_qs_register_enum_variant();
-        self.execution_engine
-            .add_global_mapping(&register_enum_fn, qs_register_enum_variant as usize);
-        let struct_from_json_fn = self.get_or_create_qs_struct_from_json();
-        self.execution_engine
-            .add_global_mapping(&struct_from_json_fn, qs_struct_from_json as usize);
-        let enum_from_json_fn = self.get_or_create_qs_enum_from_json();
-        self.execution_engine
-            .add_global_mapping(&enum_from_json_fn, qs_enum_from_json as usize);
-        let struct_to_json_fn = self.get_or_create_qs_struct_to_json();
-        self.execution_engine
-            .add_global_mapping(&struct_to_json_fn, qs_struct_to_json as usize);
-        let json_parse_fn = self.get_or_create_qs_json_parse();
-        self.execution_engine
-            .add_global_mapping(&json_parse_fn, qs_json_parse as usize);
-        let json_stringify_fn = self.get_or_create_qs_json_stringify();
-        self.execution_engine
-            .add_global_mapping(&json_stringify_fn, qs_json_stringify as usize);
-        let json_is_null_fn = self.get_or_create_qs_json_is_null();
-        self.execution_engine
-            .add_global_mapping(&json_is_null_fn, qs_json_is_null as usize);
-        let json_len_fn = self.get_or_create_qs_json_len();
-        self.execution_engine
-            .add_global_mapping(&json_len_fn, qs_json_len as usize);
-        let json_get_fn = self.get_or_create_qs_json_get();
-        self.execution_engine
-            .add_global_mapping(&json_get_fn, qs_json_get as usize);
-        let json_index_fn = self.get_or_create_qs_json_index();
-        self.execution_engine
-            .add_global_mapping(&json_index_fn, qs_json_index as usize);
-        let json_str_fn = self.get_or_create_qs_json_str();
-        self.execution_engine
-            .add_global_mapping(&json_str_fn, qs_json_str as usize);
+            let register_desc_fn = self.get_or_create_qs_register_struct_descriptor();
+            self.execution_engine
+                .add_global_mapping(&register_desc_fn, qs_register_struct_descriptor as usize);
+            let register_enum_fn = self.get_or_create_qs_register_enum_variant();
+            self.execution_engine
+                .add_global_mapping(&register_enum_fn, qs_register_enum_variant as usize);
+            let struct_from_json_fn = self.get_or_create_qs_struct_from_json();
+            self.execution_engine
+                .add_global_mapping(&struct_from_json_fn, qs_struct_from_json as usize);
+            let enum_from_json_fn = self.get_or_create_qs_enum_from_json();
+            self.execution_engine
+                .add_global_mapping(&enum_from_json_fn, qs_enum_from_json as usize);
+            let struct_to_json_fn = self.get_or_create_qs_struct_to_json();
+            self.execution_engine
+                .add_global_mapping(&struct_to_json_fn, qs_struct_to_json as usize);
+            let json_parse_fn = self.get_or_create_qs_json_parse();
+            self.execution_engine
+                .add_global_mapping(&json_parse_fn, qs_json_parse as usize);
+            let json_stringify_fn = self.get_or_create_qs_json_stringify();
+            self.execution_engine
+                .add_global_mapping(&json_stringify_fn, qs_json_stringify as usize);
+            let json_is_null_fn = self.get_or_create_qs_json_is_null();
+            self.execution_engine
+                .add_global_mapping(&json_is_null_fn, qs_json_is_null as usize);
+            let json_len_fn = self.get_or_create_qs_json_len();
+            self.execution_engine
+                .add_global_mapping(&json_len_fn, qs_json_len as usize);
+            let json_get_fn = self.get_or_create_qs_json_get();
+            self.execution_engine
+                .add_global_mapping(&json_get_fn, qs_json_get as usize);
+            let json_index_fn = self.get_or_create_qs_json_index();
+            self.execution_engine
+                .add_global_mapping(&json_index_fn, qs_json_index as usize);
+            let json_str_fn = self.get_or_create_qs_json_str();
+            self.execution_engine
+                .add_global_mapping(&json_str_fn, qs_json_str as usize);
 
-        match unsafe { self.execution_engine.get_function::<SumFunc>("main") } {
-            Ok(func) => Some(func),
-            Err(FunctionLookupError::FunctionNotFound) => {
-                eprintln!("Failed to JIT program, update cli and try again");
-                None
+            match unsafe { self.execution_engine.get_function::<SumFunc>("main") } {
+                Ok(func) => Some(func),
+                Err(FunctionLookupError::FunctionNotFound) => {
+                    eprintln!("Failed to JIT program, update cli and try again");
+                    None
+                }
+                Err(FunctionLookupError::JITNotEnabled) => {
+                    eprintln!("Failed to JIT main(): JIT not enabled on execution engine");
+                    None
+                }
             }
-            Err(FunctionLookupError::JITNotEnabled) => {
-                eprintln!("Failed to JIT main(): JIT not enabled on execution engine");
-                None
+        } else {
+            match unsafe { self.execution_engine.get_function::<SumFunc>("main") } {
+                Ok(func) => Some(func),
+                Err(_) => None,
             }
         }
     }

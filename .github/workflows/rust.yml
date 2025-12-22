@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  LLVM_LINK_STATIC: "0"
+  LLVM_LINK_STATIC: "1"
 
 permissions:
   contents: write
@@ -59,34 +59,36 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Install LLVM / deps
+      - name: Install deps / vendor LLVM
+        if: startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')
         shell: bash
         run: |
           case "${{ matrix.os }}" in
-            ubuntu-*) 
+            ubuntu-*)
               sudo apt-get update
-              sudo apt-get install -y llvm-18 llvm-18-dev llvm-18-tools clang-18 libzstd-dev libpolly-18-dev
-              echo "LLVM_CONFIG_PATH=/usr/lib/llvm-18/bin/llvm-config" >> "$GITHUB_ENV"
-              echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
-              echo "CC=clang-18" >> "$GITHUB_ENV"
+              sudo apt-get install -y ninja-build cmake git python3 build-essential
               ;;
             macos-*)
-              brew install llvm@18 zstd
-              if [ -d /usr/local/opt/llvm@18/bin ]; then
-                echo "LLVM_CONFIG_PATH=/usr/local/opt/llvm@18/bin/llvm-config" >> "$GITHUB_ENV"
-                echo "LLVM_SYS_181_PREFIX=/usr/local/opt/llvm@18" >> "$GITHUB_ENV"
-              else
-                echo "LLVM_CONFIG_PATH=/opt/homebrew/opt/llvm@18/bin/llvm-config" >> "$GITHUB_ENV"
-                echo "LLVM_SYS_181_PREFIX=/opt/homebrew/opt/llvm@18" >> "$GITHUB_ENV"
-              fi
-              ;;
-            windows-*)
-              choco install -y --no-progress llvm --version=18.1.8 --allow-downgrade --force
-              echo "LLVM_CONFIG_PATH=C:\\Program Files\\LLVM\\bin\\llvm-config.exe" >> "$GITHUB_ENV"
-              echo "LLVM_SYS_181_PREFIX=C:\\Program Files\\LLVM" >> "$GITHUB_ENV"
-              echo "PATH=C:\\Program Files\\LLVM\\bin;$PATH" >> "$GITHUB_ENV"
+              brew update
+              brew install ninja cmake git zstd
               ;;
           esac
+
+          LLVM_TAG=llvmorg-18.1.8 ./scripts/vendor_llvm.sh
+          echo "LLVM_CONFIG_PATH=${GITHUB_WORKSPACE}/llvm/install/bin/llvm-config" >> "$GITHUB_ENV"
+          echo "LLVM_SYS_181_PREFIX=${GITHUB_WORKSPACE}/llvm/install" >> "$GITHUB_ENV"
+          echo "CC=clang" >> "$GITHUB_ENV"
+
+      - name: Install deps / vendor LLVM (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: powershell
+        run: |
+          choco install -y --no-progress ninja cmake git
+          $env:LLVM_TAG="llvmorg-18.1.8"
+          ./scripts/vendor_llvm.ps1
+          "LLVM_CONFIG_PATH=$env:GITHUB_WORKSPACE\llvm\install\bin\llvm-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LLVM_SYS_181_PREFIX=$env:GITHUB_WORKSPACE\llvm\install" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CC=cl" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
@@ -106,8 +108,10 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.out }}
+          if [ -f "${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.so" ]; then cp ${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.so dist/; fi
+          if [ -f "${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.dylib" ]; then cp ${GITHUB_WORKSPACE}/llvm/install/lib/libLLVM.dylib dist/; fi
           cd dist
-          tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.out }}
+          tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.out }} libLLVM.* 2>/dev/null || tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.out }}
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2

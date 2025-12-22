@@ -877,6 +877,20 @@ dependencies = [
 
 [[package]]
 name = "quick"
+version = "0.1.1"
+dependencies = [
+ "actix",
+ "clap",
+ "hyper 0.14.32",
+ "inkwell",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "quick-runtime"
 version = "0.1.0"
 dependencies = [
  "actix",
