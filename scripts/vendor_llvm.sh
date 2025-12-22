@@ -7,6 +7,9 @@ PREFIX=${LLVM_PREFIX:-$(pwd)/llvm/install}
 
 os=$(uname -s)
 arch=$(uname -m)
+platform=""
+tmpdir=$(mktemp -d)
+trap 'rm -rf "${tmpdir}"' EXIT
 
 if [ -n "${LLVM_ARCHIVE:-}" ]; then
   archives=("${LLVM_ARCHIVE}")
@@ -15,14 +18,16 @@ else
     Linux)
       case "${arch}" in
         x86_64|amd64)
-          archives=(
+          platform="x86_64-linux-gnu"
+          fallback_archives=(
             "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu.tar.xz"
           )
           ;;
         aarch64|arm64)
-          archives=(
+          platform="aarch64-linux-gnu"
+          fallback_archives=(
             "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu.tar.xz"
             "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu-ubuntu-22.04.tar.xz"
             "clang+llvm-${LLVM_VERSION}-aarch64-linux-gnu-ubuntu-20.04.tar.xz"
@@ -37,13 +42,15 @@ else
     Darwin)
       case "${arch}" in
         arm64)
-          archives=(
+          platform="arm64-apple-darwin"
+          fallback_archives=(
             "clang+llvm-${LLVM_VERSION}-arm64-apple-darwin23.0.tar.xz"
             "clang+llvm-${LLVM_VERSION}-arm64-apple-darwin22.0.tar.xz"
           )
           ;;
         x86_64)
-          archives=(
+          platform="x86_64-apple-darwin"
+          fallback_archives=(
             "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin22.0.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin21.0.tar.xz"
             "clang+llvm-${LLVM_VERSION}-x86_64-apple-darwin20.0.tar.xz"
@@ -62,8 +69,26 @@ else
   esac
 fi
 
-tmpdir=$(mktemp -d)
-trap 'rm -rf "${tmpdir}"' EXIT
+archives=()
+sha_list=""
+sha_url="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/SHA256SUMS"
+if [ -z "${LLVM_ARCHIVE:-}" ]; then
+  if curl -fsSL "${sha_url}" -o "${tmpdir}/llvm-SHA256SUMS"; then
+    sha_list="${tmpdir}/llvm-SHA256SUMS"
+  fi
+fi
+
+if [ -n "${LLVM_ARCHIVE:-}" ]; then
+  archives=("${LLVM_ARCHIVE}")
+elif [ -n "${sha_list}" ] && [ -n "${platform}" ]; then
+  while IFS= read -r entry; do
+    archives+=("${entry}")
+  done < <(awk '{print $2}' "${sha_list}" | grep "clang+llvm-${LLVM_VERSION}-${platform}" || true)
+fi
+
+if [ ${#archives[@]} -eq 0 ]; then
+  archives=(${fallback_archives[@]})
+fi
 
 archive_file=""
 for archive in "${archives[@]}"; do
