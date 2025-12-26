@@ -4,6 +4,7 @@ use crate::TokenKind::*;
 use clap::Parser as Clap;
 use compiler::{CodegenMode, Compiler};
 use parser::Parser;
+static LIBQUICK: &'static [u8] = include_bytes!("../build/libquick.a");
 unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
     fn strncmp(a: *const i8, b: *const i8, c: i32) -> i32;
@@ -23,7 +24,7 @@ unsafe extern "C" {
     fn srand(seed: u32);
     fn fdopen(fd: i32, mode: *const i8) -> *mut std::ffi::c_void;
     fn fopen(filename: *const i8, mode: *const i8) -> *mut std::ffi::c_void;
-    fn fwrite( 
+    fn fwrite(
         ptr: *const std::ffi::c_void,
         size: usize,
         count: usize,
@@ -358,9 +359,9 @@ use inkwell::types::BasicTypeEnum;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
+use std::fs;
 use std::mem;
 use std::ops::Index;
 use std::process::Command;
@@ -4560,43 +4561,10 @@ fn execute_build(filename: String, debug: bool) {
 
             let runtime_lib_path = build_dir.join("libquick.a");
             if !runtime_lib_path.exists() {
-                eprintln!("Missing build/libquick.a; building runtime-lib once...");
-
-                let status = Command::new("cargo")
-                    .args(["build", "--release", "--lib", "--features", "runtime-lib"])
-                    .status();
-
-                match status {
-                    Ok(status) if status.success() => {}
-                    Ok(status) => {
-                        eprintln!("cargo build for runtime-lib failed with status {status}");
-                        std::process::exit(65);
-                    }
-                    Err(err) => {
-                        eprintln!("Failed to invoke cargo to build runtime-lib: {err}");
-                        std::process::exit(65);
-                    }
-                }
-
-                let target_dir = env::var("CARGO_TARGET_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("target"));
-
-                let Some(runtime_src) = find_runtime_archive(&target_dir) else {
-                    eprintln!("Unable to locate libquick.a after runtime build in {target_dir:?}");
-                    std::process::exit(65);
-                };
-
-                if let Err(err) = fs::copy(&runtime_src, &runtime_lib_path) {
-                    eprintln!(
-                        "Failed to copy runtime archive from {} to {}: {err}",
-                        runtime_src.display(),
-                        runtime_lib_path.display()
-                    );
-                    std::process::exit(65);
+                if let Err(e) = std::fs::write(&runtime_lib_path, &LIBQUICK) {
+                    eprintln!("Error writing libraries: {e}");
                 }
             }
-
             let mut link_args = vec![
                 obj_path.to_string_lossy().to_string(),
                 runtime_lib_path.to_string_lossy().to_string(),

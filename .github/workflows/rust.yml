@@ -6,6 +6,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   LLVM_TAG: llvmorg-18.1.4
+  ZSTD_VERSION: 1.5.6
+  DEPS_PREFIX: ${{ github.workspace }}/deps/install
 
 jobs:
   build:
@@ -52,6 +54,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="quick") | .version')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -71,30 +81,40 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential musl-tools zstd libzstd-dev xz-utils pkg-config libtinfo5 libncurses5
+          sudo apt-get install -y build-essential musl-tools zstd libzstd-dev xz-utils pkg-config libtinfo5 libncurses5 ninja-build
 
       - name: Enable Rosetta for x86 build (macOS)
         if: runner.os == 'macOS' && matrix.arch == 'x86_64'
         run: softwareupdate --install-rosetta --agree-to-license
 
-      - name: Install LLVM (Linux/macOS)
+      - name: Build zstd from source (static)
         if: runner.os != 'Windows'
-        env:
-          LLVM_ARCHIVE: ${{ (matrix.os_id == 'darwin' && matrix.arch == 'x86_64') && 'clang+llvm-18.1.4-x86_64-apple-darwin22.0.tar.xz' || '' }}
         run: |
-          chmod +x scripts/vendor_llvm.sh
-          LLVM_PREFIX="${{ github.workspace }}/llvm/install" LLVM_TAG="${{ env.LLVM_TAG }}" scripts/vendor_llvm.sh
+          set -euo pipefail
+          mkdir -p "${DEPS_PREFIX}"
+          curl -fsSL -o /tmp/zstd.tar.gz "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz"
+          tar xzf /tmp/zstd.tar.gz -C /tmp
+          cmake -S "/tmp/zstd-${ZSTD_VERSION}/build/cmake" -B /tmp/zstd-build \
+            -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}"
+          cmake --build /tmp/zstd-build --config Release --target install
 
-      - name: Verify LLVM install
+      - name: Build LLVM + libunwind from source (static)
         if: runner.os != 'Windows'
         run: |
-          if [ -x "${{ github.workspace }}/llvm/install/bin/llvm-config" ]; then
-            "${{ github.workspace }}/llvm/install/bin/llvm-config" --version
-            echo "${{ github.workspace }}/llvm/install/bin" >> "$GITHUB_PATH"
-          else
-            echo "llvm-config not found under vendor prefix" >&2
-            exit 1
-          fi
+          set -euo pipefail
+          git clone --depth 1 --branch "${LLVM_TAG}" https://github.com/llvm/llvm-project.git /tmp/llvm-project
+          cmake -G Ninja -S /tmp/llvm-project/llvm -B /tmp/llvm-build \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_RUNTIMES="libunwind" \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DBUILD_SHARED_LIBS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF \
+            -DLIBUNWIND_ENABLE_SHARED=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}"
+          cmake --build /tmp/llvm-build --config Release --target install
+          echo "${DEPS_PREFIX}/bin" >> "$GITHUB_PATH"
 
       - name: Install LLVM (Windows)
         if: matrix.os_id == 'windows'
@@ -113,12 +133,12 @@ jobs:
 
       - name: Build release
         env:
-          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
-          LLVM_SYS_181_PREFIX: ${{ github.workspace }}/llvm/install
-          LLVM_CONFIG_PATH: ${{ github.workspace }}/llvm/install/bin/llvm-config
-          LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
-          LD_LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
-          DYLD_LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
+          LLVM_PREFIX: ${{ runner.os == 'Windows' && format('{0}/llvm/install', github.workspace) || env.DEPS_PREFIX }}
+          LLVM_SYS_181_PREFIX: ${{ runner.os == 'Windows' && format('{0}/llvm/install', github.workspace) || env.DEPS_PREFIX }}
+          LLVM_CONFIG_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/bin/llvm-config.exe', github.workspace) || format('{0}/bin/llvm-config', env.DEPS_PREFIX) }}
+          LIBRARY_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/lib', github.workspace) || format('{0}/lib', env.DEPS_PREFIX) }}
+          LD_LIBRARY_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/lib', github.workspace) || format('{0}/lib', env.DEPS_PREFIX) }}
+          DYLD_LIBRARY_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/lib', github.workspace) || format('{0}/lib', env.DEPS_PREFIX) }}
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
@@ -193,8 +213,9 @@ jobs:
           path: ${{ steps.package-unix.outputs.asset || steps.package-win.outputs.asset }}
 
       - name: Publish release asset
-        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
           files: ${{ steps.package-unix.outputs.asset || steps.package-win.outputs.asset }}
           fail_on_unmatched_files: true

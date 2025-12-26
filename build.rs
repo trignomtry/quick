@@ -71,8 +71,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", llvm_config.display());
 
     let static_libs = collect_library_paths(&llvm_config, LinkMode::Static).ok();
-    let missing_forced_static =
-        static_libs.is_some() && missing_forced_static_archives();
+    let missing_forced_static = static_libs.is_some() && missing_forced_static_archives();
     let use_static =
         static_libs.as_ref().is_some_and(|libs| !libs.is_empty()) && !missing_forced_static;
 
