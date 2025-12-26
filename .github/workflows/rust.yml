@@ -142,7 +142,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
-          cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }} --features runtime-lib
 
       - name: Package artifact (Linux/macOS)
         if: matrix.os_id != 'windows'
