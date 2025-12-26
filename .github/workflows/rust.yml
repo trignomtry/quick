@@ -132,6 +132,7 @@ jobs:
           choco install -y libxml2
 
       - name: Build release
+        shell: bash
         env:
           LLVM_PREFIX: ${{ runner.os == 'Windows' && format('{0}/llvm/install', github.workspace) || env.DEPS_PREFIX }}
           LLVM_SYS_181_PREFIX: ${{ runner.os == 'Windows' && format('{0}/llvm/install', github.workspace) || env.DEPS_PREFIX }}
@@ -142,7 +143,20 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
+          set -euo pipefail
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
+          lib_path="target/${{ matrix.target }}/release/libquick.a"
+          if [ ! -f "$lib_path" ]; then
+            alt_path="target/${{ matrix.target }}/release/quick.lib"
+            if [ -f "$alt_path" ]; then
+              lib_path="$alt_path"
+            else
+              echo "Static library not found at $lib_path or $alt_path" >&2
+              exit 1
+            fi
+          fi
+          mkdir -p build
+          cp "$lib_path" build/libquick.a
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package artifact (Linux/macOS)
