@@ -4,6 +4,7 @@ use crate::TokenKind::*;
 use clap::Parser as Clap;
 use compiler::{CodegenMode, Compiler};
 use parser::Parser;
+#[cfg(not(feature = "runtime-lib"))]
 static LIBQUICK: &'static [u8] = include_bytes!("../build/libquick.a");
 unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
