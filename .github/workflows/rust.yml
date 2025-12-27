@@ -137,12 +137,6 @@ jobs:
         run: |
           & scripts/vendor_llvm.ps1
 
-      - name: Install libxml2 (Windows)
-        if: matrix.os_id == 'windows'
-        shell: pwsh
-        run: |
-          choco install -y libxml2
-
       - name: Build release (non-Windows)
         if: runner.os != 'Windows'
         shell: bash
