@@ -56,6 +56,7 @@ jobs:
 
       - name: Determine version
         id: version
+        shell: bash
         run: |
           set -euo pipefail
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="quick") | .version')
@@ -92,17 +93,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${DEPS_PREFIX}"
+          ARCH_FLAG=""
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ARCH_FLAG="-DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}"
+          fi
           curl -fsSL -o /tmp/zstd.tar.gz "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz"
           tar xzf /tmp/zstd.tar.gz -C /tmp
           cmake -S "/tmp/zstd-${ZSTD_VERSION}/build/cmake" -B /tmp/zstd-build \
             -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}"
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}" ${ARCH_FLAG}
           cmake --build /tmp/zstd-build --config Release --target install
 
       - name: Build LLVM + libunwind from source (static)
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
+          ARCH_FLAG=""
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ARCH_FLAG="-DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}"
+          fi
           git clone --depth 1 --branch "${LLVM_TAG}" https://github.com/llvm/llvm-project.git /tmp/llvm-project
           cmake -G Ninja -S /tmp/llvm-project/llvm -B /tmp/llvm-build \
             -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
@@ -112,7 +121,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
             -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF \
             -DLIBUNWIND_ENABLE_SHARED=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}"
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}" ${ARCH_FLAG}
           cmake --build /tmp/llvm-build --config Release --target install
           echo "${DEPS_PREFIX}/bin" >> "$GITHUB_PATH"
 
@@ -131,32 +140,59 @@ jobs:
         run: |
           choco install -y libxml2
 
-      - name: Build release
+      - name: Build release (non-Windows)
+        if: runner.os != 'Windows'
         shell: bash
         env:
-          LLVM_PREFIX: ${{ runner.os == 'Windows' && format('{0}/llvm/install', github.workspace) || env.DEPS_PREFIX }}
-          LLVM_SYS_181_PREFIX: ${{ runner.os == 'Windows' && format('{0}/llvm/install', github.workspace) || env.DEPS_PREFIX }}
-          LLVM_CONFIG_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/bin/llvm-config.exe', github.workspace) || format('{0}/bin/llvm-config', env.DEPS_PREFIX) }}
-          LIBRARY_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/lib', github.workspace) || format('{0}/lib', env.DEPS_PREFIX) }}
-          LD_LIBRARY_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/lib', github.workspace) || format('{0}/lib', env.DEPS_PREFIX) }}
-          DYLD_LIBRARY_PATH: ${{ runner.os == 'Windows' && format('{0}/llvm/install/lib', github.workspace) || format('{0}/lib', env.DEPS_PREFIX) }}
+          LLVM_PREFIX: ${{ env.DEPS_PREFIX }}
+          LLVM_SYS_181_PREFIX: ${{ env.DEPS_PREFIX }}
+          LLVM_CONFIG_PATH: ${{ env.DEPS_PREFIX }}/bin/llvm-config
+          LIBRARY_PATH: ${{ env.DEPS_PREFIX }}/lib
+          LD_LIBRARY_PATH: ${{ env.DEPS_PREFIX }}/lib
+          DYLD_LIBRARY_PATH: ${{ env.DEPS_PREFIX }}/lib
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           set -euo pipefail
+          export CC="${LLVM_PREFIX}/bin/clang"
+          export CXX="${LLVM_PREFIX}/bin/clang++"
+          export AR="${LLVM_PREFIX}/bin/llvm-ar"
+          export RANLIB="${LLVM_PREFIX}/bin/llvm-ranlib"
+          export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C link-arg=-fuse-ld=lld"
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
           lib_path="target/${{ matrix.target }}/release/libquick.a"
           if [ ! -f "$lib_path" ]; then
-            alt_path="target/${{ matrix.target }}/release/quick.lib"
-            if [ -f "$alt_path" ]; then
-              lib_path="$alt_path"
-            else
-              echo "Static library not found at $lib_path or $alt_path" >&2
-              exit 1
-            fi
+            echo "Static library not found at $lib_path" >&2
+            exit 1
           fi
           mkdir -p build
           cp "$lib_path" build/libquick.a
+          cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
+          LLVM_SYS_181_PREFIX: ${{ github.workspace }}/llvm/install
+          LLVM_CONFIG_PATH: ${{ github.workspace }}/llvm/install/bin/llvm-config.exe
+          LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
+          $libPath = "target/${{ matrix.target }}/release/libquick.a"
+          $altPath = "target/${{ matrix.target }}/release/quick.lib"
+          if (-not (Test-Path $libPath)) {
+            if (Test-Path $altPath) {
+              $libPath = $altPath
+            } else {
+              Write-Error "Static library not found at $libPath or $altPath"
+            }
+          }
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Copy-Item $libPath build/libquick.a -Force
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package artifact (Linux/macOS)
