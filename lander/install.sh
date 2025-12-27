@@ -26,54 +26,6 @@ warn()   { echo "${yellow}!!${reset} ${bold}$*${reset}"; }
 error()  { echo "${red}xx${reset} ${bold}$*${reset}" >&2; }
 success(){ echo "${green}ok${reset} ${bold}$*${reset}"; }
 
-ensure_llvm() {
-    if command -v llvm-config >/dev/null 2>&1; then
-        info "LLVM already available ($(llvm-config --version 2>/dev/null | head -n1))"
-        return
-    fi
-
-    if command -v brew >/dev/null 2>&1; then
-        info "Installing LLVM via Homebrew (llvm@18)"
-        if brew install llvm@18; then
-            success "LLVM installed via Homebrew"
-            return
-        else
-            warn "Homebrew install failed, trying direct download"
-        fi
-    fi
-
-    if [ "${os}" != "darwin" ]; then
-        warn "Please install LLVM 18+ using your package manager (e.g. apt/yum)"
-        return
-    fi
-
-    case "${arch}" in
-        arm64)
-            llvm_pkg="clang+llvm-18.1.8-arm64-apple-darwin23.0.tar.xz"
-            ;;
-        x86_64)
-            llvm_pkg="clang+llvm-18.1.8-x86_64-apple-darwin20.0.tar.xz"
-            ;;
-    esac
-
-    llvm_url="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/${llvm_pkg}"
-    llvm_dir="${HOME}/.quick/llvm"
-    mkdir -p "${llvm_dir}" 2>/dev/null || true
-    info "Downloading LLVM toolchain from ${llvm_url}"
-    if curl -fsSL "${llvm_url}" -o "${tmpdir}/${llvm_pkg}"; then
-        if tar -xJf "${tmpdir}/${llvm_pkg}" -C "${tmpdir}"; then
-            extracted="${tmpdir}/${llvm_pkg%.tar.xz}"
-            cp -R "${extracted}"/* "${llvm_dir}"/
-            success "LLVM unpacked to ${llvm_dir}"
-            warn "Add LLVM to PATH with: export PATH=\"${llvm_dir}/bin:$PATH\""
-        else
-            warn "Failed to extract ${llvm_pkg}; please install LLVM manually"
-        fi
-    else
-        warn "Failed to download LLVM; please install LLVM 18+ manually"
-    fi
-}
-
 uname_s="$(uname -s)"
 uname_m="$(uname -m)"
 
@@ -116,7 +68,7 @@ info "Target: ${os}/${arch}"
 info "Install dir: ${INSTALL_DIR%/}"
 echo
 
-ensure_llvm
+
 
 info "Downloading ${artifact} from ${url}..."
 if ! curl -fsSL "${url}" -o "${tmpdir}/${download_target}"; then
