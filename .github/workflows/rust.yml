@@ -151,10 +151,14 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           set -euo pipefail
-          export CC="${LLVM_PREFIX}/bin/clang"
-          export CXX="${LLVM_PREFIX}/bin/clang++"
-          export AR="${LLVM_PREFIX}/bin/llvm-ar"
-          export RANLIB="${LLVM_PREFIX}/bin/llvm-ranlib"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            export CC="${LLVM_PREFIX}/bin/clang"
+            export CXX="${LLVM_PREFIX}/bin/clang++"
+            export AR="${LLVM_PREFIX}/bin/llvm-ar"
+            export RANLIB="${LLVM_PREFIX}/bin/llvm-ranlib"
+          else
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
           export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C link-arg=-fuse-ld=lld"
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
           lib_path="target/${{ matrix.target }}/release/libquick.a"
@@ -219,9 +223,31 @@ jobs:
           fi
 
           if [ -n "${EXTRA}" ]; then
-            tar -czf "${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" -C "${OUT_DIR}" "${ARTIFACT_BASE}${{ matrix.bin_ext }}" "${EXTRA}"
+            if [ -x "${DEPS_PREFIX}/bin/clang" ]; then
+              mkdir -p "${OUT_DIR}/llvm/bin"
+              cp "${DEPS_PREFIX}/bin/clang" "${OUT_DIR}/llvm/bin/"
+              if [ -x "${DEPS_PREFIX}/bin/ld.lld" ]; then
+                cp "${DEPS_PREFIX}/bin/ld.lld" "${OUT_DIR}/llvm/bin/"
+              fi
+              if [ -x "${DEPS_PREFIX}/bin/lld" ]; then
+                cp "${DEPS_PREFIX}/bin/lld" "${OUT_DIR}/llvm/bin/"
+              fi
+            fi
+            tar -czf "${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" -C "${OUT_DIR}" "${ARTIFACT_BASE}${{ matrix.bin_ext }}" "${EXTRA}" llvm
           else
-            tar -czf "${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" -C "${OUT_DIR}" "${ARTIFACT_BASE}${{ matrix.bin_ext }}"
+            if [ -x "${DEPS_PREFIX}/bin/clang" ]; then
+              mkdir -p "${OUT_DIR}/llvm/bin"
+              cp "${DEPS_PREFIX}/bin/clang" "${OUT_DIR}/llvm/bin/"
+              if [ -x "${DEPS_PREFIX}/bin/ld.lld" ]; then
+                cp "${DEPS_PREFIX}/bin/ld.lld" "${OUT_DIR}/llvm/bin/"
+              fi
+              if [ -x "${DEPS_PREFIX}/bin/lld" ]; then
+                cp "${DEPS_PREFIX}/bin/lld" "${OUT_DIR}/llvm/bin/"
+              fi
+              tar -czf "${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" -C "${OUT_DIR}" "${ARTIFACT_BASE}${{ matrix.bin_ext }}" llvm
+            else
+              tar -czf "${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" -C "${OUT_DIR}" "${ARTIFACT_BASE}${{ matrix.bin_ext }}"
+            fi
           fi
           echo "asset=${OUT_DIR}/${ARTIFACT_BASE}.tar.gz" >> "$GITHUB_OUTPUT"
 

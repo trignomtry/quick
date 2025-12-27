@@ -4566,7 +4566,13 @@ fn execute_build(filename: String, debug: bool) {
                     eprintln!("Error writing libraries: {e}");
                 }
             }
-            let mut link_args = vec![
+            let (linker_override, ld_override) = bundled_linker();
+
+            let mut link_args = Vec::new();
+            if let Some(ld) = ld_override {
+                link_args.push(format!("-fuse-ld={}", ld.display()));
+            }
+            link_args.extend([
                 obj_path.to_string_lossy().to_string(),
                 runtime_lib_path.to_string_lossy().to_string(),
                 "-o".to_string(),
@@ -4574,7 +4580,7 @@ fn execute_build(filename: String, debug: bool) {
                 "-lm".to_string(),
                 "-ldl".to_string(),
                 "-lpthread".to_string(),
-            ];
+            ]);
 
             #[cfg(target_os = "macos")]
             {
@@ -4596,7 +4602,8 @@ fn execute_build(filename: String, debug: bool) {
                 link_args.push("-Wl,-e,qs_run_main".to_string());
             }
 
-            let link_status = std::process::Command::new("cc").args(&link_args).status();
+            let linker = linker_override.unwrap_or_else(|| std::ffi::OsString::from("cc"));
+            let link_status = std::process::Command::new(&linker).args(&link_args).status();
 
             match link_status {
                 Ok(status) if status.success() => {
@@ -4617,6 +4624,28 @@ fn execute_build(filename: String, debug: bool) {
             std::process::exit(65);
         }
     }
+}
+
+fn bundled_linker() -> (Option<std::ffi::OsString>, Option<std::path::PathBuf>) {
+    if let Ok(env_linker) = std::env::var_os("QUICK_LINKER") {
+        return (Some(env_linker), None);
+    }
+
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    if let Some(dir) = exe_dir {
+        let llvm_bin = dir.join("llvm").join("bin");
+        let clang = llvm_bin.join("clang");
+        let ld_lld = llvm_bin.join("ld.lld");
+        if clang.exists() {
+            let ld = if ld_lld.exists() { Some(ld_lld) } else { None };
+            return (Some(clang.into_os_string()), ld);
+        }
+    }
+
+    (None, None)
 }
 
 #[cfg(not(feature = "runtime-lib"))]
