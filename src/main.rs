@@ -4627,7 +4627,7 @@ fn execute_build(filename: String, debug: bool) {
 }
 
 fn bundled_linker() -> (Option<std::ffi::OsString>, Option<std::path::PathBuf>) {
-    if let Ok(env_linker) = std::env::var_os("QUICK_LINKER") {
+    if let Some(env_linker) = std::env::var_os("QUICK_LINKER") {
         return (Some(env_linker), None);
     }
 
