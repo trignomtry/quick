@@ -1664,6 +1664,15 @@ pub unsafe extern "C" fn range_builder_to(buil: *mut RangeBuilder, tua: f64) -> 
     buil
 }
 
+// Compatibility shim for compiler-expected symbol name
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_range_builder_to(
+    buil: *mut RangeBuilder,
+    tua: f64,
+) -> *mut RangeBuilder {
+    range_builder_to(buil, tua)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_from(
     buil: *mut RangeBuilder,
@@ -1678,6 +1687,15 @@ pub unsafe extern "C" fn range_builder_from(
     }
     (*buil).from = tua;
     buil
+}
+
+// Compatibility shim for compiler-expected symbol name
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_range_builder_from(
+    buil: *mut RangeBuilder,
+    tua: f64,
+) -> *mut RangeBuilder {
+    range_builder_from(buil, tua)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_step(
@@ -1697,6 +1715,15 @@ pub unsafe extern "C" fn range_builder_step(
         (*buil).step = tua;
     }
     buil
+}
+
+// Compatibility shim for compiler-expected symbol name
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn create_range_builder_step(
+    buil: *mut RangeBuilder,
+    tua: f64,
+) -> *mut RangeBuilder {
+    range_builder_step(buil, tua)
 }
 
 #[unsafe(no_mangle)]
