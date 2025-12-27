@@ -1,5 +1,8 @@
 name: Rust
 
+permissions:
+  contents: write # Allows creating or editing releases
+
 on:
   workflow_dispatch:
 
