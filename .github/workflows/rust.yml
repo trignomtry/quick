@@ -178,6 +178,7 @@ jobs:
           LLVM_SYS_181_PREFIX: ${{ github.workspace }}/llvm/install
           LLVM_CONFIG_PATH: ${{ github.workspace }}/llvm/install/bin/llvm-config.exe
           LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
+          LLVM_NO_LIBXML2: "1"
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
