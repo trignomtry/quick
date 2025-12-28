@@ -145,6 +145,20 @@ jobs:
         run: |
           & scripts/vendor_llvm.ps1
 
+      - name: Ensure libxml2 import lib (Windows)
+        if: matrix.os_id == 'windows'
+        shell: pwsh
+        env:
+          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
+        run: |
+          $libDir = Join-Path $env:LLVM_PREFIX "lib"
+          $xml = Join-Path $libDir "libxml2.lib"
+          $xmls = Join-Path $libDir "libxml2s.lib"
+          if ((Test-Path $xml) -and -not (Test-Path $xmls)) {
+            Copy-Item $xml $xmls -Force
+            Write-Host "Created libxml2s.lib from libxml2.lib"
+          }
+
       - name: Build release (non-Windows)
         if: runner.os != 'Windows'
         shell: bash

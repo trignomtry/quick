@@ -1,3 +1,0 @@
-for i in io.range().to(10) {
-  print ("hi")
-}
