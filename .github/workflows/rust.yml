@@ -66,6 +66,14 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
+      - name: Cache LLVM/zstd build (non-Windows)
+        if: runner.os != 'Windows'
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: deps/install
+          key: llvm-zstd-${{ runner.os }}-${{ matrix.arch }}-${{ env.LLVM_TAG }}
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -92,7 +100,7 @@ jobs:
         run: softwareupdate --install-rosetta --agree-to-license
 
       - name: Build zstd from source (static)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           mkdir -p "${DEPS_PREFIX}"
@@ -108,7 +116,7 @@ jobs:
           cmake --build /tmp/zstd-build --config Release --target install
 
       - name: Build LLVM + libunwind from source (static)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           ARCH_FLAG=""
