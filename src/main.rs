@@ -4635,6 +4635,8 @@ fn execute_build(filename: String, debug: bool) {
             match link_status {
                 Ok(status) if status.success() => {
                     eprintln!("Built {}/program", build_dir.display());
+                    let _ = std::fs::remove_file(&obj_path);
+                    let _ = std::fs::remove_file(&runtime_lib_path);
                 }
                 Ok(status) => {
                     eprintln!("Linker failed with status {status}");
@@ -4656,6 +4658,16 @@ fn execute_build(filename: String, debug: bool) {
 fn bundled_linker() -> (Option<std::ffi::OsString>, Option<std::path::PathBuf>) {
     if let Some(env_linker) = std::env::var_os("QUICK_LINKER") {
         return (Some(env_linker), None);
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        let bin = home.join(".quick").join("bin");
+        let clang = bin.join("clang");
+        let ld_lld = bin.join("ld.lld");
+        if clang.exists() {
+            let ld = if ld_lld.exists() { Some(ld_lld) } else { None };
+            return (Some(clang.into_os_string()), ld);
+        }
     }
 
     let exe_dir = std::env::current_exe()

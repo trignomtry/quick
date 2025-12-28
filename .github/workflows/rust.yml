@@ -173,15 +173,24 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           set -euo pipefail
+          NEW_RUSTFLAGS="${RUSTFLAGS:-}"
           if [ "${{ runner.os }}" = "Linux" ]; then
             export CC="${LLVM_PREFIX}/bin/clang"
             export CXX="${LLVM_PREFIX}/bin/clang++"
             export AR="${LLVM_PREFIX}/bin/llvm-ar"
             export RANLIB="${LLVM_PREFIX}/bin/llvm-ranlib"
+            NEW_RUSTFLAGS="${NEW_RUSTFLAGS:+${NEW_RUSTFLAGS} }-C link-arg=-fuse-ld=lld"
           else
             export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+            if [ -x "${LLVM_PREFIX}/bin/clang" ] && [ -x "${LLVM_PREFIX}/bin/ld.lld" ]; then
+              export CC="${LLVM_PREFIX}/bin/clang"
+              export CXX="${LLVM_PREFIX}/bin/clang++"
+              export AR="${LLVM_PREFIX}/bin/llvm-ar"
+              export RANLIB="${LLVM_PREFIX}/bin/llvm-ranlib"
+              NEW_RUSTFLAGS="${NEW_RUSTFLAGS:+${NEW_RUSTFLAGS} }-C link-arg=-fuse-ld=lld"
+            fi
           fi
-          export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C link-arg=-fuse-ld=lld"
+          export RUSTFLAGS="$NEW_RUSTFLAGS"
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
           lib_path="target/${{ matrix.target }}/release/libquick.a"
           if [ ! -f "$lib_path" ]; then

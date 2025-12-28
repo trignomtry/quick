@@ -68,6 +68,37 @@ info "Target: ${os}/${arch}"
 info "Install dir: ${INSTALL_DIR%/}"
 echo
 
+maybe_prompt_clt() {
+    if [ "${os}" != "darwin" ]; then
+        return
+    fi
+    if xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1; then
+        return
+    fi
+
+    warn "Apple Command Line Tools not detected."
+    warn "Sketch (JIT) works without CLT, but Ship (AOT) requires it."
+
+    if [ -t 0 ]; then
+        printf "Install Command Line Tools now? [y/N]: "
+        read -r reply || reply=""
+        case "$reply" in
+            [Yy]*)
+                info "Launching xcode-select --install (follow the GUI prompt, then rerun this installer)."
+                xcode-select --install || true
+                exit 0
+                ;;
+            *)
+                warn "Skipping CLT install. Ship/AOT will not work until you run 'xcode-select --install'."
+                ;;
+        esac
+    else
+        warn "Non-interactive shell; run 'xcode-select --install' to enable Ship/AOT mode."
+    fi
+}
+
+maybe_prompt_clt
+
 
 
 info "Downloading ${artifact} from ${url}..."
@@ -121,6 +152,13 @@ if [ -e "${dest}" ] && [ ! -w "${dest}" ]; then
 fi
 
 install -m 755 "${bin_src}" "${dest}"
+
+# Install bundled toolchain binaries for AOT into INSTALL_DIR
+for tool in clang ld.lld lld llvm-ar llvm-ranlib; do
+    if [ -f "${tmpdir}/llvm/bin/${tool}" ]; then
+        install -m 755 "${tmpdir}/llvm/bin/${tool}" "${target_dir}/${tool}"
+    fi
+done
 
 success "Installed to ${dest}"
 case ":${PATH}:" in
