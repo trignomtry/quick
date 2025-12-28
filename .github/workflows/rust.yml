@@ -187,7 +187,6 @@ jobs:
               export CXX="${LLVM_PREFIX}/bin/clang++"
               export AR="${LLVM_PREFIX}/bin/llvm-ar"
               export RANLIB="${LLVM_PREFIX}/bin/llvm-ranlib"
-              NEW_RUSTFLAGS="${NEW_RUSTFLAGS:+${NEW_RUSTFLAGS} }-C link-arg=-fuse-ld=lld"
             fi
           fi
           export RUSTFLAGS="$NEW_RUSTFLAGS"
