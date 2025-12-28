@@ -6561,7 +6561,7 @@ impl<'ctx> Compiler<'ctx> {
     }
 
     fn get_or_create_range_builder_to(&self) -> FunctionValue<'ctx> {
-        self.get_or_add_function("create_range_builder_to", || {
+        self.get_or_add_function("range_builder_to", || {
             let i8ptr = self.context.ptr_type(AddressSpace::default());
             i8ptr.fn_type(
                 &[
@@ -6577,7 +6577,7 @@ impl<'ctx> Compiler<'ctx> {
     }
 
     fn get_or_create_range_builder_from(&self) -> FunctionValue<'ctx> {
-        self.get_or_add_function("create_range_builder_from", || {
+        self.get_or_add_function("range_builder_from", || {
             let i8ptr = self.context.ptr_type(AddressSpace::default());
             i8ptr.fn_type(
                 &[
@@ -6593,7 +6593,7 @@ impl<'ctx> Compiler<'ctx> {
     }
 
     fn get_or_create_range_builder_step(&self) -> FunctionValue<'ctx> {
-        self.get_or_add_function("create_range_builder_step", || {
+        self.get_or_add_function("range_builder_step", || {
             let i8ptr = self.context.ptr_type(AddressSpace::default());
             i8ptr.fn_type(
                 &[
