@@ -7,9 +7,10 @@ use inkwell::execution_engine::{ExecutionEngine, FunctionLookupError, JitFunctio
 use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, RelocMode, Target, TargetMachine};
-use inkwell::types::{BasicType, BasicTypeEnum, FunctionType};
+use inkwell::types::{BasicType, BasicTypeEnum, FunctionType, IntType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValue as _, BasicValueEnum, FunctionValue, GlobalValue, IntValue,
+    PointerValue,
 };
 
 pub enum CodegenMode {
@@ -17,6 +18,15 @@ pub enum CodegenMode {
     EmitObject,
 }
 
+macro_rules! add_bindings {
+    ($this:expr, $($method:ident => $fn_name:ident),* $(,)?) => {{
+        $(
+            let function = $this.$method();
+            $this.execution_engine
+                .add_global_mapping(&function, $fn_name as usize);
+        )*
+    }};
+}
 pub struct Compiler<'ctx> {
     pub context: &'ctx context::Context,
     pub module: Module<'ctx>,
@@ -34,6 +44,7 @@ pub struct Compiler<'ctx> {
     // Stack of function names currently being emitted
     pub current_function: RefCell<Vec<String>>,
     pub loop_stack: RefCell<Vec<LoopContext<'ctx>>>,
+    pub current_arena: GlobalValue<'ctx>,
 }
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
@@ -65,6 +76,108 @@ impl<'ctx> Compiler<'ctx> {
             ctx.var_types.insert(name, ty);
         }
         ctx.with_line(None, || expr.get_type(&ctx))
+    }
+
+    fn target_usize_type(&self) -> IntType<'ctx> {
+        self.context
+            .ptr_sized_int_type(self.execution_engine.get_target_data(), None)
+    }
+
+    fn abi_alignment_for(&self, ty: BasicTypeEnum<'ctx>) -> IntValue<'ctx> {
+        let align = self
+            .execution_engine
+            .get_target_data()
+            .get_abi_alignment(&ty) as u64;
+        self.target_usize_type().const_int(align, false)
+    }
+
+    fn load_arena_ptr(&self) -> Result<PointerValue<'ctx>, BuilderError> {
+        Ok(self
+            .builder
+            .build_load(
+                self.context.ptr_type(AddressSpace::default()),
+                self.current_arena.as_pointer_value(),
+                "arena_ptr",
+            )?
+            .into_pointer_value())
+    }
+
+    fn arena_alloc_bytes(
+        &self,
+        size: IntValue<'ctx>,
+        align: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BuilderError> {
+        let usize_ty = self.target_usize_type();
+        let size_cast = if size.get_type() == usize_ty {
+            size
+        } else {
+            self.builder
+                .build_int_cast(size, usize_ty, &format!("{name}_size_cast"))?
+        };
+        let align_cast = if align.get_type() == usize_ty {
+            align
+        } else {
+            self.builder
+                .build_int_cast(align, usize_ty, &format!("{name}_align_cast"))?
+        };
+        let arena_ptr = self.load_arena_ptr()?;
+        let call = self.builder.build_call(
+            self.get_or_create_arena_alloc(),
+            &[arena_ptr.into(), size_cast.into(), align_cast.into()],
+            name,
+        )?;
+        Ok(call
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value())
+    }
+
+    fn free_option_slot_when_cleared(
+        &self,
+        function: FunctionValue<'ctx>,
+        slot: PointerValue<'ctx>,
+        new_value: PointerValue<'ctx>,
+        label: &str,
+    ) -> Result<(), BuilderError> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let old_val = self
+            .builder
+            .build_load(ptr_ty, slot, &format!("{label}_old_val"))?
+            .into_pointer_value();
+        let new_is_null = self
+            .builder
+            .build_is_null(new_value, &format!("{label}_new_is_null"))?;
+        let old_not_null = self
+            .builder
+            .build_is_not_null(old_val, &format!("{label}_old_not_null"))?;
+        let should_free =
+            self.builder
+                .build_and(new_is_null, old_not_null, &format!("{label}_should_free"))?;
+
+        let free_bb = self
+            .context
+            .append_basic_block(function, &format!("{label}_free_bb"));
+        let cont_bb = self
+            .context
+            .append_basic_block(function, &format!("{label}_cont_bb"));
+
+        self.builder
+            .build_conditional_branch(should_free, free_bb, cont_bb)?;
+
+        self.builder.position_at_end(free_bb);
+        let arena_ptr = self.load_arena_ptr()?;
+        let free_fn = self.get_or_create_arena_release_ref();
+        self.builder.build_call(
+            free_fn,
+            &[arena_ptr.into(), old_val.into()],
+            &format!("{label}_free_call"),
+        )?;
+        self.builder.build_unconditional_branch(cont_bb)?;
+
+        self.builder.position_at_end(cont_bb);
+        Ok(())
     }
 
     fn expr_type_matches<F>(&self, expr: &Expr, predicate: F) -> bool
@@ -107,7 +220,7 @@ impl<'ctx> Compiler<'ctx> {
         let register_fn = self.get_or_create_qs_register_struct_descriptor();
         let register_enum_fn = self.get_or_create_qs_register_enum_variant();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let ptr_ptr_ty = ptr_ty.ptr_type(AddressSpace::default());
+        let ptr_ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
         let i64_ty = self.context.i64_type();
 
@@ -608,18 +721,11 @@ impl<'ctx> Compiler<'ctx> {
             slot_count,
             &format!("enum_{}_{}_size", enum_name, variant_name),
         )?;
-        let malloc_fn = self.get_or_create_malloc();
-        let raw_ptr = self
-            .builder
-            .build_call(
-                malloc_fn,
-                &[total_bytes.into()],
-                &format!("alloc_enum_{}_{}", enum_name, variant_name),
-            )?
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
+        let raw_ptr = self.arena_alloc_bytes(
+            total_bytes,
+            slot_bytes,
+            &format!("alloc_enum_{}_{}", enum_name, variant_name),
+        )?;
         let enum_ptr = self.builder.build_pointer_cast(
             raw_ptr,
             slot_ty,
@@ -708,17 +814,11 @@ impl<'ctx> Compiler<'ctx> {
         let size_val = struct_ty
             .size_of()
             .unwrap_or_else(|| panic!("Failed to compute Result struct size"));
-        let malloc_fn = self.get_or_create_malloc();
-        let raw_ptr = self
-            .builder
-            .build_call(malloc_fn, &[size_val.into()], "result_malloc")?
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
+        let align = self.abi_alignment_for(struct_ty.as_basic_type_enum());
+        let raw_ptr = self.arena_alloc_bytes(size_val, align, "result_malloc")?;
         let typed_ptr = self.builder.build_pointer_cast(
             raw_ptr,
-            struct_ty.ptr_type(AddressSpace::default()),
+            self.context.ptr_type(AddressSpace::default()),
             "result_ptr",
         )?;
 
@@ -1022,7 +1122,7 @@ impl<'ctx> Compiler<'ctx> {
         let struct_ty = self.result_struct_type();
         let typed_ptr = self.builder.build_pointer_cast(
             result_ptr,
-            struct_ty.ptr_type(AddressSpace::default()),
+            self.context.ptr_type(AddressSpace::default()),
             &format!("{label}_struct_ptr"),
         )?;
         let tag_ptr =
@@ -1216,6 +1316,13 @@ impl<'ctx> Compiler<'ctx> {
         let entry_bb = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry_bb);
         let _main_scope = FunctionScopeGuard::new(&self.current_function, "main".to_string());
+
+        // Ensure the arena global mirrors host storage for runtime helpers.
+        let arena_slot = std::ptr::addr_of_mut!(GLOBAL_ARENA_PTR);
+        unsafe {
+            self.execution_engine
+                .add_global_mapping(&self.current_arena, arena_slot as usize);
+        }
         // Compile module functions into the LLVM module first (no execution).
         {
             let modules: Vec<(String, ModuleInfo)> = self
@@ -1303,6 +1410,26 @@ impl<'ctx> Compiler<'ctx> {
         // Restore builder to main entry before compiling main instructions
         self.builder.position_at_end(entry_bb);
 
+        let arena_capacity = self
+            .context
+            .ptr_sized_int_type(self.execution_engine.get_target_data(), None)
+            .const_int(64 * 1024 * 1024, false);
+        let arena_ptr = self
+            .builder
+            .build_call(
+                self.get_or_create_arena_create(),
+                &[arena_capacity.into()],
+                "arena_create",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+        self.builder
+            .build_store(self.current_arena.as_pointer_value(), arena_ptr)
+            .unwrap();
+
         self.emit_struct_descriptor_registration(main_fn).unwrap();
 
         // 2) Compile non-function-definition instructions
@@ -1355,216 +1482,98 @@ impl<'ctx> Compiler<'ctx> {
 
         if let CodegenMode::Jit = mode {
             // Ensure C library functions are resolved at runtime to prevent segfaults
-            let strcmp_fn = self.get_or_create_strcmp();
-            self.execution_engine
-                .add_global_mapping(&strcmp_fn, strcmp as usize);
-            let strncmp_fn = self.get_or_create_strncmp();
-            self.execution_engine
-                .add_global_mapping(&strncmp_fn, strncmp as usize);
-            let printf_fn = self.get_or_create_printf();
-            self.execution_engine
-                .add_global_mapping(&printf_fn, printf as usize);
-            let malloc_fn = self.get_or_create_malloc();
-            self.execution_engine
-                .add_global_mapping(&malloc_fn, malloc as usize);
-            let strcpy_fn = self.get_or_create_strcpy();
-            self.execution_engine
-                .add_global_mapping(&strcpy_fn, strcpy as usize);
-            let option_unwrap_fn = self.get_or_create_option_unwrap();
-            self.execution_engine
-                .add_global_mapping(&option_unwrap_fn, qs_option_unwrap as usize);
-            let result_unwrap_fn = self.get_or_create_result_unwrap();
-            self.execution_engine
-                .add_global_mapping(&result_unwrap_fn, qs_result_unwrap as usize);
-            let strcat_fn = self.get_or_create_strcat_c();
-            self.execution_engine
-                .add_global_mapping(&strcat_fn, strcat as usize);
-            let strlen_fn = self.get_or_create_strlen();
-            self.execution_engine
-                .add_global_mapping(&strlen_fn, strlen as usize);
-            let realloc_fn = self.get_or_create_realloc();
-            self.execution_engine
-                .add_global_mapping(&realloc_fn, realloc as usize);
-            let atoi_fn = self.get_or_create_atoi();
-            self.execution_engine
-                .add_global_mapping(&atoi_fn, atoi as usize);
-            let strstr_fn = self.get_or_create_strstr();
-            self.execution_engine
-                .add_global_mapping(&strstr_fn, strstr as usize);
-            let str_replace_fn = self.get_or_create_str_replace();
-            self.execution_engine
-                .add_global_mapping(&str_replace_fn, qs_str_replace as usize);
-            let str_split_fn = self.get_or_create_str_split();
-            self.execution_engine
-                .add_global_mapping(&str_split_fn, qs_str_split as usize);
-            let list_join_fn = self.get_or_create_list_join();
-            self.execution_engine
-                .add_global_mapping(&list_join_fn, qs_list_join as usize);
-            let sprintf_fn = self.get_or_create_sprintf();
-            self.execution_engine
-                .add_global_mapping(&sprintf_fn, sprintf as usize);
-            let rand_fn = self.get_or_create_rand();
-            self.execution_engine
-                .add_global_mapping(&rand_fn, rand as usize);
-            let exit_fn = self.get_or_create_io_exit();
-            self.execution_engine
-                .add_global_mapping(&exit_fn, io_exit as usize);
+            //
+            add_bindings!(
+                self,
+                // ---- core / libc ----
+                get_or_create_strcmp => strcmp,
+                get_or_create_printf => printf,
+                get_or_create_strcpy => strcpy,
+                get_or_create_strcat_c => strcat,
+                get_or_create_strlen => strlen,
+                get_or_create_memcpy => memcpy,
+                get_or_create_atoi => atoi,
+                get_or_create_strstr => strstr,
 
-            let fopen_fn = self.get_or_create_fopen();
-            self.execution_engine
-                .add_global_mapping(&fopen_fn, fopen as usize);
-            let fread_fn = self.get_or_create_fread();
-            self.execution_engine
-                .add_global_mapping(&fread_fn, fread as usize);
-            let fwrite_fn = self.get_or_create_fwrite();
-            self.execution_engine
-                .add_global_mapping(&fwrite_fn, fwrite as usize);
-            let fclose_fn = self.get_or_create_fclose();
-            self.execution_engine
-                .add_global_mapping(&fclose_fn, fclose as usize);
-            let get_stdin_fn = self.get_or_create_get_stdin();
-            self.execution_engine
-                .add_global_mapping(&get_stdin_fn, get_stdin as usize);
+                // ---- qs helpers ----
+                get_or_create_option_unwrap => qs_option_unwrap,
+                get_or_create_result_unwrap => qs_result_unwrap,
+                get_or_create_str_replace => qs_str_replace,
+                get_or_create_str_split => qs_str_split,
+                get_or_create_list_join => qs_list_join,
+                get_or_create_sprintf => sprintf,
+                get_or_create_rand => rand,
+                get_or_create_qs_panic => qs_panic,
 
-            let qs_lst_cb = self.get_or_create_qs_listen_with_callback();
-            self.execution_engine
-                .add_global_mapping(&qs_lst_cb, qs_listen_with_callback as usize);
+                // ---- io / fs ----
+                get_or_create_io_exit => io_exit,
+                get_or_create_fopen => fopen,
+                get_or_create_fread => fread,
+                get_or_create_fwrite => fwrite,
+                get_or_create_fclose => fclose,
+                get_or_create_get_stdin => get_stdin,
+                get_or_create_io_read_file => io_read_file,
+                get_or_create_io_write_file => io_write_file,
 
-            // Map Request object functions
-            let create_req = self.get_or_create_create_request_object();
-            self.execution_engine
-                .add_global_mapping(&create_req, create_request_object as usize);
-            let get_method = self.get_or_create_get_request_method();
-            self.execution_engine
-                .add_global_mapping(&get_method, get_request_method as usize);
-            let get_path = self.get_or_create_get_request_path();
-            self.execution_engine
-                .add_global_mapping(&get_path, get_request_path as usize);
-            // Additional Request getters
-            let get_body = self.get_or_create_get_request_body();
-            self.execution_engine
-                .add_global_mapping(&get_body, get_request_body as usize);
-            let get_query = self.get_or_create_get_request_query();
-            self.execution_engine
-                .add_global_mapping(&get_query, get_request_query as usize);
-            let get_headers = self.get_or_create_get_request_headers();
-            self.execution_engine
-                .add_global_mapping(&get_headers, get_request_headers as usize);
+                // ---- networking / web ----
+                get_or_create_qs_listen_with_callback => qs_listen_with_callback,
+                get_or_create_create_request_object => create_request_object,
+                get_or_create_get_request_method => get_request_method,
+                get_or_create_get_request_path => get_request_path,
+                get_or_create_get_request_body => get_request_body,
+                get_or_create_get_request_query => get_request_query,
+                get_or_create_get_request_headers => get_request_headers,
 
-            // Map Web helper functions
-            let web_helper = self.get_or_create_web_helper();
-            self.execution_engine
-                .add_global_mapping(&web_helper, create_web_helper as usize);
-            let range_builder = self.get_or_create_range_builder();
-            self.execution_engine
-                .add_global_mapping(&range_builder, create_range_builder as usize);
-            let create_range_builder_to = self.get_or_create_range_builder_to();
-            self.execution_engine
-                .add_global_mapping(&create_range_builder_to, range_builder_to as usize);
-            self.execution_engine
-                .add_global_mapping(&range_builder, create_range_builder as usize);
-            let create_range_builder_from = self.get_or_create_range_builder_from();
-            self.execution_engine
-                .add_global_mapping(&create_range_builder_from, range_builder_from as usize);
+                // ---- web helpers ----
+                get_or_create_web_helper => create_web_helper,
+                get_or_create_web_page => web_page,
+                get_or_create_web_file => web_file,
+                get_or_create_web_file_not_found => web_file_not_found,
+                get_or_create_web_json => web_json,
+                get_or_create_web_error_text => web_error_text,
+                get_or_create_web_error_page => web_error_page,
+                get_or_create_web_redirect => web_redirect,
+                get_or_create_web_text => web_text,
 
-            let create_range_builder_step = self.get_or_create_range_builder_step();
-            self.execution_engine
-                .add_global_mapping(&create_range_builder_step, range_builder_step as usize);
+                // ---- range builder ----
+                get_or_create_range_builder => create_range_builder,
+                get_or_create_range_builder_to => range_builder_to,
+                get_or_create_range_builder_from => range_builder_from,
+                get_or_create_range_builder_step => range_builder_step,
+                get_or_create_range_builder_get_from => range_builder_get_from,
+                get_or_create_range_builder_get_to => range_builder_get_to,
+                get_or_create_range_builder_get_step => range_builder_get_step,
 
-            let range_get_from = self.get_or_create_range_builder_get_from();
-            self.execution_engine
-                .add_global_mapping(&range_get_from, range_builder_get_from as usize);
-            let range_get_to = self.get_or_create_range_builder_get_to();
-            self.execution_engine
-                .add_global_mapping(&range_get_to, range_builder_get_to as usize);
-            let range_get_step = self.get_or_create_range_builder_get_step();
-            self.execution_engine
-                .add_global_mapping(&range_get_step, range_builder_get_step as usize);
+                // ---- object / kv ----
+                get_or_create_qs_obj_new => qs_obj_new,
+                get_or_create_qs_obj_insert_str => qs_obj_insert_str,
+                get_or_create_qs_obj_get_str => qs_obj_get_str,
 
-            let io_read = self.get_or_create_io_read_file();
-            self.execution_engine
-                .add_global_mapping(&io_read, io_read_file as usize);
+                // ---- reflection / json ----
+                get_or_create_qs_register_struct_descriptor => qs_register_struct_descriptor,
+                get_or_create_qs_register_enum_variant => qs_register_enum_variant,
+                get_or_create_qs_struct_from_json => qs_struct_from_json,
+                get_or_create_qs_enum_from_json => qs_enum_from_json,
+                get_or_create_qs_struct_to_json => qs_struct_to_json,
+                get_or_create_qs_json_parse => qs_json_parse,
+                get_or_create_qs_json_stringify => qs_json_stringify,
+                get_or_create_qs_json_is_null => qs_json_is_null,
+                get_or_create_qs_json_len => qs_json_len,
+                get_or_create_qs_json_get => qs_json_get,
+                get_or_create_qs_json_index => qs_json_index,
+                get_or_create_qs_json_str => qs_json_str,
 
-            let io_write = self.get_or_create_io_write_file();
-            self.execution_engine
-                .add_global_mapping(&io_write, io_write_file as usize);
-            let panic_fn = self.get_or_create_qs_panic();
-            self.execution_engine
-                .add_global_mapping(&panic_fn, qs_panic as usize);
-            let web_text_fn = self.get_or_create_web_text();
-            self.execution_engine
-                .add_global_mapping(&web_text_fn, web_text as usize);
-            let web_page_fn = self.get_or_create_web_page();
-            self.execution_engine
-                .add_global_mapping(&web_page_fn, web_page as usize);
-            // Map web.file correctly (was incorrectly mapped to web_page symbol)
-            let web_file_fn = self.get_or_create_web_file();
-            self.execution_engine
-                .add_global_mapping(&web_file_fn, web_file as usize);
-            let web_file_not_found_fn = self.get_or_create_web_file_not_found();
-            self.execution_engine
-                .add_global_mapping(&web_file_not_found_fn, web_file_not_found as usize);
-            // Map web.json
-            let web_json_fn = self.get_or_create_web_json();
-            self.execution_engine
-                .add_global_mapping(&web_json_fn, web_json as usize);
-            let web_error_text_fn = self.get_or_create_web_error_text();
-            self.execution_engine
-                .add_global_mapping(&web_error_text_fn, web_error_text as usize);
-            let web_error_page_fn = self.get_or_create_web_error_page();
-            self.execution_engine
-                .add_global_mapping(&web_error_page_fn, web_error_page as usize);
-            let web_redirect_fn = self.get_or_create_web_redirect();
-            self.execution_engine
-                .add_global_mapping(&web_redirect_fn, web_redirect as usize);
-
-            // Map Obj (Kv) functions
-            let obj_new_fn = self.get_or_create_qs_obj_new();
-            self.execution_engine
-                .add_global_mapping(&obj_new_fn, qs_obj_new as usize);
-            let obj_insert_fn = self.get_or_create_qs_obj_insert_str();
-            self.execution_engine
-                .add_global_mapping(&obj_insert_fn, qs_obj_insert_str as usize);
-            let obj_get_fn = self.get_or_create_qs_obj_get_str();
-            self.execution_engine
-                .add_global_mapping(&obj_get_fn, qs_obj_get_str as usize);
-
-            let register_desc_fn = self.get_or_create_qs_register_struct_descriptor();
-            self.execution_engine
-                .add_global_mapping(&register_desc_fn, qs_register_struct_descriptor as usize);
-            let register_enum_fn = self.get_or_create_qs_register_enum_variant();
-            self.execution_engine
-                .add_global_mapping(&register_enum_fn, qs_register_enum_variant as usize);
-            let struct_from_json_fn = self.get_or_create_qs_struct_from_json();
-            self.execution_engine
-                .add_global_mapping(&struct_from_json_fn, qs_struct_from_json as usize);
-            let enum_from_json_fn = self.get_or_create_qs_enum_from_json();
-            self.execution_engine
-                .add_global_mapping(&enum_from_json_fn, qs_enum_from_json as usize);
-            let struct_to_json_fn = self.get_or_create_qs_struct_to_json();
-            self.execution_engine
-                .add_global_mapping(&struct_to_json_fn, qs_struct_to_json as usize);
-            let json_parse_fn = self.get_or_create_qs_json_parse();
-            self.execution_engine
-                .add_global_mapping(&json_parse_fn, qs_json_parse as usize);
-            let json_stringify_fn = self.get_or_create_qs_json_stringify();
-            self.execution_engine
-                .add_global_mapping(&json_stringify_fn, qs_json_stringify as usize);
-            let json_is_null_fn = self.get_or_create_qs_json_is_null();
-            self.execution_engine
-                .add_global_mapping(&json_is_null_fn, qs_json_is_null as usize);
-            let json_len_fn = self.get_or_create_qs_json_len();
-            self.execution_engine
-                .add_global_mapping(&json_len_fn, qs_json_len as usize);
-            let json_get_fn = self.get_or_create_qs_json_get();
-            self.execution_engine
-                .add_global_mapping(&json_get_fn, qs_json_get as usize);
-            let json_index_fn = self.get_or_create_qs_json_index();
-            self.execution_engine
-                .add_global_mapping(&json_index_fn, qs_json_index as usize);
-            let json_str_fn = self.get_or_create_qs_json_str();
-            self.execution_engine
-                .add_global_mapping(&json_str_fn, qs_json_str as usize);
+                // ---- arena ----
+                get_or_create_arena_create => arena_create,
+                get_or_create_arena_alloc => arena_alloc,
+                get_or_create_arena_free => arena_free,
+                get_or_create_arena_mark => arena_mark,
+                get_or_create_arena_release => arena_release,
+                get_or_create_arena_pin => arena_pin,
+                get_or_create_arena_retain => arena_retain,
+                get_or_create_arena_release_ref => arena_release_ref,
+                get_or_create_arena_destroy => arena_destroy,
+            );
 
             match unsafe { self.execution_engine.get_function::<SumFunc>("main") } {
                 Ok(func) => Some(func),
@@ -1651,6 +1660,26 @@ impl<'ctx> Compiler<'ctx> {
                 } else {
                     // True return inside a user-defined function
                     let ret_val = self.compile_expr(expr)?;
+                    // Caller retains if needed; keep return path arena-clean
+                    // Release function-scope arena allocations before returning
+                    let mark_key = format!("__mark_slot_{fn_name}");
+                    if let Some(mark_ptr) = self.vars.borrow().get(&mark_key) {
+                        if let Some(BasicTypeEnum::IntType(mark_ty)) =
+                            self.var_types.borrow().get(&mark_key)
+                        {
+                            let mark_val = self
+                                .builder
+                                .build_load(*mark_ty, *mark_ptr, "fn_mark_load")?
+                                .into_int_value();
+                            let release_fn = self.get_or_create_arena_release();
+                            let arena_ptr = self.load_arena_ptr()?;
+                            let _ = self.builder.build_call(
+                                release_fn,
+                                &[arena_ptr.into(), mark_val.into()],
+                                "fn_mark_release",
+                            )?;
+                        }
+                    }
                     if function.get_type().get_return_type().is_some() {
                         self.builder.build_return(Some(&ret_val))?;
                     } else {
@@ -1660,11 +1689,50 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(())
             }
             Instruction::Block(b) => {
+                // Create an arena checkpoint for this block scope
+                let arena_ptr = self.load_arena_ptr()?;
+                let mark_fn = self.get_or_create_arena_mark();
+                let mark_val = self
+                    .builder
+                    .build_call(mark_fn, &[arena_ptr.into()], "block_arena_mark")?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+
+                // Store mark in entry block to reuse after body
+                let entry = function.get_first_basic_block().unwrap();
+                let temp_builder = self.context.create_builder();
+                match entry.get_first_instruction() {
+                    Some(inst) => temp_builder.position_before(&inst),
+                    None => temp_builder.position_at_end(entry),
+                }
+                let mark_slot = temp_builder
+                    .build_alloca(mark_val.get_type(), "block_mark_slot")
+                    .unwrap();
+                self.builder.build_store(mark_slot, mark_val)?;
+
                 let saved_quick = self.quick_var_types.borrow().clone();
                 for i in b {
                     self.compile_instruction(function, i)?;
                 }
                 *self.quick_var_types.borrow_mut() = saved_quick;
+
+                // Release any allocations made after the mark
+                if let Some(current_block) = self.builder.get_insert_block() {
+                    if current_block.get_terminator().is_none() {
+                        let release_fn = self.get_or_create_arena_release();
+                        let stored_mark = self
+                            .builder
+                            .build_load(mark_val.get_type(), mark_slot, "block_mark_load")?
+                            .into_int_value();
+                        self.builder.build_call(
+                            release_fn,
+                            &[arena_ptr.into(), stored_mark.into()],
+                            "block_arena_release",
+                        )?;
+                    }
+                }
                 Ok(())
             }
             Instruction::Break => {
@@ -1718,6 +1786,8 @@ impl<'ctx> Compiler<'ctx> {
                     // Populate the global at runtime with the actual value
                     self.builder
                         .build_store(global.as_pointer_value(), init_val)?;
+
+                    // Globals persist for program lifetime; no retain needed
 
                     self.vars
                         .borrow_mut()
@@ -1880,6 +1950,16 @@ impl<'ctx> Compiler<'ctx> {
 
                 // body block
                 self.builder.position_at_end(body_bb);
+                // Per-iteration arena checkpoint for for-loop body
+                let arena_ptr = self.load_arena_ptr()?;
+                let mark_fn = self.get_or_create_arena_mark();
+                let mark_val = self
+                    .builder
+                    .build_call(mark_fn, &[arena_ptr.into()], "for_body_mark")?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
                 for stmt in body {
                     self.compile_instruction(function, stmt)?;
                 }
@@ -1890,6 +1970,12 @@ impl<'ctx> Compiler<'ctx> {
                     .get_terminator()
                     .is_none()
                 {
+                    let release_fn = self.get_or_create_arena_release();
+                    self.builder.build_call(
+                        release_fn,
+                        &[arena_ptr.into(), mark_val.into()],
+                        "for_body_release",
+                    )?;
                     self.builder.build_unconditional_branch(step_bb)?;
                 }
 
@@ -1930,6 +2016,30 @@ impl<'ctx> Compiler<'ctx> {
 
                         match ptr_opt {
                             Some(ptr) => {
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                if let BasicValueEnum::PointerValue(old_ptr) = self
+                                    .builder
+                                    .build_load(ptr_ty, ptr, &format!("{name}_old"))?
+                                {
+                                    let arena_ptr = self.load_arena_ptr()?;
+                                    let release_fn = self.get_or_create_arena_release_ref();
+                                    let _ = self.builder.build_call(
+                                        release_fn,
+                                        &[arena_ptr.into(), old_ptr.into()],
+                                        &format!("{name}_release"),
+                                    )?;
+                                }
+
+                                if matches!(self.lookup_qtype(name), Some(Type::Option(_))) {
+                                    if let BasicValueEnum::PointerValue(new_ptr) = new_c {
+                                        self.free_option_slot_when_cleared(
+                                            function,
+                                            ptr,
+                                            new_ptr,
+                                            &format!("{name}_assign"),
+                                        )?;
+                                    }
+                                }
                                 self.builder.build_store(ptr, new_c)?;
                                 if let Some(descriptor) = self.get_active_capture_descriptor(name) {
                                     if let Some(global) =
@@ -2045,6 +2155,33 @@ impl<'ctx> Compiler<'ctx> {
                                 };
                                 self.builder.build_store(field_ptr, val)?;
                             }
+                            Type::Option(_) => {
+                                let ptr_val = match value {
+                                    BasicValueEnum::PointerValue(p) => p,
+                                    other => panic!(
+                                        "Expected pointer value for property {prop}, got {other:?}"
+                                    ),
+                                };
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let old_val = self
+                                    .builder
+                                    .build_load(ptr_ty, field_ptr, &format!("{prop}_old"))?
+                                    .into_pointer_value();
+                                let arena_ptr = self.load_arena_ptr()?;
+                                let release_fn = self.get_or_create_arena_release_ref();
+                                let _ = self.builder.build_call(
+                                    release_fn,
+                                    &[arena_ptr.into(), old_val.into()],
+                                    &format!("{prop}_release"),
+                                )?;
+                                self.free_option_slot_when_cleared(
+                                    function,
+                                    field_ptr,
+                                    ptr_val,
+                                    &format!("{}_field_opt", prop),
+                                )?;
+                                self.builder.build_store(field_ptr, ptr_val)?;
+                            }
                             Type::Str | Type::List(_) | Type::Custom(_) => {
                                 let ptr_val = match value {
                                     BasicValueEnum::PointerValue(p) => p,
@@ -2052,6 +2189,18 @@ impl<'ctx> Compiler<'ctx> {
                                         "Expected pointer value for property {prop}, got {other:?}"
                                     ),
                                 };
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let old_val = self
+                                    .builder
+                                    .build_load(ptr_ty, field_ptr, &format!("{prop}_old"))?
+                                    .into_pointer_value();
+                                let arena_ptr = self.load_arena_ptr()?;
+                                let release_fn = self.get_or_create_arena_release_ref();
+                                let _ = self.builder.build_call(
+                                    release_fn,
+                                    &[arena_ptr.into(), old_val.into()],
+                                    &format!("{prop}_release"),
+                                )?;
                                 self.builder.build_store(field_ptr, ptr_val)?;
                             }
                             Type::Bool => {
@@ -2068,10 +2217,47 @@ impl<'ctx> Compiler<'ctx> {
                         Ok(())
                     }
                     Expr::Index(list_expr, idx_expr) => {
-                        let list_val = self.compile_expr(list_expr)?;
-                        let list_ptr = match list_val {
-                            BasicValueEnum::PointerValue(p) => p,
-                            other => panic!("Index assignment on non-pointer value: {other:?}"),
+                        let mut field_slot_ptr: Option<PointerValue<'ctx>> = None;
+                        let mut updated_var: Option<String> = None;
+
+                        let list_ptr = match &**list_expr {
+                            Expr::Get(container, field_name) => {
+                                let container_is_object = match self.infer_expr_type(container) {
+                                    Ok(Type::Custom(Custype::Object(_))) => true,
+                                    Ok(Type::Option(inner)) => {
+                                        matches!(*inner, Type::Custom(Custype::Object(_)))
+                                    }
+                                    _ => false,
+                                };
+
+                                if container_is_object {
+                                    let (slot_ptr, loaded) =
+                                        self.load_object_field_slot(container, field_name);
+                                    field_slot_ptr = Some(slot_ptr);
+                                    match loaded {
+                                        BasicValueEnum::PointerValue(p) => p,
+                                        other => panic!(
+                                            "List field '{field_name}' is not a pointer: {other:?}"
+                                        ),
+                                    }
+                                } else {
+                                    match self.compile_expr(list_expr)? {
+                                        BasicValueEnum::PointerValue(p) => p,
+                                        _ => panic!("List object not a pointer value"),
+                                    }
+                                }
+                            }
+                            Expr::Variable(name) => {
+                                updated_var = Some(name.clone());
+                                match self.compile_expr(list_expr)? {
+                                    BasicValueEnum::PointerValue(p) => p,
+                                    _ => panic!("List object not a pointer value"),
+                                }
+                            }
+                            _ => match self.compile_expr(list_expr)? {
+                                BasicValueEnum::PointerValue(p) => p,
+                                _ => panic!("List object not a pointer value"),
+                            },
                         };
 
                         let index_val = self.compile_expr(idx_expr)?;
@@ -2094,10 +2280,161 @@ impl<'ctx> Compiler<'ctx> {
                         let one = i64_ty.const_int(1, false);
                         let idx_with_offset =
                             self.builder.build_int_add(idx_i64, one, "idx_plus1")?;
+                        let f64_ty = self.context.f64_type();
+
+                        // Ensure buffer capacity for target index (idx + 1 slots + len slot)
+                        let target_len = self.builder.build_int_add(idx_i64, one, "target_len")?;
+
+                        let cur_len_f = self
+                            .builder
+                            .build_load(f64_ty, list_ptr, "len_load")?
+                            .into_float_value();
+                        let cur_len_i = self.builder.build_float_to_signed_int(
+                            cur_len_f,
+                            i64_ty,
+                            "len_to_i64",
+                        )?;
+
+                        let needs_resize = self.builder.build_int_compare(
+                            IntPredicate::UGT,
+                            target_len,
+                            cur_len_i,
+                            "needs_resize",
+                        )?;
+                        let grow_bb = self
+                            .context
+                            .append_basic_block(function, "list_assign_grow");
+                        let cont_bb = self
+                            .context
+                            .append_basic_block(function, "list_assign_cont");
+                        let branch_block = self.builder.get_insert_block().unwrap();
+                        self.builder
+                            .build_conditional_branch(needs_resize, grow_bb, cont_bb)?;
+
+                        let mut new_raw_opt: Option<PointerValue<'ctx>> = None;
+
+                        // Grow path: allocate new buffer and copy existing contents
+                        self.builder.position_at_end(grow_bb);
+                        let slot_bytes = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
+                        let current_slots =
+                            self.builder
+                                .build_int_add(cur_len_i, one, "current_slots")?;
+                        let current_bytes = self.builder.build_int_mul(
+                            slot_bytes,
+                            current_slots,
+                            "current_bytes",
+                        )?;
+                        let needed_slots =
+                            self.builder
+                                .build_int_add(target_len, one, "needed_slots")?;
+                        let total_bytes =
+                            self.builder
+                                .build_int_mul(slot_bytes, needed_slots, "assign_bytes")?;
+                        let new_raw =
+                            self.arena_alloc_bytes(total_bytes, slot_bytes, "list_assign_buf")?;
+
+                        // Bail out cleanly if arena is exhausted
+                        let is_null = self.builder.build_is_null(new_raw, "list_assign_null")?;
+                        let panic_bb = self
+                            .context
+                            .append_basic_block(function, "list_assign_panic");
+                        let copy_bb = self
+                            .context
+                            .append_basic_block(function, "list_assign_copy");
+                        self.builder
+                            .build_conditional_branch(is_null, panic_bb, copy_bb)?;
+
+                        // Panic block
+                        self.builder.position_at_end(panic_bb);
+                        let msg = self
+                            .builder
+                            .build_global_string_ptr(
+                                "arena exhausted during list assignment\0",
+                                "list_assign_panic_msg",
+                            )
+                            .unwrap();
+                        let panic_fn = self.get_or_create_qs_panic();
+                        self.builder.build_call(
+                            panic_fn,
+                            &[msg.as_pointer_value().into()],
+                            "list_assign_panic_call",
+                        )?;
+                        self.builder.build_unreachable()?;
+
+                        // Copy block
+                        self.builder.position_at_end(copy_bb);
+                        let memcpy_fn = self.get_or_create_memcpy();
+                        let i8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+                        let dst =
+                            self.builder
+                                .build_pointer_cast(new_raw, i8_ptr, "list_assign_dst")?;
+                        let src =
+                            self.builder
+                                .build_pointer_cast(list_ptr, i8_ptr, "list_assign_src")?;
+                        self.builder
+                            .build_call(
+                                memcpy_fn,
+                                &[dst.into(), src.into(), current_bytes.into()],
+                                "list_assign_copy",
+                            )?
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap();
+
+                        // Update length in new buffer
+                        let new_len_f = self.builder.build_signed_int_to_float(
+                            target_len,
+                            f64_ty,
+                            "len_to_f64_assign",
+                        )?;
+                        let new_buf_ptr = self.builder.build_pointer_cast(
+                            new_raw,
+                            list_ptr.get_type(),
+                            "list_assign_buf_cast",
+                        )?;
+                        self.builder.build_store(new_buf_ptr, new_len_f)?;
+
+                        // Write back new pointer to owners
+                        if let Some(vname) = &updated_var {
+                            if let Some(var_ptr) = self.vars.borrow().get(vname) {
+                                let _ = self.builder.build_store(*var_ptr, new_buf_ptr);
+                            }
+                        }
+                        if let Some(slot_ptr) = field_slot_ptr {
+                            let slot_ptr_cast = self
+                                .builder
+                                .build_pointer_cast(
+                                    slot_ptr,
+                                    self.context.ptr_type(AddressSpace::default()),
+                                    "list_assign_field_slot",
+                                )
+                                .unwrap();
+                            let _ = self
+                                .builder
+                                .build_store(slot_ptr_cast, new_buf_ptr.as_basic_value_enum());
+                        }
+
+                        new_raw_opt = Some(new_buf_ptr);
+                        self.builder.build_unconditional_branch(cont_bb)?;
+                        let grow_end = self.builder.get_insert_block().unwrap();
+
+                        // Continue with active pointer
+                        self.builder.position_at_end(cont_bb);
+                        let active_ptr_phi = self
+                            .builder
+                            .build_phi(list_ptr.get_type(), "active_list_ptr")
+                            .unwrap();
+                        let new_raw_val = new_raw_opt.unwrap_or(list_ptr);
+                        let list_ptr_bv = list_ptr.as_basic_value_enum();
+                        let new_raw_bv = new_raw_val.as_basic_value_enum();
+                        active_ptr_phi
+                            .add_incoming(&[(&list_ptr_bv, branch_block), (&new_raw_bv, grow_end)]);
+                        let active_ptr = active_ptr_phi.as_basic_value().into_pointer_value();
+
                         let elem_ptr = unsafe {
                             self.builder.build_in_bounds_gep(
-                                self.context.f64_type(),
-                                list_ptr,
+                                f64_ty,
+                                active_ptr,
                                 &[idx_with_offset],
                                 "list_store",
                             )?
@@ -2128,6 +2465,122 @@ impl<'ctx> Compiler<'ctx> {
                                         "Cannot assign non-pointer {other:?} to string list element"
                                     ),
                                 };
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let old_val = self
+                                    .builder
+                                    .build_load(ptr_ty, elem_ptr, "list_old_str")?
+                                    .into_pointer_value();
+                                let arena_ptr = self.load_arena_ptr()?;
+                                let release_fn = self.get_or_create_arena_release_ref();
+                                let _ = self.builder.build_call(
+                                    release_fn,
+                                    &[arena_ptr.into(), old_val.into()],
+                                    "list_release_str",
+                                )?;
+                                self.builder.build_store(elem_ptr, ptr_val)?;
+                            }
+                            Type::Bool => {
+                                let bool_val = match value {
+                                    BasicValueEnum::IntValue(i) => {
+                                        if i.get_type().get_bit_width() == 1 {
+                                            i
+                                        } else {
+                                            let zero = i.get_type().const_zero();
+                                            self.builder.build_int_compare(
+                                                IntPredicate::NE,
+                                                i,
+                                                zero,
+                                                "int_to_bool_assign",
+                                            )?
+                                        }
+                                    }
+                                    BasicValueEnum::FloatValue(fv) => {
+                                        let zero = self.context.f64_type().const_float(0.0);
+                                        self.builder.build_float_compare(
+                                            FloatPredicate::ONE,
+                                            fv,
+                                            zero,
+                                            "float_to_bool_assign",
+                                        )?
+                                    }
+                                    other => panic!(
+                                        "Cannot assign non-boolean value {other:?} to bool list element"
+                                    ),
+                                };
+                                self.builder.build_store(elem_ptr, bool_val)?;
+                            }
+                            Type::Nil => {
+                                let val = match value {
+                                    BasicValueEnum::PointerValue(p) => p.as_basic_value_enum(),
+                                    BasicValueEnum::FloatValue(f) => f.as_basic_value_enum(),
+                                    BasicValueEnum::IntValue(iv) => self
+                                        .builder
+                                        .build_signed_int_to_float(
+                                            iv,
+                                            self.context.f64_type(),
+                                            "int_to_float_nil_assign",
+                                        )?
+                                        .as_basic_value_enum(),
+                                    other => panic!(
+                                        "Cannot assign unsupported value {other:?} to nil list element"
+                                    ),
+                                };
+                                self.builder.build_store(elem_ptr, val)?;
+                            }
+                            Type::Option(_) => {
+                                let ptr_val = match value {
+                                    BasicValueEnum::PointerValue(p) => p,
+                                    other => panic!(
+                                        "Cannot assign non-pointer {other:?} to pointer list element"
+                                    ),
+                                };
+                                self.free_option_slot_when_cleared(
+                                    function,
+                                    elem_ptr,
+                                    ptr_val,
+                                    "list_option_assign",
+                                )?;
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let old_val = self
+                                    .builder
+                                    .build_load(ptr_ty, elem_ptr, "list_old_opt")?
+                                    .into_pointer_value();
+                                let arena_ptr = self.load_arena_ptr()?;
+                                let release_fn = self.get_or_create_arena_release_ref();
+                                let _ = self.builder.build_call(
+                                    release_fn,
+                                    &[arena_ptr.into(), old_val.into()],
+                                    "list_release_opt",
+                                )?;
+                                self.builder.build_store(elem_ptr, ptr_val)?;
+                            }
+                            Type::Custom(_)
+                            | Type::Result(_, _)
+                            | Type::List(_)
+                            | Type::Io
+                            | Type::WebReturn
+                            | Type::RangeBuilder
+                            | Type::JsonValue
+                            | Type::Kv(_)
+                            | Type::Function(_, _) => {
+                                let ptr_val = match value {
+                                    BasicValueEnum::PointerValue(p) => p,
+                                    other => panic!(
+                                        "Cannot assign non-pointer {other:?} to pointer list element"
+                                    ),
+                                };
+                                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                let old_val = self
+                                    .builder
+                                    .build_load(ptr_ty, elem_ptr, "list_old_ptr")?
+                                    .into_pointer_value();
+                                let arena_ptr = self.load_arena_ptr()?;
+                                let release_fn = self.get_or_create_arena_release_ref();
+                                let _ = self.builder.build_call(
+                                    release_fn,
+                                    &[arena_ptr.into(), old_val.into()],
+                                    "list_release_ptr",
+                                )?;
                                 self.builder.build_store(elem_ptr, ptr_val)?;
                             }
                             other => {
@@ -2252,6 +2705,27 @@ impl<'ctx> Compiler<'ctx> {
                 let entry_bb = self.context.append_basic_block(function, "entry");
                 self.builder.position_at_end(entry_bb);
 
+                // Function-scope arena checkpoint stored in an alloca for reuse on returns
+                let arena_ptr = self.load_arena_ptr()?;
+                let mark_fn = self.get_or_create_arena_mark();
+                let mark_val = self
+                    .builder
+                    .build_call(mark_fn, &[arena_ptr.into()], &format!("{name}_mark"))?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+                let mark_slot = self
+                    .builder
+                    .build_alloca(mark_val.get_type(), &format!("{name}_mark_slot"))
+                    .unwrap();
+                self.builder.build_store(mark_slot, mark_val)?;
+                let mark_key = format!("__mark_slot_{name}");
+                self.vars.borrow_mut().insert(mark_key.clone(), mark_slot);
+                self.var_types
+                    .borrow_mut()
+                    .insert(mark_key, mark_val.get_type().as_basic_type_enum());
+
                 // Allocate space for each parameter and store the incoming values
                 for (i, (param_name, typ)) in params.iter().enumerate() {
                     let arg = function.get_nth_param(i as u32).unwrap();
@@ -2313,6 +2787,17 @@ impl<'ctx> Compiler<'ctx> {
                 // Ensure the function has a terminator; default to a sensible zero/null value.
                 if let Some(current_block) = self.builder.get_insert_block() {
                     if current_block.get_terminator().is_none() {
+                        // Release arena allocations for this function scope before default return
+                        let mark_loaded = self
+                            .builder
+                            .build_load(mark_val.get_type(), mark_slot, &format!("{name}_mark_ld"))?
+                            .into_int_value();
+                        let release_fn = self.get_or_create_arena_release();
+                        self.builder.build_call(
+                            release_fn,
+                            &[arena_ptr.into(), mark_loaded.into()],
+                            &format!("{name}_release"),
+                        )?;
                         match function.get_type().get_return_type() {
                             Some(BasicTypeEnum::FloatType(float_ty)) => {
                                 let zero = float_ty.const_float(0.0);
@@ -2376,6 +2861,16 @@ impl<'ctx> Compiler<'ctx> {
                 let _loop_scope = LoopScopeGuard::new(&self.loop_stack, loop_ctx);
 
                 self.builder.position_at_end(body_bb);
+                // Per-iteration arena mark/release
+                let arena_ptr = self.load_arena_ptr()?;
+                let mark_fn = self.get_or_create_arena_mark();
+                let mark_val = self
+                    .builder
+                    .build_call(mark_fn, &[arena_ptr.into()], "while_body_mark")?
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
                 for stmt in body {
                     self.compile_instruction(function, stmt)?;
                 }
@@ -2386,6 +2881,12 @@ impl<'ctx> Compiler<'ctx> {
                     .get_terminator()
                     .is_none()
                 {
+                    let release_fn = self.get_or_create_arena_release();
+                    self.builder.build_call(
+                        release_fn,
+                        &[arena_ptr.into(), mark_val.into()],
+                        "while_body_release",
+                    )?;
                     self.builder.build_unconditional_branch(cond_bb)?;
                 }
 
@@ -2393,8 +2894,8 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(())
             }
             Instruction::Use {
-                module_name,
-                mod_path,
+                module_name: _,
+                mod_path: _,
             } => Ok(()),
             Instruction::Match { expr, arms } => {
                 let scrutinee_type = self.infer_expr_type(expr).unwrap();
@@ -2621,7 +3122,7 @@ impl<'ctx> Compiler<'ctx> {
                                 let struct_ty = self.result_struct_type();
                                 let typed_ptr = self.builder.build_pointer_cast(
                                     result_ptr,
-                                    struct_ty.ptr_type(AddressSpace::default()),
+                                    self.context.ptr_type(AddressSpace::default()),
                                     &format!("result_match_ptr_{idx}"),
                                 )?;
 
@@ -2882,6 +3383,96 @@ impl<'ctx> Compiler<'ctx> {
             let i8ptr = self.context.ptr_type(AddressSpace::default());
             let void_ptr = self.context.ptr_type(AddressSpace::default());
             void_ptr.fn_type(&[i8ptr.into(), i8ptr.into()], false)
+        })
+    }
+
+    fn get_or_create_arena_create(&self) -> FunctionValue<'ctx> {
+        let usize_ty = self
+            .context
+            .ptr_sized_int_type(self.execution_engine.get_target_data(), None);
+        self.get_or_add_function("arena_create", || {
+            self.context
+                .ptr_type(AddressSpace::default())
+                .fn_type(&[usize_ty.into()], false)
+        })
+    }
+
+    fn get_or_create_arena_alloc(&self) -> FunctionValue<'ctx> {
+        let usize_ty = self
+            .context
+            .ptr_sized_int_type(self.execution_engine.get_target_data(), None);
+        let args = &[
+            self.context.ptr_type(AddressSpace::default()).into(),
+            usize_ty.into(),
+            usize_ty.into(),
+        ];
+        self.get_or_add_function("arena_alloc", || {
+            self.context
+                .ptr_type(AddressSpace::default())
+                .fn_type(args, false)
+        })
+    }
+
+    fn get_or_create_arena_free(&self) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        self.get_or_add_function("arena_free", || {
+            self.context
+                .void_type()
+                .fn_type(&[ptr_ty.into(), ptr_ty.into()], false)
+        })
+    }
+
+    fn get_or_create_arena_mark(&self) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let usize_ty = self
+            .context
+            .ptr_sized_int_type(self.execution_engine.get_target_data(), None);
+        self.get_or_add_function("arena_mark", || usize_ty.fn_type(&[ptr_ty.into()], false))
+    }
+
+    fn get_or_create_arena_release(&self) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let usize_ty = self
+            .context
+            .ptr_sized_int_type(self.execution_engine.get_target_data(), None);
+        self.get_or_add_function("arena_release", || {
+            self.context
+                .void_type()
+                .fn_type(&[ptr_ty.into(), usize_ty.into()], false)
+        })
+    }
+
+    fn get_or_create_arena_pin(&self) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        self.get_or_add_function("arena_pin", || {
+            self.context
+                .void_type()
+                .fn_type(&[ptr_ty.into(), ptr_ty.into()], false)
+        })
+    }
+
+    fn get_or_create_arena_retain(&self) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        self.get_or_add_function("arena_retain", || {
+            self.context
+                .void_type()
+                .fn_type(&[ptr_ty.into(), ptr_ty.into()], false)
+        })
+    }
+
+    fn get_or_create_arena_release_ref(&self) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        self.get_or_add_function("arena_release_ref", || {
+            self.context
+                .void_type()
+                .fn_type(&[ptr_ty.into(), ptr_ty.into()], false)
+        })
+    }
+
+    fn get_or_create_arena_destroy(&self) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        self.get_or_add_function("arena_destroy", || {
+            self.context.void_type().fn_type(&[ptr_ty.into()], false)
         })
     }
 
@@ -3360,17 +3951,10 @@ impl<'ctx> Compiler<'ctx> {
                     .builder
                     .build_global_string_ptr("%f\0", "fmt_str_call")
                     .unwrap();
-                let size = self.context.i64_type().const_int(128, false);
-                let malloc_fn = self.get_or_create_malloc();
-                let buf_ptr = self
-                    .builder
-                    .build_call(malloc_fn, &[size.into()], "malloc_buf_call")
-                    .unwrap();
-                let buf_ptr = buf_ptr
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap()
-                    .into_pointer_value();
+                let i64_ty = self.context.i64_type();
+                let size = i64_ty.const_int(128, false);
+                let align = self.target_usize_type().const_int(1, false);
+                let buf_ptr = self.arena_alloc_bytes(size, align, "malloc_buf_call")?;
                 let sprintf_fn = self.get_or_create_sprintf();
                 self.builder.build_call(
                     sprintf_fn,
@@ -3876,7 +4460,6 @@ impl<'ctx> Compiler<'ctx> {
                     && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "input") =>
             {
                 // Read a line from stdin
-                let malloc_fn = self.get_or_create_malloc();
                 let fgets_fn = self.get_or_create_fgets();
                 let stdin_fn = self.get_or_create_get_stdin();
                 let strlen_fn = self.get_or_create_strlen();
@@ -3891,14 +4474,11 @@ impl<'ctx> Compiler<'ctx> {
 
                 // Allocate buffer for input (256 bytes should be enough for most inputs)
                 let buffer_size = self.context.i64_type().const_int(256, false);
-                let buffer =
-                    self.builder
-                        .build_call(malloc_fn, &[buffer_size.into()], "input_buffer")?;
-                let buffer_ptr = buffer
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap()
-                    .into_pointer_value();
+                let buffer_ptr = self.arena_alloc_bytes(
+                    buffer_size,
+                    self.target_usize_type().const_int(1, false),
+                    "input_buffer",
+                )?;
 
                 // Get stdin file pointer
                 let stdin_ptr = self.builder.build_call(stdin_fn, &[], "stdin_ptr")?;
@@ -4098,20 +4678,14 @@ impl<'ctx> Compiler<'ctx> {
                 let compiled_obj = self.compile_expr(obj)?;
                 if let BasicValueEnum::FloatValue(float_val) = compiled_obj {
                     let sprintf_fn = self.get_or_create_sprintf();
-                    let malloc_fn = self.get_or_create_malloc();
 
                     // Allocate buffer for string (e.g., 64 bytes for float string representation)
                     let buffer_size = self.context.i64_type().const_int(64, false);
-                    let buffer_ptr = self.builder.build_call(
-                        malloc_fn,
-                        &[buffer_size.into()],
+                    let buffer_ptr = self.arena_alloc_bytes(
+                        buffer_size,
+                        self.target_usize_type().const_int(1, false),
                         "str_buf_malloc",
                     )?;
-                    let buffer_ptr = buffer_ptr
-                        .try_as_basic_value()
-                        .left()
-                        .unwrap()
-                        .into_pointer_value();
 
                     // Format string: "%f\0"
                     let format_str = self
@@ -4224,7 +4798,6 @@ impl<'ctx> Compiler<'ctx> {
                             BinOp::Plus => {
                                 // Simple but efficient string concatenation
                                 let strlen_fn = self.get_or_create_strlen();
-                                let malloc_fn = self.get_or_create_malloc();
                                 let strcpy_fn = self.get_or_create_strcpy();
                                 let strcat_fn = self.get_or_create_strcat_c();
 
@@ -4250,17 +4823,12 @@ impl<'ctx> Compiler<'ctx> {
                                 let total_len =
                                     self.builder.build_int_add(sum, one, "total_len")?;
 
-                                // malloc(buffer)
-                                let buf_ptr = self.builder.build_call(
-                                    malloc_fn,
-                                    &[total_len.into()],
+                                // arena_alloc(buffer)
+                                let buf_ptr = self.arena_alloc_bytes(
+                                    total_len,
+                                    self.target_usize_type().const_int(1, false),
                                     "malloc_buf",
                                 )?;
-                                let buf_ptr = buf_ptr
-                                    .try_as_basic_value()
-                                    .left()
-                                    .unwrap()
-                                    .into_pointer_value();
 
                                 // strcpy(buf, lp)
                                 self.builder.build_call(
@@ -4353,17 +4921,12 @@ impl<'ctx> Compiler<'ctx> {
                     .builder
                     .build_int_mul(slot_bytes, count, "obj_size")
                     .unwrap();
-                // Call malloc
-                let malloc_fn = self.get_or_create_malloc();
-                let raw_ptr = self
-                    .builder
-                    .build_call(malloc_fn, &[total_bytes.into()], "malloc_obj")
-                    .unwrap();
-                let raw_ptr = raw_ptr
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap()
-                    .into_pointer_value();
+                // arena alloc
+                let raw_ptr = self.arena_alloc_bytes(
+                    total_bytes,
+                    slot_bytes,
+                    "malloc_obj",
+                )?;
                 let obj_ptr = self
                     .builder
                     .build_pointer_cast(raw_ptr, slot_ty, "obj_ptr")?;
@@ -4388,6 +4951,15 @@ impl<'ctx> Compiler<'ctx> {
                             .unwrap()
                     };
                     let _ = self.builder.build_store(field_ptr, val);
+                    if let BasicValueEnum::PointerValue(ptr_val) = val {
+                        let arena_ptr = self.load_arena_ptr()?;
+                        let pin_fn = self.get_or_create_arena_pin();
+                        let _ = self.builder.build_call(
+                            pin_fn,
+                            &[arena_ptr.into(), ptr_val.into()],
+                            &format!("field_{field_name}_pin"),
+                        )?;
+                    }
                 }
                 Ok(obj_ptr.as_basic_value_enum())
             }
@@ -4533,7 +5105,6 @@ impl<'ctx> Compiler<'ctx> {
                 // Find the index of this property
                 let index = field_defs.keys().position(|k| k == prop).unwrap() as u64;
                 let idx_const = self.context.i64_type().const_int(index, false);
-                let slot_ty = self.context.ptr_type(AddressSpace::default());
                 // Compute address and load
                 // Compute the address of the field
                 let field_ptr = unsafe {
@@ -4641,7 +5212,7 @@ impl<'ctx> Compiler<'ctx> {
                         if met == "unwrap"
                             && matches!(
                                 self.infer_expr_type(ex).unwrap(),
-                                (Type::Option(_)) | (Type::Result(_, _))
+                                Type::Option(_) | Type::Result(_, _)
                             ) =>
                     {
                         let receiver = self.compile_expr(ex)?;
@@ -4757,16 +5328,12 @@ impl<'ctx> Compiler<'ctx> {
                                     .builder
                                     .build_global_string_ptr("%f\0", "fmt_insert_f")
                                     .unwrap();
-                                let malloc_fn = self.get_or_create_malloc();
                                 let size = self.context.i64_type().const_int(64, false);
-                                let buf = self
-                                    .builder
-                                    .build_call(malloc_fn, &[size.into()], "malloc_fbuf")
-                                    .unwrap()
-                                    .try_as_basic_value()
-                                    .left()
-                                    .unwrap()
-                                    .into_pointer_value();
+                                let buf = self.arena_alloc_bytes(
+                                    size,
+                                    self.target_usize_type().const_int(1, false),
+                                    "malloc_fbuf",
+                                )?;
                                 let sprintf_fn = self.get_or_create_sprintf();
                                 self.builder
                                     .build_call(
@@ -4817,16 +5384,12 @@ impl<'ctx> Compiler<'ctx> {
                                         .builder
                                         .build_global_string_ptr("%ld\0", "fmt_insert_i")
                                         .unwrap();
-                                    let malloc_fn = self.get_or_create_malloc();
                                     let size = self.context.i64_type().const_int(64, false);
-                                    let buf = self
-                                        .builder
-                                        .build_call(malloc_fn, &[size.into()], "malloc_ibuf")
-                                        .unwrap()
-                                        .try_as_basic_value()
-                                        .left()
-                                        .unwrap()
-                                        .into_pointer_value();
+                                    let buf = self.arena_alloc_bytes(
+                                        size,
+                                        self.target_usize_type().const_int(1, false),
+                                        "malloc_ibuf",
+                                    )?;
                                     let sprintf_fn = self.get_or_create_sprintf();
                                     self.builder
                                         .build_call(
@@ -4964,16 +5527,11 @@ impl<'ctx> Compiler<'ctx> {
                             .unwrap();
                         // Allocate a 32-byte buffer
                         let size = self.context.i64_type().const_int(128, false);
-                        let malloc_fn = self.get_or_create_malloc();
-                        let buf_ptr = self
-                            .builder
-                            .build_call(malloc_fn, &[size.into()], "malloc_buf")
-                            .unwrap();
-                        let buf_ptr = buf_ptr
-                            .try_as_basic_value()
-                            .left()
-                            .unwrap()
-                            .into_pointer_value();
+                        let buf_ptr = self.arena_alloc_bytes(
+                            size,
+                            self.target_usize_type().const_int(1, false),
+                            "malloc_buf",
+                        )?;
                         // Call sprintf(buf, "%ld", num_val)
                         let sprintf_fn = self.get_or_create_sprintf();
                         self.builder.build_call(
@@ -5428,6 +5986,12 @@ impl<'ctx> Compiler<'ctx> {
 
                         // Ensure capacity for the new element: reuse 8-byte slots for simplicity.
                         let slot_bytes = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
+                        let current_slots = self
+                            .builder
+                            .build_int_add(cur_len_i, i64_ty.const_int(1, false), "current_slots")?;
+                        let current_bytes = self
+                            .builder
+                            .build_int_mul(slot_bytes, current_slots, "current_bytes")?;
                         let needed_slots = self.builder.build_int_add(
                             cur_len_i,
                             i64_ty.const_int(2, false),
@@ -5436,18 +6000,34 @@ impl<'ctx> Compiler<'ctx> {
                         let total_bytes = self
                             .builder
                             .build_int_mul(slot_bytes, needed_slots, "push_bytes")?;
-                        let realloc_fn = self.get_or_create_realloc();
-                        let new_raw = self
+                        let new_raw = self.arena_alloc_bytes(
+                            total_bytes,
+                            slot_bytes,
+                            "list_push_buf",
+                        )?;
+
+                        // Copy current contents into the new buffer
+                        let memcpy_fn = self.get_or_create_memcpy();
+                        let i8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+                        let dst = self
                             .builder
+                            .build_pointer_cast(new_raw, i8_ptr, "list_push_dst")?;
+                        let src = self
+                            .builder
+                            .build_pointer_cast(
+                                original_buf_ptr,
+                                i8_ptr,
+                                "list_push_src",
+                            )?;
+                        self.builder
                             .build_call(
-                                realloc_fn,
-                                &[original_buf_ptr.into(), total_bytes.into()],
-                                "realloc_list_push",
+                                memcpy_fn,
+                                &[dst.into(), src.into(), current_bytes.into()],
+                                "copy_list_push",
                             )?
                             .try_as_basic_value()
                             .left()
-                            .unwrap()
-                            .into_pointer_value();
+                            .unwrap();
 
                         // Update the source variable if `obj` is a variable name
                         if let Some(vname) = updated_var {
@@ -5458,12 +6038,11 @@ impl<'ctx> Compiler<'ctx> {
 
                         // Write the pointer back to the owning object field when applicable.
                         if let Some(slot_ptr) = field_slot_ptr {
-                            let ptr_ty = self.context.ptr_type(AddressSpace::default());
                             let slot_ptr_cast = self
                                 .builder
                                 .build_pointer_cast(
                                     slot_ptr,
-                                    ptr_ty.ptr_type(AddressSpace::default()),
+                                    self.context.ptr_type(AddressSpace::default()),
                                     "list_field_slot",
                                 )
                                 .unwrap();
@@ -6040,16 +6619,12 @@ impl<'ctx> Compiler<'ctx> {
                         .build_int_mul(bytes_per, num_elems, "list_bytes")?
                 };
 
-                // Malloc buffer
-                let malloc_fn = self.get_or_create_malloc();
-                let raw_ptr =
-                    self.builder
-                        .build_call(malloc_fn, &[total_bytes.into()], "malloc")?;
-                let raw_ptr = raw_ptr
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap()
-                    .into_pointer_value();
+                // Arena-backed buffer
+                let raw_ptr = self.arena_alloc_bytes(
+                    total_bytes,
+                    self.target_usize_type().const_int(std::mem::size_of::<f64>() as u64, false),
+                    "malloc",
+                )?;
                 let f64_ptr_ty = self.context.ptr_type(AddressSpace::default());
                 let buf_ptr =
                     self.builder
@@ -6078,6 +6653,7 @@ impl<'ctx> Compiler<'ctx> {
                             .build_in_bounds_gep(f64_ty, buf_ptr, &[idx_val], "elem_ptr")?
                     };
                     let _ = self.builder.build_store(gep, elem_val);
+                    // no retain for literal elements; released with arena scope
                 }
 
                 Ok(buf_ptr.as_basic_value_enum())
@@ -6112,7 +6688,7 @@ impl<'ctx> Compiler<'ctx> {
 
                         // Compute address of the target character: &str[idx]
                         let i8_ty = self.context.i8_type();
-                        let i8_ptr_ty = i8_ty.ptr_type(AddressSpace::default());
+                        let i8_ptr_ty = self.context.ptr_type(AddressSpace::default());
                         let char_ptr = unsafe {
                             // Use i8 element type for byte-wise indexing
                             self.builder
@@ -6127,15 +6703,12 @@ impl<'ctx> Compiler<'ctx> {
                             .into_int_value();
 
                         // Allocate a 2-byte buffer: character + null terminator
-                        let malloc_fn = self.get_or_create_malloc();
                         let two = self.context.i64_type().const_int(2, false);
-                        let buf_raw = self
-                            .builder
-                            .build_call(malloc_fn, &[two.into()], "malloc_char")?
-                            .try_as_basic_value()
-                            .left()
-                            .unwrap()
-                            .into_pointer_value();
+                        let buf_raw = self.arena_alloc_bytes(
+                            two,
+                            self.target_usize_type().const_int(1, false),
+                            "malloc_char",
+                        )?;
                         let buf_ptr =
                             self.builder
                                 .build_pointer_cast(buf_raw, i8_ptr_ty, "char_buf_ptr")?;
@@ -6424,15 +6997,6 @@ impl<'ctx> Compiler<'ctx> {
         })
     }
 
-    fn get_or_create_malloc(&self) -> FunctionValue<'ctx> {
-        // malloc signature: (i64) -> i8*
-        self.get_or_add_function("malloc", || {
-            let i64_type = self.context.i64_type();
-            let i8ptr = self.context.ptr_type(AddressSpace::default());
-            i8ptr.fn_type(&[i64_type.into()], false)
-        })
-    }
-
     fn get_or_create_strcpy(&self) -> FunctionValue<'ctx> {
         // strcpy signature: (i8*, i8*) -> i8*
         self.get_or_add_function("strcpy", || {
@@ -6449,21 +7013,12 @@ impl<'ctx> Compiler<'ctx> {
         })
     }
 
-    fn get_or_create_realloc(&self) -> FunctionValue<'ctx> {
-        // realloc signature: (i8*, i64) -> i8*
-        self.get_or_add_function("realloc", || {
-            let i8ptr = self.context.ptr_type(AddressSpace::default());
-            let i64_type = self.context.i64_type();
-            i8ptr.fn_type(&[i8ptr.into(), i64_type.into()], false)
-        })
-    }
-
     fn get_or_create_memcpy(&self) -> FunctionValue<'ctx> {
-        // memcpy signature: (i8*, i8*, i64) -> i8*
+        // memcpy signature: (i8*, i8*, usize) -> i8*
         self.get_or_add_function("memcpy", || {
             let i8ptr = self.context.ptr_type(AddressSpace::default());
-            let i64_type = self.context.i64_type();
-            i8ptr.fn_type(&[i8ptr.into(), i8ptr.into(), i64_type.into()], false)
+            let usize_ty = self.target_usize_type();
+            i8ptr.fn_type(&[i8ptr.into(), i8ptr.into(), usize_ty.into()], false)
         })
     }
 
@@ -6677,7 +7232,7 @@ impl<'ctx> Compiler<'ctx> {
     fn get_or_create_qs_register_struct_descriptor(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("qs_register_struct_descriptor", || {
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            let ptr_ptr_ty = ptr_ty.ptr_type(AddressSpace::default());
+            let ptr_ptr_ty = self.context.ptr_type(AddressSpace::default());
             self.context.void_type().fn_type(
                 &[
                     ptr_ty.into(),
@@ -6694,7 +7249,7 @@ impl<'ctx> Compiler<'ctx> {
     fn get_or_create_qs_register_enum_variant(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("qs_register_enum_variant", || {
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            let ptr_ptr_ty = ptr_ty.ptr_type(AddressSpace::default());
+            let ptr_ptr_ty = self.context.ptr_type(AddressSpace::default());
             self.context.void_type().fn_type(
                 &[
                     ptr_ty.into(),

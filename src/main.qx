@@ -1,11 +1,48 @@
-let maybe_val = Some("Hello, World!");
-let maybe_v = None;
+print "Starting function arena test"
 
+object Object {
+  value: Str,
+  number: Num,
+}
 
-print maybe_val 
-print maybe_v
-print "Wow"
-print "runnning web server"
-io.listen(8080, fun(req: Request) {
-  return io.web().text(req.path)
-})
+fun make_objects(round: Num) {
+  let i = 0
+
+  while (i < 1000) {
+    let text = "fn_" + round.str() + "_" + i.str()
+    let obj = Object {
+      value: text,
+      number: i
+    }
+
+    // USE the values so they matter
+    if (obj.number == -1) {
+      print("impossible")
+    }
+
+    i = i + 1
+  }
+  return None
+
+  // function ends here
+  // EVERYTHING above should drop with the arena
+}
+
+let ext = 200000
+let round = 0
+
+while (ext > 0) {
+  ext = ext - 1
+  round = round + 1
+
+  make_objects(round)
+
+  // observable effect outside the arena
+  if (round == 1000) {
+    print("completed 1000 function calls")
+    round = 0
+  }
+}
+
+print("done")
+

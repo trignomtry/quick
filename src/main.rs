@@ -1,17 +1,18 @@
 mod compiler;
 mod parser;
 use crate::TokenKind::*;
+use crate::compiler::CodegenMode;
 use clap::Parser as Clap;
-use compiler::{CodegenMode, Compiler};
 use parser::Parser;
+
+use crate::compiler::Compiler;
+use inkwell::AddressSpace;
 #[cfg(not(feature = "runtime-lib"))]
 static LIBQUICK: &'static [u8] = include_bytes!("../build/libquick.a");
 unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
     fn strncmp(a: *const i8, b: *const i8, c: i32) -> i32;
     fn printf(fmt: *const i8, ...) -> i32;
-    fn malloc(size: usize) -> *mut std::ffi::c_void;
-
     fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8;
     fn sprintf(buf: *mut i8, fmt: *const i8, ...) -> i32;
     fn strcat(dest: *mut i8, src: *const i8) -> *mut i8;
@@ -19,6 +20,8 @@ unsafe extern "C" {
     fn atoi(s: *const i8) -> usize;
     // Correct strstr signature: returns pointer to match or NULL
     fn strstr(s: *const i8, o: *const i8) -> *mut i8;
+
+    fn memcpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8;
 
     fn rand() -> i32;
     fn time(t: *mut i64) -> i64;
@@ -38,10 +41,48 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> usize;
     fn fclose(stream: *mut std::ffi::c_void) -> i32;
-    fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
     fn LLVMLinkInMCJIT();
     fn LLVMLinkInInterpreter();
 
+}
+
+pub static mut GLOBAL_ARENA_PTR: *mut Arena = std::ptr::null_mut();
+
+fn get_or_create_global_arena() -> *mut Arena {
+    unsafe {
+        if GLOBAL_ARENA_PTR.is_null() {
+            GLOBAL_ARENA_PTR = arena_create(64 * 1024 * 1024);
+        }
+        GLOBAL_ARENA_PTR
+    }
+}
+
+fn alloc_in_arena(size: usize, align: usize) -> *mut c_void {
+    unsafe {
+        let arena = get_or_create_global_arena();
+        arena_alloc(arena, size, align) as *mut c_void
+    }
+}
+
+fn arena_alloc_cstring(bytes: &[u8]) -> *mut c_char {
+    unsafe {
+        let len = bytes.len().saturating_add(1);
+        let buf = alloc_in_arena(len, 1) as *mut u8;
+        if buf.is_null() {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+        buf as *mut c_char
+    }
+}
+
+fn arena_cstring_from_bytes_checked(bytes: &[u8]) -> *mut c_char {
+    if bytes.contains(&0) {
+        std::ptr::null_mut()
+    } else {
+        arena_alloc_cstring(bytes)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -191,9 +232,7 @@ pub unsafe extern "C" fn qs_str_replace(
     };
 
     if needle_bytes.is_empty() {
-        return std::ffi::CString::new(hay_bytes.to_vec())
-            .unwrap()
-            .into_raw();
+        return arena_alloc_cstring(hay_bytes);
     }
 
     let needle_len = needle_bytes.len();
@@ -210,7 +249,7 @@ pub unsafe extern "C" fn qs_str_replace(
         }
     }
 
-    std::ffi::CString::new(result).unwrap().into_raw()
+    arena_alloc_cstring(&result)
 }
 
 #[unsafe(no_mangle)]
@@ -277,17 +316,14 @@ pub unsafe extern "C" fn qs_str_split(
 
     let mut c_strings: Vec<*mut c_void> = Vec::with_capacity(segments.len());
     for seg in segments {
-        let c = std::ffi::CString::new(seg).unwrap();
-        c_strings.push(c.into_raw() as *mut c_void);
+        let ptr = arena_alloc_cstring(&seg) as *mut c_void;
+        c_strings.push(ptr);
     }
 
     let slots = c_strings.len() + 1;
     let total_bytes = slots * std::mem::size_of::<*mut c_void>();
-    let buffer = malloc(total_bytes);
+    let buffer = alloc_in_arena(total_bytes, std::mem::align_of::<*mut c_void>());
     if buffer.is_null() {
-        for ptr in c_strings {
-            let _ = std::ffi::CString::from_raw(ptr as *mut c_char);
-        }
         return std::ptr::null_mut();
     }
 
@@ -306,7 +342,7 @@ pub unsafe extern "C" fn qs_str_split(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_list_join(list: *mut c_void, separator: *const c_char) -> *mut c_char {
-    let empty_cstring = || std::ffi::CString::new(Vec::<u8>::new()).unwrap().into_raw();
+    let empty_cstring = || arena_alloc_cstring(&[]);
 
     if list.is_null() {
         return empty_cstring();
@@ -350,13 +386,14 @@ pub unsafe extern "C" fn qs_list_join(list: *mut c_void, separator: *const c_cha
         }
     }
 
-    std::ffi::CString::new(output).unwrap().into_raw()
+    arena_alloc_cstring(&output)
 }
 use hyper::body::Body;
 use inkwell::basic_block::BasicBlock;
 use inkwell::targets::InitializationConfig;
 use inkwell::types::BasicTypeEnum;
 
+use std::alloc::{Layout, alloc, dealloc};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -735,11 +772,19 @@ fn coerce_json_to_value(schema: &SchemaType, value: &JsonValue) -> Result<ValueR
             .as_str()
             .ok_or_else(|| format!("Expected string, found {value}"))
             .and_then(|s| {
-                std::ffi::CString::new(s.as_bytes())
-                    .map_err(|_| {
-                        format!("String value for JSON field contains embedded null: {s:?}")
-                    })
-                    .map(|c| ValueRepr::Pointer(c.into_raw() as *mut c_void))
+                let bytes = s.as_bytes();
+                if bytes.contains(&0) {
+                    Err(format!(
+                        "String value for JSON field contains embedded null: {s:?}"
+                    ))
+                } else {
+                    let ptr = arena_alloc_cstring(bytes) as *mut c_void;
+                    if ptr.is_null() {
+                        Err("Failed to allocate string in arena".to_string())
+                    } else {
+                        Ok(ValueRepr::Pointer(ptr))
+                    }
+                }
             }),
         SchemaType::Bool => value
             .as_bool()
@@ -782,7 +827,7 @@ fn build_list_from_json(inner: &SchemaType, elements: &[JsonValue]) -> Result<*m
     let total_bytes = total_slots
         .checked_mul(std::mem::size_of::<u64>())
         .ok_or_else(|| "List size overflow".to_string())?;
-    let buffer = unsafe { malloc(total_bytes) };
+    let buffer = alloc_in_arena(total_bytes, std::mem::align_of::<u64>());
     if buffer.is_null() {
         return Err("Failed to allocate memory for list".to_string());
     }
@@ -828,7 +873,7 @@ fn build_struct_from_json_value(
     let total_bytes = field_count
         .checked_mul(std::mem::size_of::<u64>())
         .ok_or_else(|| "Struct size overflow".to_string())?;
-    let buffer = unsafe { malloc(total_bytes) };
+    let buffer = alloc_in_arena(total_bytes, std::mem::align_of::<u64>());
     if buffer.is_null() {
         return Err(format!(
             "Failed to allocate memory while constructing '{}' from JSON",
@@ -942,7 +987,7 @@ fn build_enum_from_json_value(
     let total_bytes = total_slots
         .checked_mul(slot_bytes)
         .ok_or_else(|| "Enum size overflow".to_string())?;
-    let buffer = unsafe { malloc(total_bytes) };
+    let buffer = alloc_in_arena(total_bytes, std::mem::align_of::<u64>());
     if buffer.is_null() {
         return Err(format!(
             "Failed to allocate memory while constructing enum '{}'",
@@ -1274,9 +1319,14 @@ pub unsafe extern "C" fn qs_struct_to_json(
 
     let json_value = struct_to_json_value(&descriptor, struct_ptr);
     match serde_json::to_string(&json_value) {
-        Ok(rendered) => std::ffi::CString::new(rendered)
-            .map(|c| c.into_raw())
-            .unwrap_or_else(|_| std::ptr::null_mut()),
+        Ok(rendered) => {
+            let bytes = rendered.into_bytes();
+            if bytes.contains(&0) {
+                std::ptr::null_mut()
+            } else {
+                arena_alloc_cstring(&bytes)
+            }
+        }
         Err(err) => {
             eprintln!("Failed to render JSON for '{type_name}': {err}");
             std::ptr::null_mut()
@@ -1287,26 +1337,25 @@ pub unsafe extern "C" fn qs_struct_to_json(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_json_parse(source: *const c_char) -> *mut c_void {
     if source.is_null() {
-        let msg = std::ffi::CString::new("io.json received null input")
-            .unwrap()
-            .into_raw();
+        let msg = arena_alloc_cstring(b"io.json received null input");
         return qs_result_err(msg as *mut c_void);
     }
     let text = CStr::from_ptr(source).to_str().unwrap_or_default();
     let parsed = match serde_json::from_str::<JsonValue>(&text) {
         Ok(value) => value,
         Err(err) => {
-            let msg = std::ffi::CString::new(err.to_string())
-                .unwrap_or_else(|_| std::ffi::CString::new("io.json parse error").unwrap())
-                .into_raw();
+            let err_text = err.to_string();
+            let msg = if err_text.as_bytes().contains(&0) {
+                arena_alloc_cstring(b"io.json parse error")
+            } else {
+                arena_alloc_cstring(err_text.as_bytes())
+            };
             return qs_result_err(msg as *mut c_void);
         }
     };
 
     let JsonValue::Object(map) = parsed else {
-        let msg = std::ffi::CString::new("io.json expects an object at the top level")
-            .unwrap()
-            .into_raw();
+        let msg = arena_alloc_cstring(b"io.json expects an object at the top level");
         return qs_result_err(msg as *mut c_void);
     };
 
@@ -1328,9 +1377,14 @@ pub extern "C" fn qs_json_stringify(handle: *mut JsonHandle) -> *mut c_char {
     match NonNull::new(handle) {
         Some(handle) => unsafe {
             match serde_json::to_string(&handle.as_ref().value) {
-                Ok(rendered) => std::ffi::CString::new(rendered)
-                    .map(|c| c.into_raw())
-                    .unwrap_or_else(|_| std::ptr::null_mut()),
+                Ok(rendered) => {
+                    let bytes = rendered.into_bytes();
+                    if bytes.contains(&0) {
+                        std::ptr::null_mut()
+                    } else {
+                        arena_alloc_cstring(&bytes)
+                    }
+                }
                 Err(err) => {
                     eprintln!("Failed to stringify JSON value: {err}");
                     std::ptr::null_mut()
@@ -1406,10 +1460,95 @@ pub unsafe extern "C" fn qs_json_str(handle: *mut JsonHandle) -> *mut c_char {
         return std::ptr::null_mut();
     }
     match (*handle).value.as_str() {
-        Some(text) => std::ffi::CString::new(text.as_bytes())
-            .map(|c| c.into_raw())
-            .unwrap_or_else(|_| std::ptr::null_mut()),
+        Some(text) => {
+            let bytes = text.as_bytes();
+            if bytes.contains(&0) {
+                std::ptr::null_mut()
+            } else {
+                arena_alloc_cstring(bytes)
+            }
+        }
         None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_create(capacity: usize) -> *mut Arena {
+    let cap = capacity.max(1024);
+    let ptr = Box::into_raw(Box::new(Arena::new(cap)));
+    GLOBAL_ARENA_PTR = ptr;
+    ptr
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_alloc(arena: *mut Arena, size: usize, align: usize) -> *mut u8 {
+    let Some(mut arena) = NonNull::new(arena) else {
+        return std::ptr::null_mut();
+    };
+
+    let layout = match Layout::from_size_align(size, align) {
+        Ok(l) => l,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    arena
+        .as_mut()
+        .alloc(layout)
+        .map(|p| p.as_ptr())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_free(arena: *mut Arena, ptr: *mut u8) {
+    if arena.is_null() || ptr.is_null() {
+        return;
+    }
+    if let Some(mut arena) = NonNull::new(arena) {
+        arena.as_mut().release_ref(ptr);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_mark(arena: *mut Arena) -> usize {
+    NonNull::new(arena).map(|a| a.as_ref().mark()).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_release(arena: *mut Arena, mark: usize) {
+    if let Some(mut arena) = NonNull::new(arena) {
+        arena.as_mut().release_from(mark);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_pin(arena: *mut Arena, ptr: *mut u8) {
+    if let Some(mut arena) = NonNull::new(arena) {
+        arena.as_mut().retain(ptr);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_retain(arena: *mut Arena, ptr: *mut u8) {
+    if let Some(mut arena) = NonNull::new(arena) {
+        arena.as_mut().retain(ptr);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_release_ref(arena: *mut Arena, ptr: *mut u8) {
+    if let Some(mut arena) = NonNull::new(arena) {
+        arena.as_mut().release_ref(ptr);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_destroy(arena: *mut Arena) {
+    if arena.is_null() {
+        return;
+    }
+    let _ = Box::from_raw(arena);
+    if GLOBAL_ARENA_PTR == arena {
+        GLOBAL_ARENA_PTR = std::ptr::null_mut();
     }
 }
 
@@ -1423,9 +1562,11 @@ pub struct RequestObject {
 }
 
 fn owned_string_to_c_ptr(value: String) -> *mut c_char {
-    CString::new(value)
-        .expect("Request field contains interior null byte")
-        .into_raw()
+    let bytes = value.into_bytes();
+    if bytes.contains(&0) {
+        panic!("Request field contains interior null byte");
+    }
+    arena_alloc_cstring(&bytes)
 }
 
 fn option_string_to_c_ptr(value: Option<String>) -> *mut c_char {
@@ -1503,11 +1644,7 @@ unsafe fn free_body(ptr: *mut u8, len: usize) {
     }
 }
 
-unsafe fn free_c_string(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        let _ = std::ffi::CString::from_raw(ptr);
-    }
-}
+unsafe fn free_c_string(_ptr: *mut c_char) {}
 
 impl ResponseObject {
     unsafe fn take_body_bytes(&mut self) -> Vec<u8> {
@@ -1527,13 +1664,8 @@ impl ResponseObject {
             None
         } else {
             let ptr = std::mem::replace(field, std::ptr::null_mut());
-            match std::ffi::CString::from_raw(ptr).into_string() {
-                Ok(s) => Some(s),
-                Err(err) => {
-                    let cstr = err.into_cstring();
-                    Some(cstr.to_string_lossy().into_owned())
-                }
-            }
+            let cstr = CStr::from_ptr(ptr);
+            Some(cstr.to_string_lossy().into_owned())
         }
     }
 }
@@ -1763,12 +1895,10 @@ pub unsafe extern "C" fn web_text(content: *const c_char) -> *mut ResponseObject
 
     let response = Box::new(ResponseObject {
         status_code: 200,
-        content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-            .unwrap()
-            .into_raw(),
+        content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
         body: body_ptr,
         body_len,
-        headers: std::ffi::CString::new("").unwrap().into_raw(),
+        headers: arena_alloc_cstring(b""),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -1786,12 +1916,10 @@ pub unsafe extern "C" fn web_json(content: *const c_char) -> *mut ResponseObject
 
     let response = Box::new(ResponseObject {
         status_code: 200,
-        content_type: std::ffi::CString::new("application/json; charset=utf-8")
-            .unwrap()
-            .into_raw(),
+        content_type: arena_alloc_cstring(b"application/json; charset=utf-8"),
         body: body_ptr,
         body_len,
-        headers: std::ffi::CString::new("").unwrap().into_raw(),
+        headers: arena_alloc_cstring(b""),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -1809,12 +1937,10 @@ pub unsafe extern "C" fn web_page(content: *const c_char) -> *mut ResponseObject
 
     let response = Box::new(ResponseObject {
         status_code: 200,
-        content_type: std::ffi::CString::new("text/html; charset=utf-8")
-            .unwrap()
-            .into_raw(),
+        content_type: arena_alloc_cstring(b"text/html; charset=utf-8"),
         body: body_ptr,
         body_len,
-        headers: std::ffi::CString::new("").unwrap().into_raw(),
+        headers: arena_alloc_cstring(b""),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -1835,12 +1961,10 @@ pub unsafe extern "C" fn web_error_text(
 
     let response = Box::new(ResponseObject {
         status_code,
-        content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-            .unwrap()
-            .into_raw(),
+        content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
         body: body_ptr,
         body_len,
-        headers: std::ffi::CString::new("").unwrap().into_raw(),
+        headers: arena_alloc_cstring(b""),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -1861,12 +1985,10 @@ pub unsafe extern "C" fn web_error_page(
 
     let response = Box::new(ResponseObject {
         status_code,
-        content_type: std::ffi::CString::new("text/html; charset=utf-8")
-            .unwrap()
-            .into_raw(),
+        content_type: arena_alloc_cstring(b"text/html; charset=utf-8"),
         body: body_ptr,
         body_len,
-        headers: std::ffi::CString::new("").unwrap().into_raw(),
+        headers: arena_alloc_cstring(b""),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -1888,14 +2010,14 @@ pub unsafe extern "C" fn web_redirect(
 
     let (body_ptr, body_len) = leak_string_as_body(String::new());
 
+    let header_bytes = headers.into_bytes();
+
     let response = Box::new(ResponseObject {
         status_code,
-        content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-            .unwrap()
-            .into_raw(),
+        content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
         body: body_ptr,
         body_len,
-        headers: std::ffi::CString::new(headers).unwrap().into_raw(),
+        headers: arena_cstring_from_bytes_checked(&header_bytes),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -1905,16 +2027,12 @@ pub unsafe extern "C" fn web_redirect(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn io_read_file(filename: *const c_char) -> *mut c_void {
     if filename.is_null() {
-        let msg = std::ffi::CString::new("io.read received null filename")
-            .unwrap()
-            .into_raw();
+        let msg = arena_alloc_cstring(b"io.read received null filename");
         return qs_result_err(msg as *mut c_void);
     }
 
     let Some(path) = cstr_to_path(filename) else {
-        let msg = std::ffi::CString::new("io.read received invalid filename")
-            .unwrap()
-            .into_raw();
+        let msg = arena_alloc_cstring(b"io.read received invalid filename");
         return qs_result_err(msg as *mut c_void);
     };
 
@@ -1922,14 +2040,23 @@ pub unsafe extern "C" fn io_read_file(filename: *const c_char) -> *mut c_void {
 
     match read_result {
         Ok(content) => {
-            let owned = std::ffi::CString::new(content).unwrap().into_raw();
-            qs_result_ok(owned as *mut c_void)
+            let bytes = content.into_bytes();
+            let owned = arena_cstring_from_bytes_checked(&bytes);
+            if owned.is_null() {
+                let msg = arena_alloc_cstring(b"io.read failed");
+                qs_result_err(msg as *mut c_void)
+            } else {
+                qs_result_ok(owned as *mut c_void)
+            }
         }
         Err(err) => {
             let msg_text = err.to_string();
-            let c_msg = std::ffi::CString::new(msg_text)
-                .unwrap_or_else(|_| std::ffi::CString::new("io.read failed").unwrap())
-                .into_raw();
+            let c_msg = arena_cstring_from_bytes_checked(msg_text.as_bytes());
+            let c_msg = if c_msg.is_null() {
+                arena_alloc_cstring(b"io.read failed")
+            } else {
+                c_msg
+            };
             qs_result_err(c_msg as *mut c_void)
         }
     }
@@ -1942,16 +2069,12 @@ pub unsafe extern "C" fn io_write_file(
     content: *const c_char,
 ) -> *mut c_void {
     if filename.is_null() || content.is_null() {
-        let msg = std::ffi::CString::new("io.write received null pointer")
-            .unwrap()
-            .into_raw();
+        let msg = arena_alloc_cstring(b"io.write received null pointer");
         return qs_result_err(msg as *mut c_void);
     }
 
     let Some(path) = cstr_to_path(filename) else {
-        let msg = std::ffi::CString::new("io.write received invalid filename")
-            .unwrap()
-            .into_raw();
+        let msg = arena_alloc_cstring(b"io.write received invalid filename");
         return qs_result_err(msg as *mut c_void);
     };
 
@@ -1959,14 +2082,17 @@ pub unsafe extern "C" fn io_write_file(
 
     match block_on_in_runtime(async { tokio::fs::write(path.as_ref(), content_bytes).await }) {
         Ok(_) => {
-            let ok_msg = std::ffi::CString::new("").unwrap().into_raw();
+            let ok_msg = arena_alloc_cstring(b"");
             qs_result_ok(ok_msg as *mut c_void)
         }
         Err(err) => {
             let msg_text = err.to_string();
-            let c_msg = std::ffi::CString::new(msg_text)
-                .unwrap_or_else(|_| std::ffi::CString::new("io.write failed").unwrap())
-                .into_raw();
+            let c_msg = arena_cstring_from_bytes_checked(msg_text.as_bytes());
+            let c_msg = if c_msg.is_null() {
+                arena_alloc_cstring(b"io.write failed")
+            } else {
+                c_msg
+            };
             qs_result_err(c_msg as *mut c_void)
         }
     }
@@ -2027,12 +2153,10 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
         let (body_ptr, body_len) = leak_string_as_body("File not found".to_string());
         let response = Box::new(ResponseObject {
             status_code: 404,
-            content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-                .unwrap()
-                .into_raw(),
+            content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
             body: body_ptr,
             body_len,
-            headers: std::ffi::CString::new("").unwrap().into_raw(),
+            headers: arena_alloc_cstring(b""),
             missing_file_path: std::ptr::null_mut(),
         });
         return Box::into_raw(response);
@@ -2045,12 +2169,10 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
         let (body_ptr, body_len) = leak_string_as_body("File not found".to_string());
         let response = Box::new(ResponseObject {
             status_code: 404,
-            content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-                .unwrap()
-                .into_raw(),
+            content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
             body: body_ptr,
             body_len,
-            headers: std::ffi::CString::new("").unwrap().into_raw(),
+            headers: arena_alloc_cstring(b""),
             missing_file_path: std::ptr::null_mut(),
         });
         return Box::into_raw(response);
@@ -2070,31 +2192,28 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
             let (body_ptr, body_len) = leak_bytes_as_body(content);
             let response = Box::new(ResponseObject {
                 status_code: 200,
-                content_type: std::ffi::CString::new(mime_type).unwrap().into_raw(),
+                content_type: arena_alloc_cstring(mime_type.as_bytes()),
                 body: body_ptr,
                 body_len,
-                headers: std::ffi::CString::new("").unwrap().into_raw(),
+                headers: arena_alloc_cstring(b""),
                 missing_file_path: std::ptr::null_mut(),
             });
             Box::into_raw(response)
         }
         Err(err) => {
             let missing_ptr = if err.kind() == std::io::ErrorKind::NotFound {
-                std::ffi::CString::new(path_buf.to_string_lossy().into_owned())
-                    .unwrap()
-                    .into_raw()
+                let missing = path_buf.to_string_lossy();
+                arena_cstring_from_bytes_checked(missing.as_bytes())
             } else {
                 std::ptr::null_mut()
             };
             let (body_ptr, body_len) = leak_string_as_body("File not found".to_string());
             let response = Box::new(ResponseObject {
                 status_code: 404,
-                content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-                    .unwrap()
-                    .into_raw(),
+                content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
                 body: body_ptr,
                 body_len,
-                headers: std::ffi::CString::new("").unwrap().into_raw(),
+                headers: arena_alloc_cstring(b""),
                 missing_file_path: missing_ptr,
             });
             Box::into_raw(response)
@@ -2117,12 +2236,10 @@ pub unsafe extern "C" fn web_file_not_found(
         let (body_ptr, body_len) = leak_bytes_as_body(body);
         let response = Box::new(ResponseObject {
             status_code: 404,
-            content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-                .unwrap()
-                .into_raw(),
+            content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
             body: body_ptr,
             body_len,
-            headers: std::ffi::CString::new("").unwrap().into_raw(),
+            headers: arena_alloc_cstring(b""),
             missing_file_path: std::ptr::null_mut(),
         });
         return Box::into_raw(response);
@@ -2154,10 +2271,10 @@ pub unsafe extern "C" fn web_file_not_found(
                 let (body_ptr, body_len) = leak_bytes_as_body(content);
                 let response = Box::new(ResponseObject {
                     status_code: 404,
-                    content_type: std::ffi::CString::new(mime_type).unwrap().into_raw(),
+                    content_type: arena_alloc_cstring(mime_type.as_bytes()),
                     body: body_ptr,
                     body_len,
-                    headers: std::ffi::CString::new("").unwrap().into_raw(),
+                    headers: arena_alloc_cstring(b""),
                     missing_file_path: std::ptr::null_mut(),
                 });
                 return Box::into_raw(response);
@@ -2168,12 +2285,10 @@ pub unsafe extern "C" fn web_file_not_found(
     let (body_ptr, body_len) = leak_string_as_body("Not Found".to_string());
     let response = Box::new(ResponseObject {
         status_code: 404,
-        content_type: std::ffi::CString::new("text/plain; charset=utf-8")
-            .unwrap()
-            .into_raw(),
+        content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
         body: body_ptr,
         body_len,
-        headers: std::ffi::CString::new("").unwrap().into_raw(),
+        headers: arena_alloc_cstring(b""),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -2298,7 +2413,11 @@ fn dispatch_request_to_handler(
     headers_raw: String,
     body_str: String,
 ) -> (i32, String, Vec<u8>, String) {
-    match std::panic::catch_unwind(move || unsafe {
+    // Scope arena allocations to this request so per-request C-strings don't accumulate
+    let arena_ptr = get_or_create_global_arena();
+    let mark = unsafe { arena_mark(arena_ptr) };
+
+    let result = match std::panic::catch_unwind(move || unsafe {
         let body = if body_str.is_empty() {
             None
         } else {
@@ -2320,7 +2439,15 @@ fn dispatch_request_to_handler(
             b"Internal Server Error".to_vec(),
             String::new(),
         ),
+    };
+
+    unsafe {
+        if !arena_ptr.is_null() {
+            arena_release(arena_ptr, mark);
+        }
     }
+
+    result
 }
 
 unsafe fn invoke_user_handler(
@@ -4373,6 +4500,12 @@ fn execute_run(filename: String, debug: bool) {
             ensure_llvm_ready();
             let context = inkwell::context::Context::create();
             let module = context.create_module("sum");
+            let arena_global = module.add_global(
+                context.ptr_type(AddressSpace::default()),
+                None,
+                "__qs_arena",
+            );
+            arena_global.set_initializer(&context.ptr_type(AddressSpace::default()).const_null());
             let execution_engine = module
                 .create_jit_execution_engine(inkwell::OptimizationLevel::Aggressive)
                 .unwrap();
@@ -4418,6 +4551,7 @@ fn execute_run(filename: String, debug: bool) {
                 closure_envs: RefCell::new(HashMap::new()),
                 current_function: RefCell::new(Vec::new()),
                 loop_stack: RefCell::new(Vec::new()),
+                current_arena: arena_global,
             };
 
             // seed the C PRNG so io.random() varies each run
@@ -4436,6 +4570,9 @@ fn execute_run(filename: String, debug: bool) {
 
             unsafe {
                 let res = sum.call();
+                if !SERVER_RUNNING.load(Ordering::Relaxed) && !GLOBAL_ARENA_PTR.is_null() {
+                    arena_destroy(GLOBAL_ARENA_PTR);
+                }
                 if res != 0.0 {
                     std::process::exit(res as i32);
                 }
@@ -4492,6 +4629,12 @@ fn execute_build(filename: String, debug: bool) {
             ensure_llvm_ready();
             let context = inkwell::context::Context::create();
             let module = context.create_module("sum");
+            let arena_global = module.add_global(
+                context.ptr_type(AddressSpace::default()),
+                None,
+                "__qs_arena",
+            );
+            arena_global.set_initializer(&context.ptr_type(AddressSpace::default()).const_null());
             let execution_engine = module
                 .create_jit_execution_engine(inkwell::OptimizationLevel::Aggressive)
                 .unwrap();
@@ -4538,6 +4681,7 @@ fn execute_build(filename: String, debug: bool) {
                 closure_envs: RefCell::new(HashMap::new()),
                 current_function: RefCell::new(Vec::new()),
                 loop_stack: RefCell::new(Vec::new()),
+                current_arena: arena_global,
             };
 
             unsafe {
@@ -4630,7 +4774,9 @@ fn execute_build(filename: String, debug: bool) {
             }
 
             let linker = linker_override.unwrap_or_else(|| std::ffi::OsString::from("cc"));
-            let link_status = std::process::Command::new(&linker).args(&link_args).status();
+            let link_status = std::process::Command::new(&linker)
+                .args(&link_args)
+                .status();
 
             match link_status {
                 Ok(status) if status.success() => {
@@ -5414,6 +5560,110 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
     });
 
     tokens
+}
+
+struct Allocation {
+    ptr: *mut u8,
+    layout: Layout,
+    refs: usize,
+}
+
+struct Arena {
+    allocations: Vec<Allocation>,
+    index_map: HashMap<usize, usize>,
+    _capacity_hint: usize,
+}
+
+impl Arena {
+    fn new(cap: usize) -> Self {
+        Self {
+            allocations: Vec::new(),
+            index_map: HashMap::new(),
+            _capacity_hint: cap,
+        }
+    }
+
+    fn alloc(&mut self, layout: std::alloc::Layout) -> Option<NonNull<u8>> {
+        unsafe {
+            let ptr = alloc(layout);
+            let nn = NonNull::new(ptr)?;
+            let idx = self.allocations.len();
+            self.allocations.push(Allocation {
+                ptr,
+                layout,
+                refs: 0,
+            });
+            self.index_map.insert(ptr as usize, idx);
+            Some(nn)
+        }
+    }
+
+    fn retain(&mut self, ptr: *mut u8) {
+        if let Some(idx) = self.index_map.get(&(ptr as usize)).copied() {
+            if let Some(alloc) = self.allocations.get_mut(idx) {
+                alloc.refs = alloc.refs.saturating_add(1);
+            }
+        }
+    }
+
+    fn release_ref(&mut self, ptr: *mut u8) {
+        if ptr.is_null() {
+            return;
+        }
+        if let Some(idx) = self.index_map.get(&(ptr as usize)).copied() {
+            if let Some(alloc) = self.allocations.get_mut(idx) {
+                if alloc.refs > 0 {
+                    alloc.refs -= 1;
+                }
+                if alloc.refs == 0 {
+                    let layout = alloc.layout;
+                    let raw_ptr = alloc.ptr;
+                    self.allocations.swap_remove(idx);
+                    if let Some(swapped) = self.allocations.get(idx) {
+                        self.index_map.insert(swapped.ptr as usize, idx);
+                    }
+                    self.index_map.remove(&(raw_ptr as usize));
+                    unsafe {
+                        dealloc(raw_ptr, layout);
+                    }
+                }
+            }
+        }
+    }
+
+    fn mark(&self) -> usize {
+        self.allocations.len()
+    }
+
+    fn release_from(&mut self, target_len: usize) {
+        let mut retained: Vec<Allocation> = Vec::new();
+        while self.allocations.len() > target_len {
+            let alloc = self.allocations.pop().unwrap();
+            self.index_map.remove(&(alloc.ptr as usize));
+            if alloc.refs == 0 {
+                unsafe {
+                    dealloc(alloc.ptr, alloc.layout);
+                }
+            } else {
+                retained.push(alloc);
+            }
+        }
+        for alloc in retained.into_iter().rev() {
+            let idx = self.allocations.len();
+            self.index_map.insert(alloc.ptr as usize, idx);
+            self.allocations.push(alloc);
+        }
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        for alloc in self.allocations.drain(..) {
+            unsafe {
+                dealloc(alloc.ptr, alloc.layout);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
