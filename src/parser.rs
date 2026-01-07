@@ -209,7 +209,7 @@ impl Parser {
         // Handle return statements with type inference and consistency checking
         if self.match_kind(TokenKind::Return) {
             let expr = self.expression()?;
-            let expr_line = self.previous().line;
+            let _expr_line = self.previous().line;
             let line_hint = self.previous().line;
             let ret_type = self
                 .pctx
@@ -362,7 +362,7 @@ impl Parser {
                         name,
                         value,
                         type_hint,
-                        global,
+                        global: _,
                     } => {
                         // Only allow literal constants to avoid executing code
                         let is_literal = matches!(
@@ -450,7 +450,7 @@ impl Parser {
             self.is_global = was;
             Ok(Instruction::Block(stmts))
         } else if self.match_kind(TokenKind::Print) || self.match_kind(TokenKind::Reprint) {
-            let prkind = self.previous().clone();
+            let _prkind = self.previous().clone();
             let expr = self.expression()?;
             // Static type checking for print expression
             let print_line = self.previous().line;
@@ -993,7 +993,7 @@ impl Parser {
             }
             let real_type = if let Some(hint) = type_hint {
                 match (expr_type.clone(), (hint)) {
-                    (Type::Kv(l), Type::Kv(y)) => Type::Kv(y),
+                    (Type::Kv(_l), Type::Kv(y)) => Type::Kv(y),
                     (Type::List(act), Type::List(exp)) if *act == Type::Nil => Type::List(exp),
                     (act, exp) => {
                         if act != exp {

@@ -7,7 +7,7 @@ rust-version = "1.85"
 description = "The QuickScript CLI tool, inspired by cargo"
 
 [lib]
-name = "quick"
+name = "quick_runtime"
 path = "src/lib.rs"
 crate-type = ["staticlib"]
 required-features = ["runtime-lib"]
@@ -39,7 +39,7 @@ serde_json = "1.0"
 [features]
 runtime-lib = []
 [profile.release]
-lto = true
+lto = false
 codegen-units = 1
 panic = "abort"
 opt-level = 3

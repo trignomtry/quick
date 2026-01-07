@@ -191,13 +191,20 @@ jobs:
           fi
           export RUSTFLAGS="$NEW_RUSTFLAGS"
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
-          lib_path="target/${{ matrix.target }}/release/libquick.a"
+          lib_path="target/${{ matrix.target }}/release/libquick_runtime.a"
           if [ ! -f "$lib_path" ]; then
-            echo "Static library not found at $lib_path" >&2
-            exit 1
+            # Fallback to old name if present
+            alt_path="target/${{ matrix.target }}/release/libquick.a"
+            if [ -f "$alt_path" ]; then
+              lib_path="$alt_path"
+            else
+              echo "Static library not found at $lib_path or $alt_path" >&2
+              exit 1
+            fi
           fi
-          mkdir -p build
-          cp "$lib_path" build/libquick.a
+          mkdir -p build target/runtime/release
+          cp "$lib_path" build/libquick_runtime.a
+          cp "$lib_path" target/runtime/release/libquick_runtime.a
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build release (Windows)
@@ -214,17 +221,23 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
-          $libPath = "target/${{ matrix.target }}/release/libquick.a"
-          $altPath = "target/${{ matrix.target }}/release/quick.lib"
+          $libPath = "target/${{ matrix.target }}/release/libquick_runtime.a"
+          $altPath = "target/${{ matrix.target }}/release/libquick.a"
+          $altPath2 = "target/${{ matrix.target }}/release/quick.lib"
           if (-not (Test-Path $libPath)) {
             if (Test-Path $altPath) {
               $libPath = $altPath
+            } elseif (Test-Path $altPath2) {
+              $libPath = $altPath2
             } else {
-              Write-Error "Static library not found at $libPath or $altPath"
+              Write-Error "Static library not found at $libPath or $altPath or $altPath2"
             }
           }
           New-Item -ItemType Directory -Force -Path build | Out-Null
-          Copy-Item $libPath build/libquick.a -Force
+          Copy-Item $libPath build/libquick_runtime.a -Force
+          $runtimeDir = Join-Path $env:GITHUB_WORKSPACE "target/runtime/release"
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+          Copy-Item $libPath (Join-Path $runtimeDir "libquick_runtime.a") -Force
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package artifact (Linux/macOS)
@@ -240,7 +253,9 @@ jobs:
           cp "${BIN_SRC}" "${OUT_DIR}/${ARTIFACT_BASE}${{ matrix.bin_ext }}"
 
           LIB_SRC=""
-          if compgen -G "${TARGET_DIR}/libquick.*" > /dev/null; then
+          if compgen -G "${TARGET_DIR}/libquick_runtime.*" > /dev/null; then
+            LIB_SRC=$(ls "${TARGET_DIR}/libquick_runtime."* | head -n1)
+          elif compgen -G "${TARGET_DIR}/libquick.*" > /dev/null; then
             LIB_SRC=$(ls "${TARGET_DIR}/libquick."* | head -n1)
           elif compgen -G "${TARGET_DIR}/quick.*" > /dev/null; then
             LIB_SRC=$(ls "${TARGET_DIR}/quick."* | head -n1)
@@ -296,15 +311,19 @@ jobs:
           $binSrc = Join-Path $targetDir "quick${{ matrix.bin_ext }}"
           Copy-Item $binSrc (Join-Path $outDir "$artifactBase${{ matrix.bin_ext }}")
 
-          $libSrc = Get-ChildItem -Path $targetDir -Filter "libquick.*" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $libSrc = Get-ChildItem -Path $targetDir -Filter "libquick_runtime.*" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $libSrc) {
-            $libSrc = Get-ChildItem -Path $targetDir -Filter "quick.*" -ErrorAction SilentlyContinue | Select-Object -First 1
+            $libSrc = Get-ChildItem -Path $targetDir -Filter "libquick.*" -ErrorAction SilentlyContinue | Select-Object -First 1
           }
 
           $entries = @((Join-Path $outDir "$artifactBase${{ matrix.bin_ext }}"))
           if ($libSrc) {
             Copy-Item $libSrc.FullName (Join-Path $outDir $libSrc.Name)
             $entries += (Join-Path $outDir $libSrc.Name)
+            # Ensure embed path exists for Windows builds too
+            $runtimeDir = Join-Path $env:GITHUB_WORKSPACE "target/runtime/release"
+            New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+            Copy-Item $libSrc.FullName (Join-Path $runtimeDir "libquick_runtime.a") -Force
           }
 
           $zipPath = Join-Path $outDir "$artifactBase.zip"

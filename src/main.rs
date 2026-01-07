@@ -8,7 +8,7 @@ use parser::Parser;
 use crate::compiler::Compiler;
 use inkwell::AddressSpace;
 #[cfg(not(feature = "runtime-lib"))]
-static LIBQUICK: &'static [u8] = include_bytes!("../build/libquick.a");
+static LIBQUICK: &'static [u8] = include_bytes!("../target/runtime/release/libquick_runtime.a");
 unsafe extern "C" {
     fn strcmp(a: *const i8, b: *const i8) -> i32;
     fn strncmp(a: *const i8, b: *const i8, c: i32) -> i32;
@@ -47,6 +47,7 @@ unsafe extern "C" {
 }
 
 pub static mut GLOBAL_ARENA_PTR: *mut Arena = std::ptr::null_mut();
+static ARENA_DEBUG_CHECKS: AtomicBool = AtomicBool::new(false);
 
 fn get_or_create_global_arena() -> *mut Arena {
     unsafe {
@@ -215,41 +216,45 @@ pub unsafe extern "C" fn qs_str_replace(
     needle: *const c_char,
     replacement: *const c_char,
 ) -> *mut c_char {
-    if haystack.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let hay_bytes = CStr::from_ptr(haystack).to_bytes();
-    let needle_bytes = if needle.is_null() {
-        &[][..]
-    } else {
-        CStr::from_ptr(needle).to_bytes()
-    };
-    let replacement_bytes = if replacement.is_null() {
-        &[][..]
-    } else {
-        CStr::from_ptr(replacement).to_bytes()
-    };
-
-    if needle_bytes.is_empty() {
-        return arena_alloc_cstring(hay_bytes);
-    }
-
-    let needle_len = needle_bytes.len();
-    let mut result = Vec::with_capacity(hay_bytes.len());
-    let mut index = 0;
-    let hay_len = hay_bytes.len();
-    while index < hay_len {
-        if index + needle_len <= hay_len && &hay_bytes[index..index + needle_len] == needle_bytes {
-            result.extend_from_slice(replacement_bytes);
-            index += needle_len;
-        } else {
-            result.push(hay_bytes[index]);
-            index += 1;
+    unsafe {
+        if haystack.is_null() {
+            return std::ptr::null_mut();
         }
-    }
 
-    arena_alloc_cstring(&result)
+        let hay_bytes = CStr::from_ptr(haystack).to_bytes();
+        let needle_bytes = if needle.is_null() {
+            &[][..]
+        } else {
+            CStr::from_ptr(needle).to_bytes()
+        };
+        let replacement_bytes = if replacement.is_null() {
+            &[][..]
+        } else {
+            CStr::from_ptr(replacement).to_bytes()
+        };
+
+        if needle_bytes.is_empty() {
+            return arena_alloc_cstring(hay_bytes);
+        }
+
+        let needle_len = needle_bytes.len();
+        let mut result = Vec::with_capacity(hay_bytes.len());
+        let mut index = 0;
+        let hay_len = hay_bytes.len();
+        while index < hay_len {
+            if index + needle_len <= hay_len
+                && &hay_bytes[index..index + needle_len] == needle_bytes
+            {
+                result.extend_from_slice(replacement_bytes);
+                index += needle_len;
+            } else {
+                result.push(hay_bytes[index]);
+                index += 1;
+            }
+        }
+
+        arena_alloc_cstring(&result)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -284,109 +289,113 @@ pub unsafe extern "C" fn qs_str_split(
     haystack: *const c_char,
     delimiter: *const c_char,
 ) -> *mut c_void {
-    let hay_bytes = if haystack.is_null() {
-        &[][..]
-    } else {
-        CStr::from_ptr(haystack).to_bytes()
-    };
-    let delim_bytes = if delimiter.is_null() {
-        &[][..]
-    } else {
-        CStr::from_ptr(delimiter).to_bytes()
-    };
+    unsafe {
+        let hay_bytes = if haystack.is_null() {
+            &[][..]
+        } else {
+            CStr::from_ptr(haystack).to_bytes()
+        };
+        let delim_bytes = if delimiter.is_null() {
+            &[][..]
+        } else {
+            CStr::from_ptr(delimiter).to_bytes()
+        };
 
-    let mut segments: Vec<Vec<u8>> = Vec::new();
+        let mut segments: Vec<Vec<u8>> = Vec::new();
 
-    if delim_bytes.is_empty() {
-        segments.push(hay_bytes.to_vec());
-    } else {
-        let mut start = 0usize;
-        let mut index = 0usize;
-        while index + delim_bytes.len() <= hay_bytes.len() {
-            if &hay_bytes[index..index + delim_bytes.len()] == delim_bytes {
-                segments.push(hay_bytes[start..index].to_vec());
-                index += delim_bytes.len();
-                start = index;
-            } else {
-                index += 1;
+        if delim_bytes.is_empty() {
+            segments.push(hay_bytes.to_vec());
+        } else {
+            let mut start = 0usize;
+            let mut index = 0usize;
+            while index + delim_bytes.len() <= hay_bytes.len() {
+                if &hay_bytes[index..index + delim_bytes.len()] == delim_bytes {
+                    segments.push(hay_bytes[start..index].to_vec());
+                    index += delim_bytes.len();
+                    start = index;
+                } else {
+                    index += 1;
+                }
             }
+            segments.push(hay_bytes[start..].to_vec());
         }
-        segments.push(hay_bytes[start..].to_vec());
+
+        let mut c_strings: Vec<*mut c_void> = Vec::with_capacity(segments.len());
+        for seg in segments {
+            let ptr = arena_alloc_cstring(&seg) as *mut c_void;
+            c_strings.push(ptr);
+        }
+
+        let slots = c_strings.len() + 1;
+        let total_bytes = slots * std::mem::size_of::<*mut c_void>();
+        let buffer = alloc_in_arena(total_bytes, std::mem::align_of::<*mut c_void>());
+        if buffer.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        // First slot stores the length as f64
+        let len_ptr = buffer.cast::<f64>();
+        *len_ptr = c_strings.len() as f64;
+
+        // Remaining slots store string pointers
+        let data_ptr = buffer.cast::<*mut c_void>().add(1);
+        for (idx, ptr) in c_strings.into_iter().enumerate() {
+            data_ptr.add(idx).write(ptr);
+        }
+
+        buffer
     }
-
-    let mut c_strings: Vec<*mut c_void> = Vec::with_capacity(segments.len());
-    for seg in segments {
-        let ptr = arena_alloc_cstring(&seg) as *mut c_void;
-        c_strings.push(ptr);
-    }
-
-    let slots = c_strings.len() + 1;
-    let total_bytes = slots * std::mem::size_of::<*mut c_void>();
-    let buffer = alloc_in_arena(total_bytes, std::mem::align_of::<*mut c_void>());
-    if buffer.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    // First slot stores the length as f64
-    let len_ptr = buffer.cast::<f64>();
-    *len_ptr = c_strings.len() as f64;
-
-    // Remaining slots store string pointers
-    let data_ptr = buffer.cast::<*mut c_void>().add(1);
-    for (idx, ptr) in c_strings.into_iter().enumerate() {
-        data_ptr.add(idx).write(ptr);
-    }
-
-    buffer
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_list_join(list: *mut c_void, separator: *const c_char) -> *mut c_char {
-    let empty_cstring = || arena_alloc_cstring(&[]);
+    unsafe {
+        let empty_cstring = || arena_alloc_cstring(&[]);
 
-    if list.is_null() {
-        return empty_cstring();
-    }
-
-    let len_ptr = list.cast::<f64>();
-    let length = (*len_ptr).round() as usize;
-
-    if length == 0 {
-        return empty_cstring();
-    }
-
-    let sep_bytes = if separator.is_null() {
-        &[][..]
-    } else {
-        CStr::from_ptr(separator).to_bytes()
-    };
-
-    let data_ptr = list.cast::<*mut c_void>().add(1);
-    let mut total_len = sep_bytes.len() * length.saturating_sub(1);
-    let mut elements: Vec<*const c_char> = Vec::with_capacity(length);
-
-    for idx in 0..length {
-        let raw = *data_ptr.add(idx) as *const c_char;
-        if raw.is_null() {
-            elements.push(std::ptr::null());
-            continue;
+        if list.is_null() {
+            return empty_cstring();
         }
-        let bytes = CStr::from_ptr(raw).to_bytes();
-        total_len += bytes.len();
-        elements.push(raw);
-    }
 
-    let mut output = Vec::with_capacity(total_len);
-    for (index, ptr) in elements.iter().enumerate() {
-        if !ptr.is_null() {
-            output.extend_from_slice(CStr::from_ptr(*ptr).to_bytes());
-        }
-        if index + 1 != length {
-            output.extend_from_slice(sep_bytes);
-        }
-    }
+        let len_ptr = list.cast::<f64>();
+        let length = (*len_ptr).round() as usize;
 
-    arena_alloc_cstring(&output)
+        if length == 0 {
+            return empty_cstring();
+        }
+
+        let sep_bytes = if separator.is_null() {
+            &[][..]
+        } else {
+            CStr::from_ptr(separator).to_bytes()
+        };
+
+        let data_ptr = list.cast::<*mut c_void>().add(1);
+        let mut total_len = sep_bytes.len() * length.saturating_sub(1);
+        let mut elements: Vec<*const c_char> = Vec::with_capacity(length);
+
+        for idx in 0..length {
+            let raw = *data_ptr.add(idx) as *const c_char;
+            if raw.is_null() {
+                elements.push(std::ptr::null());
+                continue;
+            }
+            let bytes = CStr::from_ptr(raw).to_bytes();
+            total_len += bytes.len();
+            elements.push(raw);
+        }
+
+        let mut output = Vec::with_capacity(total_len);
+        for (index, ptr) in elements.iter().enumerate() {
+            if !ptr.is_null() {
+                output.extend_from_slice(CStr::from_ptr(*ptr).to_bytes());
+            }
+            if index + 1 != length {
+                output.extend_from_slice(sep_bytes);
+            }
+        }
+
+        arena_alloc_cstring(&output)
+    }
 }
 use hyper::body::Body;
 use inkwell::basic_block::BasicBlock;
@@ -401,7 +410,6 @@ use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs;
 use std::mem;
-use std::ops::Index;
 use std::process::Command;
 use std::ptr::{self, NonNull};
 
@@ -413,7 +421,6 @@ use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 // Hyper (async HTTP server)
 use hyper::service::{make_service_fn, service_fn};
@@ -435,10 +442,12 @@ unsafe fn cstr_to_string(ptr: *const c_char) -> String {
 }
 
 unsafe fn cstr_to_option_string(ptr: *const c_char) -> Option<String> {
-    if ptr.is_null() {
-        None
-    } else {
-        Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    unsafe {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+        }
     }
 }
 
@@ -746,10 +755,12 @@ enum ValueRepr {
 }
 
 unsafe fn store_value(slot_ptr: *mut u8, repr: ValueRepr) {
-    match repr {
-        ValueRepr::Float(f) => (slot_ptr as *mut f64).write(f),
-        ValueRepr::Bool(b) => (slot_ptr as *mut u64).write(if b { 1 } else { 0 }),
-        ValueRepr::Pointer(ptr) => (slot_ptr as *mut *mut c_void).write(ptr),
+    unsafe {
+        match repr {
+            ValueRepr::Float(f) => (slot_ptr as *mut f64).write(f),
+            ValueRepr::Bool(b) => (slot_ptr as *mut u64).write(if b { 1 } else { 0 }),
+            ValueRepr::Pointer(ptr) => (slot_ptr as *mut *mut c_void).write(ptr),
+        }
     }
 }
 
@@ -1124,50 +1135,52 @@ pub unsafe extern "C" fn qs_register_struct_descriptor(
     field_names: *const *const c_char,
     field_types: *const *const c_char,
 ) {
-    if canonical_name.is_null() || structural_signature.is_null() {
-        return;
-    }
-
-    let name = CStr::from_ptr(canonical_name)
-        .to_string_lossy()
-        .into_owned();
-    let signature = CStr::from_ptr(structural_signature)
-        .to_string_lossy()
-        .into_owned();
-
-    let mut fields = Vec::with_capacity(field_count);
-    for idx in 0..field_count {
-        let name_ptr = *field_names.add(idx);
-        let ty_ptr = *field_types.add(idx);
-        if name_ptr.is_null() || ty_ptr.is_null() {
-            continue;
+    unsafe {
+        if canonical_name.is_null() || structural_signature.is_null() {
+            return;
         }
-        let field_name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-        let ty_sig = CStr::from_ptr(ty_ptr).to_string_lossy().into_owned();
 
-        match parse_schema(&ty_sig) {
-            Ok(schema) => fields.push(StructFieldSchema {
-                name: field_name,
-                schema,
-            }),
-            Err(err) => eprintln!(
-                "Failed to register JSON schema for field '{field_name}' on '{name}': {err}"
-            ),
+        let name = CStr::from_ptr(canonical_name)
+            .to_string_lossy()
+            .into_owned();
+        let signature = CStr::from_ptr(structural_signature)
+            .to_string_lossy()
+            .into_owned();
+
+        let mut fields = Vec::with_capacity(field_count);
+        for idx in 0..field_count {
+            let name_ptr = *field_names.add(idx);
+            let ty_ptr = *field_types.add(idx);
+            if name_ptr.is_null() || ty_ptr.is_null() {
+                continue;
+            }
+            let field_name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+            let ty_sig = CStr::from_ptr(ty_ptr).to_string_lossy().into_owned();
+
+            match parse_schema(&ty_sig) {
+                Ok(schema) => fields.push(StructFieldSchema {
+                    name: field_name,
+                    schema,
+                }),
+                Err(err) => eprintln!(
+                    "Failed to register JSON schema for field '{field_name}' on '{name}': {err}"
+                ),
+            }
         }
-    }
 
-    if let Ok(mut registry) = struct_registry().lock() {
-        registry.insert(
-            name.clone(),
-            StructDescriptor {
-                canonical_name: name.clone(),
-                structural_signature: signature.clone(),
-                fields,
-            },
-        );
-    }
-    if let Ok(mut signatures) = signature_registry().lock() {
-        signatures.insert(signature, name);
+        if let Ok(mut registry) = struct_registry().lock() {
+            registry.insert(
+                name.clone(),
+                StructDescriptor {
+                    canonical_name: name.clone(),
+                    structural_signature: signature.clone(),
+                    fields,
+                },
+            );
+        }
+        if let Ok(mut signatures) = signature_registry().lock() {
+            signatures.insert(signature, name);
+        }
     }
 }
 
@@ -1179,45 +1192,47 @@ pub unsafe extern "C" fn qs_register_enum_variant(
     payload_count: usize,
     payload_types: *const *const c_char,
 ) {
-    if canonical_name.is_null() || structural_signature.is_null() || variant_name.is_null() {
-        return;
-    }
-
-    let canonical = CStr::from_ptr(canonical_name)
-        .to_string_lossy()
-        .into_owned();
-    let structural = CStr::from_ptr(structural_signature)
-        .to_string_lossy()
-        .into_owned();
-    let vname = CStr::from_ptr(variant_name).to_string_lossy().into_owned();
-
-    let mut payload = Vec::with_capacity(payload_count);
-    for idx in 0..payload_count {
-        let ty_ptr = *payload_types.add(idx);
-        if ty_ptr.is_null() {
-            continue;
+    unsafe {
+        if canonical_name.is_null() || structural_signature.is_null() || variant_name.is_null() {
+            return;
         }
-        let ty_sig = CStr::from_ptr(ty_ptr).to_string_lossy().into_owned();
-        if let Ok(parsed) = parse_schema(&ty_sig) {
-            payload.push(parsed);
-        }
-    }
 
-    if let Ok(mut registry) = enum_registry().lock() {
-        let entry = registry
-            .entry(canonical.clone())
-            .or_insert_with(|| EnumDescriptor {
-                canonical_name: canonical.clone(),
-                structural_signature: structural.clone(),
-                variants: Vec::new(),
+        let canonical = CStr::from_ptr(canonical_name)
+            .to_string_lossy()
+            .into_owned();
+        let structural = CStr::from_ptr(structural_signature)
+            .to_string_lossy()
+            .into_owned();
+        let vname = CStr::from_ptr(variant_name).to_string_lossy().into_owned();
+
+        let mut payload = Vec::with_capacity(payload_count);
+        for idx in 0..payload_count {
+            let ty_ptr = *payload_types.add(idx);
+            if ty_ptr.is_null() {
+                continue;
+            }
+            let ty_sig = CStr::from_ptr(ty_ptr).to_string_lossy().into_owned();
+            if let Ok(parsed) = parse_schema(&ty_sig) {
+                payload.push(parsed);
+            }
+        }
+
+        if let Ok(mut registry) = enum_registry().lock() {
+            let entry = registry
+                .entry(canonical.clone())
+                .or_insert_with(|| EnumDescriptor {
+                    canonical_name: canonical.clone(),
+                    structural_signature: structural.clone(),
+                    variants: Vec::new(),
+                });
+            entry.variants.push(EnumVariantSchema {
+                name: vname.clone(),
+                payload,
             });
-        entry.variants.push(EnumVariantSchema {
-            name: vname.clone(),
-            payload,
-        });
-    }
-    if let Ok(mut signatures) = enum_signature_registry().lock() {
-        signatures.insert(structural, canonical);
+        }
+        if let Ok(mut signatures) = enum_signature_registry().lock() {
+            signatures.insert(structural, canonical);
+        }
     }
 }
 
@@ -1226,38 +1241,40 @@ pub unsafe extern "C" fn qs_struct_from_json(
     canonical_name: *const c_char,
     json_payload: *const c_char,
 ) -> *mut c_void {
-    if canonical_name.is_null() || json_payload.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let type_name = CStr::from_ptr(canonical_name)
-        .to_string_lossy()
-        .into_owned();
-    let payload = CStr::from_ptr(json_payload).to_string_lossy().into_owned();
-
-    let descriptor = match find_descriptor(&type_name) {
-        Some(desc) => desc,
-        None => {
-            // eprintln!(
-            //     "Cannot deserialize JSON for '{type_name}': type descriptor is not registered"
-            // );
+    unsafe {
+        if canonical_name.is_null() || json_payload.is_null() {
             return std::ptr::null_mut();
         }
-    };
 
-    let parsed: JsonValue = match serde_json::from_str(&payload) {
-        Ok(v) => v,
-        Err(err) => {
-            //  eprintln!("Failed to parse JSON payload for '{type_name}': {err}");
-            return std::ptr::null_mut();
-        }
-    };
+        let type_name = CStr::from_ptr(canonical_name)
+            .to_string_lossy()
+            .into_owned();
+        let payload = CStr::from_ptr(json_payload).to_string_lossy().into_owned();
 
-    match build_struct_from_json_value(&descriptor, &parsed) {
-        Ok(ptr) => ptr,
-        Err(err) => {
-            //            eprintln!("Failed to convert JSON into '{type_name}': {err}");
-            std::ptr::null_mut()
+        let descriptor = match find_descriptor(&type_name) {
+            Some(desc) => desc,
+            None => {
+                // eprintln!(
+                //     "Cannot deserialize JSON for '{type_name}': type descriptor is not registered"
+                // );
+                return std::ptr::null_mut();
+            }
+        };
+
+        let parsed: JsonValue = match serde_json::from_str(&payload) {
+            Ok(v) => v,
+            Err(_err) => {
+                //  eprintln!("Failed to parse JSON payload for '{type_name}': {err}");
+                return std::ptr::null_mut();
+            }
+        };
+
+        match build_struct_from_json_value(&descriptor, &parsed) {
+            Ok(ptr) => ptr,
+            Err(_err) => {
+                //            eprintln!("Failed to convert JSON into '{type_name}': {err}");
+                std::ptr::null_mut()
+            }
         }
     }
 }
@@ -1267,32 +1284,34 @@ pub unsafe extern "C" fn qs_enum_from_json(
     canonical_name: *const c_char,
     json_payload: *const c_char,
 ) -> *mut c_void {
-    if canonical_name.is_null() || json_payload.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let type_name = CStr::from_ptr(canonical_name)
-        .to_string_lossy()
-        .into_owned();
-    let payload = CStr::from_ptr(json_payload).to_string_lossy().into_owned();
-
-    let descriptor = match find_enum_descriptor(&type_name) {
-        Some(desc) => desc,
-        None => {
+    unsafe {
+        if canonical_name.is_null() || json_payload.is_null() {
             return std::ptr::null_mut();
         }
-    };
 
-    let parsed: JsonValue = match serde_json::from_str(&payload) {
-        Ok(v) => v,
-        Err(_) => {
-            return std::ptr::null_mut();
+        let type_name = CStr::from_ptr(canonical_name)
+            .to_string_lossy()
+            .into_owned();
+        let payload = CStr::from_ptr(json_payload).to_string_lossy().into_owned();
+
+        let descriptor = match find_enum_descriptor(&type_name) {
+            Some(desc) => desc,
+            None => {
+                return std::ptr::null_mut();
+            }
+        };
+
+        let parsed: JsonValue = match serde_json::from_str(&payload) {
+            Ok(v) => v,
+            Err(_) => {
+                return std::ptr::null_mut();
+            }
+        };
+
+        match build_enum_from_json_value(&descriptor, &parsed) {
+            Ok(ptr) => ptr,
+            Err(_) => std::ptr::null_mut(),
         }
-    };
-
-    match build_enum_from_json_value(&descriptor, &parsed) {
-        Ok(ptr) => ptr,
-        Err(_) => std::ptr::null_mut(),
     }
 }
 
@@ -1301,75 +1320,81 @@ pub unsafe extern "C" fn qs_struct_to_json(
     canonical_name: *const c_char,
     struct_ptr: *mut c_void,
 ) -> *mut c_char {
-    if canonical_name.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let type_name = CStr::from_ptr(canonical_name)
-        .to_string_lossy()
-        .into_owned();
-
-    let descriptor = match find_descriptor(&type_name) {
-        Some(desc) => desc,
-        None => {
-            eprintln!("Cannot serialize '{type_name}' to JSON: type descriptor is not registered");
+    unsafe {
+        if canonical_name.is_null() {
             return std::ptr::null_mut();
         }
-    };
 
-    let json_value = struct_to_json_value(&descriptor, struct_ptr);
-    match serde_json::to_string(&json_value) {
-        Ok(rendered) => {
-            let bytes = rendered.into_bytes();
-            if bytes.contains(&0) {
-                std::ptr::null_mut()
-            } else {
-                arena_alloc_cstring(&bytes)
+        let type_name = CStr::from_ptr(canonical_name)
+            .to_string_lossy()
+            .into_owned();
+
+        let descriptor = match find_descriptor(&type_name) {
+            Some(desc) => desc,
+            None => {
+                eprintln!(
+                    "Cannot serialize '{type_name}' to JSON: type descriptor is not registered"
+                );
+                return std::ptr::null_mut();
             }
-        }
-        Err(err) => {
-            eprintln!("Failed to render JSON for '{type_name}': {err}");
-            std::ptr::null_mut()
+        };
+
+        let json_value = struct_to_json_value(&descriptor, struct_ptr);
+        match serde_json::to_string(&json_value) {
+            Ok(rendered) => {
+                let bytes = rendered.into_bytes();
+                if bytes.contains(&0) {
+                    std::ptr::null_mut()
+                } else {
+                    arena_alloc_cstring(&bytes)
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to render JSON for '{type_name}': {err}");
+                std::ptr::null_mut()
+            }
         }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_json_parse(source: *const c_char) -> *mut c_void {
-    if source.is_null() {
-        let msg = arena_alloc_cstring(b"io.json received null input");
-        return qs_result_err(msg as *mut c_void);
-    }
-    let text = CStr::from_ptr(source).to_str().unwrap_or_default();
-    let parsed = match serde_json::from_str::<JsonValue>(&text) {
-        Ok(value) => value,
-        Err(err) => {
-            let err_text = err.to_string();
-            let msg = if err_text.as_bytes().contains(&0) {
-                arena_alloc_cstring(b"io.json parse error")
-            } else {
-                arena_alloc_cstring(err_text.as_bytes())
-            };
+    unsafe {
+        if source.is_null() {
+            let msg = arena_alloc_cstring(b"io.json received null input");
             return qs_result_err(msg as *mut c_void);
         }
-    };
-
-    let JsonValue::Object(map) = parsed else {
-        let msg = arena_alloc_cstring(b"io.json expects an object at the top level");
-        return qs_result_err(msg as *mut c_void);
-    };
-
-    let obj_ptr = qs_obj_new();
-    for (key, value) in map {
-        let handle_raw = Box::into_raw(Box::new(JsonHandle { value }));
-        let Ok(key_c) = std::ffi::CString::new(key) else {
-            let _ = Box::from_raw(handle_raw);
-            continue;
+        let text = CStr::from_ptr(source).to_str().unwrap_or_default();
+        let parsed = match serde_json::from_str::<JsonValue>(&text) {
+            Ok(value) => value,
+            Err(err) => {
+                let err_text = err.to_string();
+                let msg = if err_text.as_bytes().contains(&0) {
+                    arena_alloc_cstring(b"io.json parse error")
+                } else {
+                    arena_alloc_cstring(err_text.as_bytes())
+                };
+                return qs_result_err(msg as *mut c_void);
+            }
         };
-        qs_obj_insert_str(obj_ptr, key_c.as_ptr(), handle_raw as *mut c_void);
-    }
 
-    qs_result_ok(obj_ptr)
+        let JsonValue::Object(map) = parsed else {
+            let msg = arena_alloc_cstring(b"io.json expects an object at the top level");
+            return qs_result_err(msg as *mut c_void);
+        };
+
+        let obj_ptr = qs_obj_new();
+        for (key, value) in map {
+            let handle_raw = Box::into_raw(Box::new(JsonHandle { value }));
+            let Ok(key_c) = std::ffi::CString::new(key) else {
+                let _ = Box::from_raw(handle_raw);
+                continue;
+            };
+            qs_obj_insert_str(obj_ptr, key_c.as_ptr(), handle_raw as *mut c_void);
+        }
+
+        qs_result_ok(obj_ptr)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1424,131 +1449,166 @@ pub unsafe extern "C" fn qs_json_get(
     handle: *mut JsonHandle,
     key: *const c_char,
 ) -> *mut JsonHandle {
-    if handle.is_null() || key.is_null() {
-        return std::ptr::null_mut();
-    }
-    let Some(object) = (*handle).value.as_object() else {
-        return std::ptr::null_mut();
-    };
-    let key_str = CStr::from_ptr(key).to_string_lossy();
-    match object.get(key_str.as_ref()) {
-        Some(value) => Box::into_raw(Box::new(JsonHandle {
-            value: value.clone(),
-        })),
-        None => std::ptr::null_mut(),
+    unsafe {
+        if handle.is_null() || key.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Some(object) = (*handle).value.as_object() else {
+            return std::ptr::null_mut();
+        };
+        let key_str = CStr::from_ptr(key).to_string_lossy();
+        match object.get(key_str.as_ref()) {
+            Some(value) => Box::into_raw(Box::new(JsonHandle {
+                value: value.clone(),
+            })),
+            None => std::ptr::null_mut(),
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_json_index(handle: *mut JsonHandle, index: usize) -> *mut JsonHandle {
-    if handle.is_null() {
-        return std::ptr::null_mut();
+    unsafe {
+        if handle.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Some(array) = (*handle).value.as_array() else {
+            return std::ptr::null_mut();
+        };
+        array
+            .get(index)
+            .cloned()
+            .map(|value| Box::into_raw(Box::new(JsonHandle { value })))
+            .unwrap_or_else(std::ptr::null_mut)
     }
-    let Some(array) = (*handle).value.as_array() else {
-        return std::ptr::null_mut();
-    };
-    array
-        .get(index)
-        .cloned()
-        .map(|value| Box::into_raw(Box::new(JsonHandle { value })))
-        .unwrap_or_else(std::ptr::null_mut)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_json_str(handle: *mut JsonHandle) -> *mut c_char {
-    if handle.is_null() {
-        return std::ptr::null_mut();
-    }
-    match (*handle).value.as_str() {
-        Some(text) => {
-            let bytes = text.as_bytes();
-            if bytes.contains(&0) {
-                std::ptr::null_mut()
-            } else {
-                arena_alloc_cstring(bytes)
-            }
+    unsafe {
+        if handle.is_null() {
+            return std::ptr::null_mut();
         }
-        None => std::ptr::null_mut(),
+        match (*handle).value.as_str() {
+            Some(text) => {
+                let bytes = text.as_bytes();
+                if bytes.contains(&0) {
+                    std::ptr::null_mut()
+                } else {
+                    arena_alloc_cstring(bytes)
+                }
+            }
+            None => std::ptr::null_mut(),
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_create(capacity: usize) -> *mut Arena {
-    let cap = capacity.max(1024);
-    let ptr = Box::into_raw(Box::new(Arena::new(cap)));
-    GLOBAL_ARENA_PTR = ptr;
-    ptr
+    unsafe {
+        let cap = capacity.max(1024);
+        let ptr = Box::into_raw(Box::new(Arena::new(cap)));
+        GLOBAL_ARENA_PTR = ptr;
+        ptr
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_alloc(arena: *mut Arena, size: usize, align: usize) -> *mut u8 {
-    let Some(mut arena) = NonNull::new(arena) else {
-        return std::ptr::null_mut();
-    };
+    unsafe {
+        let Some(mut arena) = NonNull::new(arena) else {
+            return std::ptr::null_mut();
+        };
 
-    let layout = match Layout::from_size_align(size, align) {
-        Ok(l) => l,
-        Err(_) => return std::ptr::null_mut(),
-    };
+        let layout = match Layout::from_size_align(size, align) {
+            Ok(l) => l,
+            Err(_) => return std::ptr::null_mut(),
+        };
 
-    arena
-        .as_mut()
-        .alloc(layout)
-        .map(|p| p.as_ptr())
-        .unwrap_or(std::ptr::null_mut())
+        arena
+            .as_mut()
+            .alloc(layout)
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut())
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_free(arena: *mut Arena, ptr: *mut u8) {
-    if arena.is_null() || ptr.is_null() {
-        return;
-    }
-    if let Some(mut arena) = NonNull::new(arena) {
-        arena.as_mut().release_ref(ptr);
+    unsafe {
+        if arena.is_null() || ptr.is_null() {
+            return;
+        }
+        if let Some(mut arena) = NonNull::new(arena) {
+            arena.as_mut().release_ref(ptr);
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_mark(arena: *mut Arena) -> usize {
-    NonNull::new(arena).map(|a| a.as_ref().mark()).unwrap_or(0)
+    unsafe { NonNull::new(arena).map(|a| a.as_ref().mark()).unwrap_or(0) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_release(arena: *mut Arena, mark: usize) {
-    if let Some(mut arena) = NonNull::new(arena) {
-        arena.as_mut().release_from(mark);
+    unsafe {
+        if let Some(mut arena) = NonNull::new(arena) {
+            arena.as_mut().release_from(mark);
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_pin(arena: *mut Arena, ptr: *mut u8) {
-    if let Some(mut arena) = NonNull::new(arena) {
-        arena.as_mut().retain(ptr);
+    unsafe {
+        if let Some(mut arena) = NonNull::new(arena) {
+            arena.as_mut().retain(ptr);
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_retain(arena: *mut Arena, ptr: *mut u8) {
-    if let Some(mut arena) = NonNull::new(arena) {
-        arena.as_mut().retain(ptr);
+    unsafe {
+        if let Some(mut arena) = NonNull::new(arena) {
+            arena.as_mut().retain(ptr);
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_release_ref(arena: *mut Arena, ptr: *mut u8) {
-    if let Some(mut arena) = NonNull::new(arena) {
-        arena.as_mut().release_ref(ptr);
+    unsafe {
+        if let Some(mut arena) = NonNull::new(arena) {
+            arena.as_mut().release_ref(ptr);
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_destroy(arena: *mut Arena) {
-    if arena.is_null() {
-        return;
-    }
-    let _ = Box::from_raw(arena);
-    if GLOBAL_ARENA_PTR == arena {
-        GLOBAL_ARENA_PTR = std::ptr::null_mut();
+    unsafe {
+        if arena.is_null() {
+            return;
+        }
+        let arena_box = Box::from_raw(arena);
+        if ARENA_DEBUG_CHECKS.load(Ordering::Relaxed) {
+            if let Some(leaked) = arena_box
+                .allocations
+                .iter()
+                .find(|allocation| allocation.refs > 0)
+            {
+                panic!(
+                    "Arena leak detected: ptr={:?} still has {} outstanding reference(s)",
+                    leaked.ptr, leaked.refs
+                );
+            }
+        }
+        if GLOBAL_ARENA_PTR == arena {
+            GLOBAL_ARENA_PTR = std::ptr::null_mut();
+        }
+        drop(arena_box);
     }
 }
 
@@ -1639,8 +1699,10 @@ fn leak_bytes_as_body(mut bytes: Vec<u8>) -> (*mut u8, usize) {
 }
 
 unsafe fn free_body(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() && len > 0 {
-        let _ = Vec::from_raw_parts(ptr, len, len);
+    unsafe {
+        if !ptr.is_null() && len > 0 {
+            let _ = Vec::from_raw_parts(ptr, len, len);
+        }
     }
 }
 
@@ -1648,24 +1710,28 @@ unsafe fn free_c_string(_ptr: *mut c_char) {}
 
 impl ResponseObject {
     unsafe fn take_body_bytes(&mut self) -> Vec<u8> {
-        let ptr = self.body;
-        let len = self.body_len;
-        self.body = std::ptr::null_mut();
-        self.body_len = 0;
-        if ptr.is_null() || len == 0 {
-            Vec::new()
-        } else {
-            Vec::from_raw_parts(ptr, len, len)
+        unsafe {
+            let ptr = self.body;
+            let len = self.body_len;
+            self.body = std::ptr::null_mut();
+            self.body_len = 0;
+            if ptr.is_null() || len == 0 {
+                Vec::new()
+            } else {
+                Vec::from_raw_parts(ptr, len, len)
+            }
         }
     }
 
     unsafe fn take_owned_string(field: &mut *mut c_char) -> Option<String> {
-        if (*field).is_null() {
-            None
-        } else {
-            let ptr = std::mem::replace(field, std::ptr::null_mut());
-            let cstr = CStr::from_ptr(ptr);
-            Some(cstr.to_string_lossy().into_owned())
+        unsafe {
+            if (*field).is_null() {
+                None
+            } else {
+                let ptr = std::mem::replace(field, std::ptr::null_mut());
+                let cstr = CStr::from_ptr(ptr);
+                Some(cstr.to_string_lossy().into_owned())
+            }
         }
     }
 }
@@ -1710,18 +1776,20 @@ pub unsafe extern "C" fn create_request_object(
     headers: *const c_char,
     body: *const c_char,
 ) -> *mut RequestObject {
-    let body_string = match cstr_to_option_string(body) {
-        Some(text) if text.is_empty() => None,
-        other => other,
-    };
-    let request = RequestObject::from_owned_parts(
-        cstr_to_option_string(method),
-        cstr_to_option_string(path),
-        cstr_to_option_string(query),
-        cstr_to_option_string(headers),
-        body_string,
-    );
-    Box::into_raw(Box::new(request))
+    unsafe {
+        let body_string = match cstr_to_option_string(body) {
+            Some(text) if text.is_empty() => None,
+            other => other,
+        };
+        let request = RequestObject::from_owned_parts(
+            cstr_to_option_string(method),
+            cstr_to_option_string(path),
+            cstr_to_option_string(query),
+            cstr_to_option_string(headers),
+            body_string,
+        );
+        Box::into_raw(Box::new(request))
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1785,15 +1853,17 @@ pub unsafe extern "C" fn create_range_builder() -> *mut RangeBuilder {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_to(buil: *mut RangeBuilder, tua: f64) -> *mut RangeBuilder {
-    if buil.is_null() {
-        return Box::into_raw(Box::new(RangeBuilder {
-            from: 0.0,
-            to: tua,
-            step: 1.0,
-        }));
+    unsafe {
+        if buil.is_null() {
+            return Box::into_raw(Box::new(RangeBuilder {
+                from: 0.0,
+                to: tua,
+                step: 1.0,
+            }));
+        }
+        (*buil).to = tua;
+        buil
     }
-    (*buil).to = tua;
-    buil
 }
 
 // Compatibility shim for compiler-expected symbol name
@@ -1802,7 +1872,7 @@ pub unsafe extern "C" fn create_range_builder_to(
     buil: *mut RangeBuilder,
     tua: f64,
 ) -> *mut RangeBuilder {
-    range_builder_to(buil, tua)
+    unsafe { range_builder_to(buil, tua) }
 }
 
 #[unsafe(no_mangle)]
@@ -1810,15 +1880,17 @@ pub unsafe extern "C" fn range_builder_from(
     buil: *mut RangeBuilder,
     tua: f64,
 ) -> *mut RangeBuilder {
-    if buil.is_null() {
-        return Box::into_raw(Box::new(RangeBuilder {
-            from: tua,
-            to: 0.0,
-            step: 1.0,
-        }));
+    unsafe {
+        if buil.is_null() {
+            return Box::into_raw(Box::new(RangeBuilder {
+                from: tua,
+                to: 0.0,
+                step: 1.0,
+            }));
+        }
+        (*buil).from = tua;
+        buil
     }
-    (*buil).from = tua;
-    buil
 }
 
 // Compatibility shim for compiler-expected symbol name
@@ -1827,26 +1899,28 @@ pub unsafe extern "C" fn create_range_builder_from(
     buil: *mut RangeBuilder,
     tua: f64,
 ) -> *mut RangeBuilder {
-    range_builder_from(buil, tua)
+    unsafe { range_builder_from(buil, tua) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_step(
     buil: *mut RangeBuilder,
     tua: f64,
 ) -> *mut RangeBuilder {
-    if buil.is_null() {
-        return Box::into_raw(Box::new(RangeBuilder {
-            from: 0.0,
-            to: 0.0,
-            step: if tua == 0.0 { 1.0 } else { tua },
-        }));
+    unsafe {
+        if buil.is_null() {
+            return Box::into_raw(Box::new(RangeBuilder {
+                from: 0.0,
+                to: 0.0,
+                step: if tua == 0.0 { 1.0 } else { tua },
+            }));
+        }
+        if tua == 0.0 {
+            (*buil).step = 1.0;
+        } else {
+            (*buil).step = tua;
+        }
+        buil
     }
-    if tua == 0.0 {
-        (*buil).step = 1.0;
-    } else {
-        (*buil).step = tua;
-    }
-    buil
 }
 
 // Compatibility shim for compiler-expected symbol name
@@ -1855,32 +1929,38 @@ pub unsafe extern "C" fn create_range_builder_step(
     buil: *mut RangeBuilder,
     tua: f64,
 ) -> *mut RangeBuilder {
-    range_builder_step(buil, tua)
+    unsafe { range_builder_step(buil, tua) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_get_from(buil: *const RangeBuilder) -> f64 {
-    if buil.is_null() {
-        return 0.0;
+    unsafe {
+        if buil.is_null() {
+            return 0.0;
+        }
+        (*buil).from
     }
-    (*buil).from
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_get_to(buil: *const RangeBuilder) -> f64 {
-    if buil.is_null() {
-        return 0.0;
+    unsafe {
+        if buil.is_null() {
+            return 0.0;
+        }
+        (*buil).to
     }
-    (*buil).to
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_get_step(buil: *const RangeBuilder) -> f64 {
-    if buil.is_null() {
-        return 1.0;
+    unsafe {
+        if buil.is_null() {
+            return 1.0;
+        }
+        let step = (*buil).step;
+        if step == 0.0 { 1.0 } else { step }
     }
-    let step = (*buil).step;
-    if step == 0.0 { 1.0 } else { step }
 }
 
 #[unsafe(no_mangle)]
@@ -2100,13 +2180,15 @@ pub unsafe extern "C" fn io_write_file(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_panic(message: *const c_char) -> ! {
-    if message.is_null() {
-        eprintln!("QuickScript panic");
-    } else {
-        let text = CStr::from_ptr(message).to_str().unwrap_or_default();
-        eprintln!("QuickScript panic: {text}",);
+    unsafe {
+        if message.is_null() {
+            eprintln!("QuickScript panic");
+        } else {
+            let text = CStr::from_ptr(message).to_str().unwrap_or_default();
+            eprintln!("QuickScript panic: {text}",);
+        }
+        std::process::exit(70);
     }
-    std::process::exit(70);
 }
 
 #[unsafe(no_mangle)]
@@ -2226,14 +2308,64 @@ pub unsafe extern "C" fn web_file_not_found(
     response: *mut ResponseObject,
     fallback: *const c_char,
 ) -> *mut ResponseObject {
-    if response.is_null() {
-        // No original response; fall back to default handling
-        let body = if fallback.is_null() {
-            b"Not Found".to_vec()
+    unsafe {
+        if response.is_null() {
+            // No original response; fall back to default handling
+            let body = if fallback.is_null() {
+                b"Not Found".to_vec()
+            } else {
+                CStr::from_ptr(fallback).to_bytes().to_owned()
+            };
+            let (body_ptr, body_len) = leak_bytes_as_body(body);
+            let response = Box::new(ResponseObject {
+                status_code: 404,
+                content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
+                body: body_ptr,
+                body_len,
+                headers: arena_alloc_cstring(b""),
+                missing_file_path: std::ptr::null_mut(),
+            });
+            return Box::into_raw(response);
+        }
+
+        let mut original = Box::from_raw(response);
+        if original.missing_file_path.is_null() {
+            // Not a missing-file response; return it unchanged
+            return Box::into_raw(original);
+        }
+
+        let fallback_path = if fallback.is_null() {
+            None
         } else {
-            CStr::from_ptr(fallback).to_bytes().to_owned()
-        };
-        let (body_ptr, body_len) = leak_bytes_as_body(body);
+            cstr_to_path(fallback).map(|p| p.into_owned())
+        }
+        .filter(|p| !p.as_os_str().is_empty());
+
+        let _ = ResponseObject::take_owned_string(&mut original.content_type);
+        let _ = ResponseObject::take_owned_string(&mut original.headers);
+        let _ = ResponseObject::take_owned_string(&mut original.missing_file_path);
+        let _ = original.take_body_bytes();
+        drop(original);
+
+        if let Some(path) = fallback_path {
+            if !path.as_os_str().is_empty() {
+                if let Ok(content) = block_on_in_runtime(async { tokio::fs::read(&path).await }) {
+                    let mime_type = get_mime_type(&path);
+                    let (body_ptr, body_len) = leak_bytes_as_body(content);
+                    let response = Box::new(ResponseObject {
+                        status_code: 404,
+                        content_type: arena_alloc_cstring(mime_type.as_bytes()),
+                        body: body_ptr,
+                        body_len,
+                        headers: arena_alloc_cstring(b""),
+                        missing_file_path: std::ptr::null_mut(),
+                    });
+                    return Box::into_raw(response);
+                }
+            }
+        }
+
+        let (body_ptr, body_len) = leak_string_as_body("Not Found".to_string());
         let response = Box::new(ResponseObject {
             status_code: 404,
             content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
@@ -2242,56 +2374,8 @@ pub unsafe extern "C" fn web_file_not_found(
             headers: arena_alloc_cstring(b""),
             missing_file_path: std::ptr::null_mut(),
         });
-        return Box::into_raw(response);
+        Box::into_raw(response)
     }
-
-    let mut original = Box::from_raw(response);
-    if original.missing_file_path.is_null() {
-        // Not a missing-file response; return it unchanged
-        return Box::into_raw(original);
-    }
-
-    let fallback_path = if fallback.is_null() {
-        None
-    } else {
-        cstr_to_path(fallback).map(|p| p.into_owned())
-    }
-    .filter(|p| !p.as_os_str().is_empty());
-
-    let _ = ResponseObject::take_owned_string(&mut original.content_type);
-    let _ = ResponseObject::take_owned_string(&mut original.headers);
-    let _ = ResponseObject::take_owned_string(&mut original.missing_file_path);
-    let _ = original.take_body_bytes();
-    drop(original);
-
-    if let Some(path) = fallback_path {
-        if !path.as_os_str().is_empty() {
-            if let Ok(content) = block_on_in_runtime(async { tokio::fs::read(&path).await }) {
-                let mime_type = get_mime_type(&path);
-                let (body_ptr, body_len) = leak_bytes_as_body(content);
-                let response = Box::new(ResponseObject {
-                    status_code: 404,
-                    content_type: arena_alloc_cstring(mime_type.as_bytes()),
-                    body: body_ptr,
-                    body_len,
-                    headers: arena_alloc_cstring(b""),
-                    missing_file_path: std::ptr::null_mut(),
-                });
-                return Box::into_raw(response);
-            }
-        }
-    }
-
-    let (body_ptr, body_len) = leak_string_as_body("Not Found".to_string());
-    let response = Box::new(ResponseObject {
-        status_code: 404,
-        content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
-        body: body_ptr,
-        body_len,
-        headers: arena_alloc_cstring(b""),
-        missing_file_path: std::ptr::null_mut(),
-    });
-    Box::into_raw(response)
 }
 
 // Helper to get response fields
@@ -2454,39 +2538,43 @@ unsafe fn invoke_user_handler(
     handler_addr: usize,
     request: RequestObject,
 ) -> (i32, String, Vec<u8>, String) {
-    let mut request_box = Box::new(request);
-    let request_ptr = request_box.as_ref() as *const RequestObject;
-    let func: extern "C" fn(*const RequestObject) -> *mut ResponseObject =
-        std::mem::transmute::<usize, _>(handler_addr);
-    let response_ptr = func(request_ptr);
-    drop(request_box);
-    materialize_response(response_ptr)
+    unsafe {
+        let request_box = Box::new(request);
+        let request_ptr = request_box.as_ref() as *const RequestObject;
+        let func: extern "C" fn(*const RequestObject) -> *mut ResponseObject =
+            std::mem::transmute::<usize, _>(handler_addr);
+        let response_ptr = func(request_ptr);
+        drop(request_box);
+        materialize_response(response_ptr)
+    }
 }
 
 unsafe fn materialize_response(
     response_ptr: *mut ResponseObject,
 ) -> (i32, String, Vec<u8>, String) {
-    if response_ptr.is_null() {
-        return (
-            404,
-            "text/plain; charset=utf-8".to_string(),
-            b"Not Found".to_vec(),
-            String::new(),
-        );
-    }
+    unsafe {
+        if response_ptr.is_null() {
+            return (
+                404,
+                "text/plain; charset=utf-8".to_string(),
+                b"Not Found".to_vec(),
+                String::new(),
+            );
+        }
 
-    let status = get_response_status(response_ptr);
-    let content_type = cstr_to_string(get_response_content_type(response_ptr));
-    let headers = cstr_to_string(get_response_headers(response_ptr));
-    let body_ptr = get_response_body(response_ptr);
-    let body_len = get_response_body_len(response_ptr);
-    let body = if body_ptr.is_null() || body_len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(body_ptr, body_len).to_vec()
-    };
-    let _ = Box::from_raw(response_ptr);
-    (status, content_type, body, headers)
+        let status = get_response_status(response_ptr);
+        let content_type = cstr_to_string(get_response_content_type(response_ptr));
+        let headers = cstr_to_string(get_response_headers(response_ptr));
+        let body_ptr = get_response_body(response_ptr);
+        let body_len = get_response_body_len(response_ptr);
+        let body = if body_ptr.is_null() || body_len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(body_ptr, body_len).to_vec()
+        };
+        let _ = Box::from_raw(response_ptr);
+        (status, content_type, body, headers)
+    }
 }
 
 async fn handle_hyper_request(
@@ -2997,7 +3085,7 @@ impl Expr {
                                             Type::Function(
                                                 vec![(
                                                     "req".to_string(),
-                                                    Type::Custom(Custype::Object((request_fields))),
+                                                    Type::Custom(Custype::Object(request_fields)),
                                                 )],
                                                 Box::new(Type::WebReturn),
                                             ),
@@ -3936,7 +4024,7 @@ impl PreCtx {
                 format!("Object{{{inner}}}")
             }
             Type::Custom(Custype::Enum(variants)) => {
-                let mut rendered = variants
+                let rendered = variants
                     .iter()
                     .map(|variant| {
                         if variant.payload.is_empty() {
@@ -4732,26 +4820,65 @@ fn execute_build(filename: String, debug: bool) {
             let output_bin = build_dir.join("program");
 
             let runtime_lib_path = build_dir.join("libquick.a");
+            // Prefer an explicit override, then a freshly built runtime from disk, and finally the embedded bytes.
+            if let Ok(path_override) = std::env::var("QUICK_RUNTIME_LIB") {
+                let override_path = PathBuf::from(&path_override);
+                if let Err(err) = std::fs::copy(&override_path, &runtime_lib_path) {
+                    eprintln!(
+                        "Failed to copy runtime lib from {}: {err}; falling back to defaults",
+                        override_path.display()
+                    );
+                }
+            }
+
+            if !runtime_lib_path.exists() {
+                let disk_runtime = PathBuf::from("target/runtime/release/libquick_runtime.a");
+                if disk_runtime.exists() {
+                    if let Err(err) = std::fs::copy(&disk_runtime, &runtime_lib_path) {
+                        eprintln!(
+                            "Failed to copy runtime lib from {}: {err}; falling back to embedded runtime",
+                            disk_runtime.display()
+                        );
+                    }
+                }
+            }
+
             if !runtime_lib_path.exists() {
                 if let Err(e) = std::fs::write(&runtime_lib_path, &LIBQUICK) {
-                    eprintln!("Error writing libraries: {e}");
+                    eprintln!("Error writing embedded runtime library: {e}");
                 }
             }
             let (linker_override, ld_override) = bundled_linker();
 
             let mut link_args = Vec::new();
-            if let Some(ld) = ld_override {
-                link_args.push(format!("-fuse-ld={}", ld.display()));
+            // On macOS, prefer the platform ld64 to avoid lld complaining about Mach-O archives.
+            if cfg!(not(target_os = "macos")) {
+                if let Some(ld) = ld_override {
+                    link_args.push(format!("-fuse-ld={}", ld.display()));
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            if let Some(sdk) = macos_sdk_root() {
+                link_args.push(format!("-isysroot={}", sdk.display()));
+                link_args.push(format!("-Wl,-syslibroot,{}", sdk.display()));
             }
             link_args.extend([
                 obj_path.to_string_lossy().to_string(),
                 runtime_lib_path.to_string_lossy().to_string(),
                 "-o".to_string(),
                 output_bin.to_string_lossy().to_string(),
-                "-lm".to_string(),
-                "-ldl".to_string(),
-                "-lpthread".to_string(),
             ]);
+
+            if cfg!(target_os = "macos") {
+                // macOS libSystem provides pthread/libm/libdl; no extra libs needed.
+            } else {
+                link_args.extend([
+                    "-lm".to_string(),
+                    "-ldl".to_string(),
+                    "-lpthread".to_string(),
+                ]);
+            }
 
             #[cfg(target_os = "macos")]
             {
@@ -4833,11 +4960,57 @@ fn bundled_linker() -> (Option<std::ffi::OsString>, Option<std::path::PathBuf>) 
     (None, None)
 }
 
+#[cfg(target_os = "macos")]
+fn macos_sdk_root() -> Option<std::path::PathBuf> {
+    let validate = |p: &std::path::Path| p.join("usr/lib/libSystem.tbd").exists();
+
+    if let Ok(sdk) = std::env::var("QUICK_SYSROOT").or_else(|_| std::env::var("SDKROOT")) {
+        let pb = std::path::PathBuf::from(&sdk);
+        if validate(&pb) {
+            return Some(pb);
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let pb = std::path::PathBuf::from(path);
+            if validate(&pb) {
+                return Some(pb);
+            }
+        }
+    }
+
+    // Fallback: scan CommandLineTools SDK directory for a MacOSX*.sdk
+    let clt_sdks = std::path::Path::new("/Library/Developer/CommandLineTools/SDKs");
+    if let Ok(entries) = std::fs::read_dir(clt_sdks) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("MacOSX") && n.ends_with(".sdk"))
+                .unwrap_or(false)
+                && validate(&path)
+            {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(not(feature = "runtime-lib"))]
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     let debug = args.debug;
+
+    ARENA_DEBUG_CHECKS.store(debug, Ordering::Relaxed);
 
     let command = args.command.unwrap_or(Commands::Run { filename: None });
 
@@ -4884,7 +5057,7 @@ async fn main() {
             let mut line_open = false;
             let mut prev_kind: Option<TokenKind> = None;
 
-            let mut push_indent = |buf: &mut String, indent: usize, line_open: &mut bool| {
+            let push_indent = |buf: &mut String, indent: usize, line_open: &mut bool| {
                 if !*line_open {
                     for _ in 0..indent {
                         buf.push('\t');
@@ -4893,7 +5066,7 @@ async fn main() {
                 }
             };
 
-            let mut trim_trailing_space = |buf: &mut String| {
+            let trim_trailing_space = |buf: &mut String| {
                 while buf.ends_with(' ') {
                     buf.pop();
                 }
@@ -5113,9 +5286,6 @@ async fn main() {
 }
 
 #[cfg(feature = "runtime-lib")]
-fn main() {}
-
-#[cfg(feature = "runtime-lib")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qs_run_main() -> i32 {
     unsafe extern "C" {
@@ -5127,6 +5297,27 @@ pub unsafe extern "C" fn qs_run_main() -> i32 {
         std::thread::park();
     }
     res.round() as i32
+}
+
+// Keep runtime C-ABI exports alive in the static library. This function is
+// never called, but taking the addresses of the exported symbols forces codegen
+// to retain them even when they are otherwise unreferenced within the crate.
+#[cfg(feature = "runtime-lib")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __qs_export_roots() -> usize {
+    let addrs: [usize; 10] = [
+        qs_register_struct_descriptor as usize,
+        arena_create as usize,
+        arena_alloc as usize,
+        arena_mark as usize,
+        arena_release as usize,
+        arena_pin as usize,
+        arena_retain as usize,
+        arena_release_ref as usize,
+        arena_destroy as usize,
+        qs_run_main as usize,
+    ];
+    addrs.iter().fold(0usize, |acc, p| acc.wrapping_add(*p))
 }
 
 type SumFunc = unsafe extern "C" fn() -> f64;
@@ -5568,7 +5759,7 @@ struct Allocation {
     refs: usize,
 }
 
-struct Arena {
+pub struct Arena {
     allocations: Vec<Allocation>,
     index_map: HashMap<usize, usize>,
     _capacity_hint: usize,

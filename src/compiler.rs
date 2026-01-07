@@ -1660,6 +1660,16 @@ impl<'ctx> Compiler<'ctx> {
                 } else {
                     // True return inside a user-defined function
                     let ret_val = self.compile_expr(expr)?;
+                    // Promote returned heap values so callers can safely observe them
+                    if let BasicValueEnum::PointerValue(ret_ptr) = ret_val {
+                        let arena_ptr = self.load_arena_ptr()?;
+                        let retain_fn = self.get_or_create_arena_retain();
+                        let _ = self.builder.build_call(
+                            retain_fn,
+                            &[arena_ptr.into(), ret_ptr.into()],
+                            "return_retain",
+                        )?;
+                    }
                     // Caller retains if needed; keep return path arena-clean
                     // Release function-scope arena allocations before returning
                     let mark_key = format!("__mark_slot_{fn_name}");
@@ -4727,7 +4737,7 @@ impl<'ctx> Compiler<'ctx> {
             }
             Expr::Literal(Value::Nil) => {
                 // Represent nil as the C-string "nil"
-                let gs = self
+                let _gs = self
                     .builder
                     .build_global_string_ptr("nil\0", "nil_literal")
                     .unwrap();
@@ -4951,15 +4961,6 @@ impl<'ctx> Compiler<'ctx> {
                             .unwrap()
                     };
                     let _ = self.builder.build_store(field_ptr, val);
-                    if let BasicValueEnum::PointerValue(ptr_val) = val {
-                        let arena_ptr = self.load_arena_ptr()?;
-                        let pin_fn = self.get_or_create_arena_pin();
-                        let _ = self.builder.build_call(
-                            pin_fn,
-                            &[arena_ptr.into(), ptr_val.into()],
-                            &format!("field_{field_name}_pin"),
-                        )?;
-                    }
                 }
                 Ok(obj_ptr.as_basic_value_enum())
             }
