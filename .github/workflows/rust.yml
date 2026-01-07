@@ -140,10 +140,13 @@ jobs:
         if: matrix.os_id == 'windows'
         shell: pwsh
         env:
-          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
-          LLVM_TAG: ${{ env.LLVM_TAG }}
+          LLVM_PREFIX: "C:/Program Files/LLVM"
         run: |
-          & scripts/vendor_llvm.ps1
+          $ErrorActionPreference = 'Stop'
+          choco install llvm -y --no-progress
+          if (-not (Test-Path "$env:LLVM_PREFIX/bin/llvm-config.exe")) {
+            Write-Error "llvm-config not found after install"
+          }
 
       - name: Ensure libxml2 import lib (Windows)
         if: matrix.os_id == 'windows'
@@ -211,10 +214,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
-          LLVM_SYS_181_PREFIX: ${{ github.workspace }}/llvm/install
-          LLVM_CONFIG_PATH: ${{ github.workspace }}/llvm/install/bin/llvm-config.exe
-          LIBRARY_PATH: ${{ github.workspace }}/llvm/install/lib
+          LLVM_PREFIX: "C:/Program Files/LLVM"
+          LLVM_SYS_181_PREFIX: "C:/Program Files/LLVM"
+          LLVM_CONFIG_PATH: "C:/Program Files/LLVM/bin/llvm-config.exe"
+          LIBRARY_PATH: "C:/Program Files/LLVM/lib"
           LLVM_NO_LIBXML2: "1"
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
