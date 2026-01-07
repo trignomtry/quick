@@ -102,7 +102,7 @@ maybe_prompt_clt
 
 
 info "Downloading ${artifact} from ${url}..."
-if ! curl -fsSL "${url}" -o "${tmpdir}/${download_target}"; then
+if ! curl -#fsSL "${url}" -o "${tmpdir}/${download_target}"; then
     error "Download failed. Check QS_BASE/QS_VERSION or connectivity."
     exit 1
 fi
