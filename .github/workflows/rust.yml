@@ -152,16 +152,26 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $version = $env:LLVM_TAG.TrimStart('llvmorg-')
-          $installer = "https://github.com/llvm/llvm-project/releases/download/$($env:LLVM_TAG)/LLVM-$version-win64.exe"
           $dest = Join-Path $env:GITHUB_WORKSPACE "llvm"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          # Try official installer
+          $installer = "https://github.com/llvm/llvm-project/releases/download/$($env:LLVM_TAG)/LLVM-$version-win64.exe"
           $exePath = Join-Path $env:GITHUB_WORKSPACE "llvm-installer.exe"
           Invoke-WebRequest -Uri $installer -OutFile $exePath
           Start-Process -FilePath $exePath -ArgumentList "/S","/D=$dest" -Wait
-          if (-not (Test-Path (Join-Path $dest "bin/llvm-config.exe"))) {
-            Write-Error "llvm-config not found after install"
-          }
           Remove-Item $exePath -Force
+
+          $llvmConfig = Join-Path $dest "bin/llvm-config.exe"
+          if (-not (Test-Path $llvmConfig)) {
+            Write-Host "llvm-config not found in bundled installer, falling back to choco"
+            choco install llvm --version $version -y --no-progress
+            $dest = "C:/Program Files/LLVM"
+            $llvmConfig = Join-Path $dest "bin/llvm-config.exe"
+            if (-not (Test-Path $llvmConfig)) {
+              Write-Error "llvm-config not found after choco install"
+            }
+          }
 
       - name: Add LLVM to PATH (Windows)
         if: matrix.os_id == 'windows'
