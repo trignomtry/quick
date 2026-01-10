@@ -168,6 +168,13 @@ jobs:
           if (-not (Test-Path $llvmConfig)) {
             Write-Host "llvm-config not found in bundled installer, falling back to choco"
             choco install llvm --version $version -y --no-progress --allow-downgrade
+            # Ensure git and ninja are available for potential source build
+            if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+              choco install git -y --no-progress
+            }
+            if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+              choco install ninja -y --no-progress
+            }
             $candidates = @(
               $dest,
               "C:/Program Files/LLVM",
@@ -192,13 +199,24 @@ jobs:
               }
             }
             if (-not $llvmConfig) {
-              Write-Warning "llvm-config still not found; proceeding with detected LLVM prefix"
-              # Try to pick a sane default root
-              foreach ($root in $candidates) {
-                if (Test-Path $root) {
-                  $dest = (Get-Item $root).FullName
-                  break
-                }
+              Write-Warning "llvm-config still not found; building LLVM from source"
+              $srcDir = Join-Path $env:GITHUB_WORKSPACE "llvm-project"
+              $buildDir = Join-Path $env:GITHUB_WORKSPACE "llvm-build"
+              if (Test-Path $srcDir) { Remove-Item $srcDir -Recurse -Force }
+              if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
+              git clone --depth 1 --branch $env:LLVM_TAG https://github.com/llvm/llvm-project.git $srcDir
+              cmake -G Ninja -S "$srcDir/llvm" -B $buildDir `
+                -DLLVM_TARGETS_TO_BUILD="X86" `
+                -DLLVM_ENABLE_PROJECTS="clang;lld" `
+                -DLLVM_ENABLE_RUNTIMES="libunwind" `
+                -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_LINK_LLVM_DYLIB=OFF `
+                -DBUILD_SHARED_LIBS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF `
+                -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF `
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$dest
+              cmake --build $buildDir --config Release --target install
+              $llvmConfig = Join-Path $dest "bin/llvm-config.exe"
+              if (-not (Test-Path $llvmConfig)) {
+                Write-Error "llvm-config not found after source build"
               }
             }
           }
@@ -294,6 +312,7 @@ jobs:
         env:
           LLVM_PREFIX: ${{ env.LLVM_PREFIX }}
           LLVM_SYS_181_PREFIX: ${{ env.LLVM_SYS_181_PREFIX }}
+          LLVM_CONFIG_PATH: ${{ env.LLVM_PREFIX }}/bin/llvm-config
           LLVM_NO_LIBXML2: "1"
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
