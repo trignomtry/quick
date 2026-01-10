@@ -192,12 +192,30 @@ jobs:
               }
             }
             if (-not $llvmConfig) {
-              Write-Error "llvm-config not found after choco install"
+              Write-Warning "llvm-config still not found; proceeding with detected LLVM prefix"
+              # Try to pick a sane default root
+              foreach ($root in $candidates) {
+                if (Test-Path $root) {
+                  $dest = (Get-Item $root).FullName
+                  break
+                }
+              }
             }
           }
 
-          $binDir = Split-Path -Parent $llvmConfig
-          $dest = Split-Path -Parent $binDir
+          $binDir = $null
+          if ($llvmConfig) {
+            $binDir = Split-Path -Parent $llvmConfig
+          }
+          if (-not $binDir) {
+            $candidateBin = Join-Path $dest "bin"
+            if (Test-Path $candidateBin) {
+              $binDir = $candidateBin
+            }
+          }
+          if ($binDir) {
+            $dest = Split-Path -Parent $binDir
+          }
           "LLVM_PREFIX=$dest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "LLVM_SYS_181_PREFIX=$dest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
