@@ -4,7 +4,6 @@ pub struct Parser {
     tokens: Vec<Token>,
     current: usize, // index into `tokens`
     pub pctx: PreCtx,
-    current_return_type: Option<Type>,
     saw_non_nil_return: bool,
     saw_nil_return: bool,
     saw_never_return: bool,
@@ -19,7 +18,6 @@ impl Parser {
             tokens,
             current: 0,
             pctx: PreCtx::default(),
-            current_return_type: None,
             saw_non_nil_return: false,
             saw_nil_return: false,
             saw_never_return: false,
@@ -223,14 +221,14 @@ impl Parser {
                 self.saw_non_nil_return = true;
             }
             // Unify return types: allow Nil and uniform type => Option(inner)
-            let merged_return_type = if let Some(old) = self.current_return_type.clone() {
+            let merged_return_type = if let Some(old) = self.pctx.current_return_type.clone() {
                 merge_return_types(&old, &ret_type).ok_or_else(|| {
                     format!("Mismatched return types in function: {old:?} vs {ret_type:?}")
                 })?
             } else {
                 ret_type.clone()
             };
-            self.current_return_type = Some(merged_return_type);
+            self.pctx.current_return_type = Some(merged_return_type);
             self.match_kind(TokenKind::Semicolon);
             Ok(Instruction::Return(expr))
         } else if self.match_kind(TokenKind::Break) {
@@ -273,7 +271,7 @@ impl Parser {
             }
 
             // Loop variable is numeric; register for type checking before parsing body
-            self.pctx.var_types.insert(iterator.clone(), Type::Num);
+            self.pctx.var_types.insert(iterator.clone(), Type::Int);
 
             self.loop_depth += 1;
             let body_stmt = match self.parse_statement() {
@@ -367,7 +365,8 @@ impl Parser {
                         // Only allow literal constants to avoid executing code
                         let is_literal = matches!(
                             value,
-                            Expr::Literal(Value::Num(_))
+                            Expr::Literal(Value::Int(_))
+                                | Expr::Literal(Value::Float(_))
                                 | Expr::Literal(Value::Str(_))
                                 | Expr::Literal(Value::Bool(_))
                                 | Expr::Literal(Value::Nil)
@@ -616,13 +615,87 @@ impl Parser {
             self.advance();
             self.consume(LParen, "Expected '(' after function name")?;
 
-            let (params, fn_ret_type, block) = self.parse_fn_params_body()?;
+            self.pctx.current_parsing_function = Some(fun_name.clone());
 
-            // Store the function's type signature for strong typing on calls
+            // --- START RECURSION FIX ---
+
+            // 1. Parse parameters first
+            let mut params = vec![];
+            while !self.is_at_end() && self.peek().kind != RParen {
+                let param_name = if let Identifier(i) = self.peek().kind {
+                    i
+                } else {
+                    return Err(format!(
+                        "[line {}] Expected parameter name after '(', got {}",
+                        self.peek().line,
+                        self.peek().value
+                    ));
+                };
+                self.advance();
+                self.consume(Colon, "Expected ':' after param name")?;
+                let param_type = self.parse_type()?;
+                if self.match_kind(TokenKind::Comma) {
+                    // Continue parsing next parameter
+                }
+                params.push((param_name, param_type));
+            }
+            self.advance(); // Consume ')'
+
+            // 2. Register a placeholder signature BEFORE parsing the body
+            // This allows recursive calls to be type-checked.
+            // We use `Type::Never` as a placeholder return type which can unify with anything.
+            let placeholder_type = Type::Function(params.clone(), Box::new(Type::Never));
+            self.pctx
+                .var_types
+                .insert(fun_name.clone(), placeholder_type);
+
+            // 3. Now parse the body with the placeholder in context
+            let saved_types = self.pctx.var_types.clone();
+            for (param_name, param_type) in &params {
+                self.pctx
+                    .var_types
+                    .insert(param_name.clone(), param_type.clone());
+            }
+
+            self.pctx.current_return_type = None;
+            self.saw_non_nil_return = false;
+            self.saw_nil_return = false;
+            self.saw_never_return = false;
+
+            let block = self.parse_statement()?;
+
+            // 4. Infer the real return type
+            let fn_ret_type = if self.saw_non_nil_return && self.saw_nil_return {
+                match self.pctx.current_return_type.clone() {
+                    Some(Type::Option(inner)) => Type::Option(inner),
+                    Some(inner) if inner != Type::Nil => Type::Option(Box::new(inner)),
+                    _ => Type::Nil,
+                }
+            } else if self.saw_non_nil_return {
+                match self.pctx.current_return_type.clone() {
+                    Some(inner) if inner != Type::Nil => inner,
+                    _ => Type::Nil,
+                }
+            } else if self.saw_nil_return {
+                Type::Nil
+            } else if self.saw_never_return {
+                self.pctx.current_return_type.clone().unwrap_or(Type::Never)
+            } else {
+                Type::Nil
+            };
+
+            // Restore outer scope types before updating the function's final signature
+            self.pctx.var_types = saved_types;
+
+            // 5. Update the context with the final, correct function signature
             self.pctx.var_types.insert(
                 fun_name.clone(),
                 Type::Function(params.clone(), Box::new(fn_ret_type.clone())),
             );
+
+            // --- END RECURSION FIX ---
+            self.pctx.current_parsing_function = None;
+
             Ok(Instruction::FunctionDef {
                 body: vec![block],
                 name: fun_name,
@@ -996,13 +1069,13 @@ impl Parser {
                     (Type::Kv(_l), Type::Kv(y)) => Type::Kv(y),
                     (Type::List(act), Type::List(exp)) if *act == Type::Nil => Type::List(exp),
                     (act, exp) => {
-                        if act != exp {
+                        if let Some(inferred) = act.infer(&exp).or_else(|| exp.infer(&act)) {
+                            inferred
+                        } else {
                             eprintln!(
                                 "Expected type {exp:?}, found {act:?} for variable {var_name}"
                             );
                             std::process::exit(70);
-                        } else {
-                            exp
                         }
                     }
                 }
@@ -1328,7 +1401,7 @@ impl Parser {
         }
 
         // Reset return type inference and flags for this new function
-        self.current_return_type = None;
+        self.pctx.current_return_type = None;
         self.saw_non_nil_return = false;
         self.saw_nil_return = false;
         self.saw_never_return = false;
@@ -1341,21 +1414,21 @@ impl Parser {
         // - No non-nil ⇒ Nil
         let fn_ret_type = if self.saw_non_nil_return && self.saw_nil_return {
             // Mixed returns: Option of inner non-nil type
-            match self.current_return_type.clone() {
+            match self.pctx.current_return_type.clone() {
                 Some(Type::Option(inner)) => Type::Option(inner),
                 Some(inner) if inner != Type::Nil => Type::Option(Box::new(inner)),
                 _ => Type::Nil,
             }
         } else if self.saw_non_nil_return {
             // Only non-nil returns: return that type
-            match self.current_return_type.clone() {
+            match self.pctx.current_return_type.clone() {
                 Some(inner) if inner != Type::Nil => inner,
                 _ => Type::Nil,
             }
         } else if self.saw_nil_return {
             Type::Nil
         } else if self.saw_never_return {
-            self.current_return_type.clone().unwrap_or(Type::Never)
+            self.pctx.current_return_type.clone().unwrap_or(Type::Never)
         } else {
             // No non-nil returns ⇒ always nil
             Type::Nil
@@ -1452,16 +1525,44 @@ impl Parser {
         let mut expr = self.primary()?;
         loop {
             if self.match_kind(TokenKind::Dot) {
-                if let TokenKind::Identifier(name) = &self.peek().kind {
-                    let prop = name.clone();
-                    self.advance();
-                    expr = Expr::Get(Box::new(expr), prop);
-                } else {
-                    return Err(format!(
-                        "Expected identifier after '.', found {}",
-                        self.peek().kind
-                    ));
-                }
+                let prop = match self.peek().kind.clone() {
+                    TokenKind::Identifier(name) => name,
+                    // Convert keyword tokens back to their string representation
+                    // for property access.
+                    TokenKind::Print => "print".to_string(),
+                    TokenKind::Reprint => "reprint".to_string(),
+                    TokenKind::Fun => "fun".to_string(),
+                    TokenKind::Let => "let".to_string(),
+                    TokenKind::If => "if".to_string(),
+                    TokenKind::Else => "else".to_string(),
+                    TokenKind::For => "for".to_string(),
+                    TokenKind::While => "while".to_string(),
+                    TokenKind::Return => "return".to_string(),
+                    TokenKind::Break => "break".to_string(),
+                    TokenKind::True => "true".to_string(),
+                    TokenKind::False => "false".to_string(),
+                    TokenKind::In => "in".to_string(),
+                    TokenKind::Match => "match".to_string(),
+                    TokenKind::Object => "object".to_string(),
+                    TokenKind::Enum => "enum".to_string(),
+                    TokenKind::Use => "use".to_string(),
+                    TokenKind::OptionSome => "Some".to_string(),
+                    TokenKind::OptionNone => "None".to_string(),
+                    TokenKind::ResultOk => "Ok".to_string(),
+                    TokenKind::ResultErr => "Err".to_string(),
+                    TokenKind::And => "and".to_string(),
+                    TokenKind::Or => "or".to_string(),
+                    TokenKind::Super => "super".to_string(),
+                    TokenKind::This => "this".to_string(),
+                    _ => {
+                        return Err(format!(
+                            "Expected identifier after '.', found {}",
+                            self.peek().kind
+                        ));
+                    }
+                };
+                self.advance();
+                expr = Expr::Get(Box::new(expr), prop);
             } else if self.match_kind(TokenKind::LBrack) {
                 let index_pr = self.expression()?;
                 self.consume(RBrack, "Expected ']' after list index")?;
@@ -1570,9 +1671,13 @@ impl Parser {
 
         let pekd = self.peek().clone();
 
-        if let TokenKind::Num(n) = pekd.kind {
+        if let TokenKind::Int(n) = pekd.kind {
             self.advance();
-            let expr = Expr::Literal(Value::Num(n));
+            let expr = Expr::Literal(Value::Int(n));
+            return Ok(expr);
+        } else if let TokenKind::Float(n) = pekd.kind {
+            self.advance();
+            let expr = Expr::Literal(Value::Float(n));
             return Ok(expr);
         } else if let TokenKind::Str(o) = &pekd.kind {
             self.advance();

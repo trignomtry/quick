@@ -62,7 +62,7 @@ print("splitlen:" + split.len().str());
 print("splitmid:" + split[1]);
 print("join:" + split.join("-"));
 
-let parsed = "42".num().default(0);
+let parsed = "42".num();
 print("num:" + parsed.str());
 print("index:" + "code"[1]);
 

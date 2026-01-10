@@ -538,6 +538,8 @@ struct EnumVariantSchema {
 #[derive(Clone, Debug)]
 enum SchemaType {
     Num,
+    Int,
+    Float,
     Str,
     Bool,
     List(Box<SchemaType>),
@@ -589,6 +591,12 @@ fn parse_schema(signature: &str) -> Result<SchemaType, String> {
 
     if trimmed == "Num" {
         return Ok(SchemaType::Num);
+    }
+    if trimmed == "Int" {
+        return Ok(SchemaType::Int);
+    }
+    if trimmed == "Float" {
+        return Ok(SchemaType::Float);
     }
     if trimmed == "Str" {
         return Ok(SchemaType::Str);
@@ -749,6 +757,7 @@ pub struct JsonHandle {
 }
 
 enum ValueRepr {
+    Int(i64),
     Float(f64),
     Bool(bool),
     Pointer(*mut c_void),
@@ -757,6 +766,7 @@ enum ValueRepr {
 unsafe fn store_value(slot_ptr: *mut u8, repr: ValueRepr) {
     unsafe {
         match repr {
+            ValueRepr::Int(i) => (slot_ptr as *mut i64).write(i),
             ValueRepr::Float(f) => (slot_ptr as *mut f64).write(f),
             ValueRepr::Bool(b) => (slot_ptr as *mut u64).write(if b { 1 } else { 0 }),
             ValueRepr::Pointer(ptr) => (slot_ptr as *mut *mut c_void).write(ptr),
@@ -767,7 +777,7 @@ unsafe fn store_value(slot_ptr: *mut u8, repr: ValueRepr) {
 fn wrap_pointer_from_repr(repr: ValueRepr) -> Result<*mut c_void, String> {
     match repr {
         ValueRepr::Pointer(ptr) => Ok(ptr),
-        ValueRepr::Float(_) | ValueRepr::Bool(_) => {
+        ValueRepr::Int(_) | ValueRepr::Float(_) | ValueRepr::Bool(_) => {
             Err("Option values for primitive numbers or booleans are not yet supported".to_string())
         }
     }
@@ -778,6 +788,15 @@ fn coerce_json_to_value(schema: &SchemaType, value: &JsonValue) -> Result<ValueR
         SchemaType::Num => value
             .as_f64()
             .ok_or_else(|| format!("Expected number, found {value}"))
+            .map(ValueRepr::Float),
+        SchemaType::Int => value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|f| f as i64))
+            .ok_or_else(|| format!("Expected integer, found {value}"))
+            .map(ValueRepr::Int),
+        SchemaType::Float => value
+            .as_f64()
+            .ok_or_else(|| format!("Expected float, found {value}"))
             .map(ValueRepr::Float),
         SchemaType::Str => value
             .as_str()
@@ -1026,7 +1045,11 @@ fn build_enum_from_json_value(
 
 fn read_field_value(schema: &SchemaType, slot_ptr: *mut u8) -> JsonValue {
     match schema {
-        SchemaType::Num => unsafe { JsonValue::from(*(slot_ptr as *mut f64)) },
+        SchemaType::Num | SchemaType::Float => unsafe { JsonValue::from(*(slot_ptr as *mut f64)) },
+        SchemaType::Int => {
+            let raw = unsafe { *(slot_ptr as *mut i64) };
+            JsonValue::from(raw as f64)
+        }
         SchemaType::Str => {
             let ptr = unsafe { *(slot_ptr as *mut *mut c_void) } as *mut c_char;
             if ptr.is_null() {
@@ -1763,9 +1786,9 @@ pub struct WebHelper {
 
 #[repr(C)]
 pub struct RangeBuilder {
-    from: f64,
-    to: f64,
-    step: f64,
+    from: i64,
+    to: i64,
+    step: i64,
 }
 
 #[unsafe(no_mangle)]
@@ -1845,20 +1868,20 @@ pub unsafe extern "C" fn create_web_helper() -> *mut WebHelper {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_range_builder() -> *mut RangeBuilder {
     Box::into_raw(Box::new(RangeBuilder {
-        from: 0.0,
-        to: 0.0,
-        step: 1.0,
+        from: 0,
+        to: 0,
+        step: 1,
     }))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn range_builder_to(buil: *mut RangeBuilder, tua: f64) -> *mut RangeBuilder {
+pub unsafe extern "C" fn range_builder_to(buil: *mut RangeBuilder, tua: i64) -> *mut RangeBuilder {
     unsafe {
         if buil.is_null() {
             return Box::into_raw(Box::new(RangeBuilder {
-                from: 0.0,
+                from: 0,
                 to: tua,
-                step: 1.0,
+                step: 1,
             }));
         }
         (*buil).to = tua;
@@ -1870,7 +1893,7 @@ pub unsafe extern "C" fn range_builder_to(buil: *mut RangeBuilder, tua: f64) -> 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_range_builder_to(
     buil: *mut RangeBuilder,
-    tua: f64,
+    tua: i64,
 ) -> *mut RangeBuilder {
     unsafe { range_builder_to(buil, tua) }
 }
@@ -1878,14 +1901,14 @@ pub unsafe extern "C" fn create_range_builder_to(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_from(
     buil: *mut RangeBuilder,
-    tua: f64,
+    tua: i64,
 ) -> *mut RangeBuilder {
     unsafe {
         if buil.is_null() {
             return Box::into_raw(Box::new(RangeBuilder {
                 from: tua,
-                to: 0.0,
-                step: 1.0,
+                to: 0,
+                step: 1,
             }));
         }
         (*buil).from = tua;
@@ -1897,25 +1920,25 @@ pub unsafe extern "C" fn range_builder_from(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_range_builder_from(
     buil: *mut RangeBuilder,
-    tua: f64,
+    tua: i64,
 ) -> *mut RangeBuilder {
     unsafe { range_builder_from(buil, tua) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn range_builder_step(
     buil: *mut RangeBuilder,
-    tua: f64,
+    tua: i64,
 ) -> *mut RangeBuilder {
     unsafe {
         if buil.is_null() {
             return Box::into_raw(Box::new(RangeBuilder {
-                from: 0.0,
-                to: 0.0,
-                step: if tua == 0.0 { 1.0 } else { tua },
+                from: 0,
+                to: 0,
+                step: if tua == 0 { 1 } else { tua },
             }));
         }
-        if tua == 0.0 {
-            (*buil).step = 1.0;
+        if tua == 0 {
+            (*buil).step = 1;
         } else {
             (*buil).step = tua;
         }
@@ -1927,39 +1950,39 @@ pub unsafe extern "C" fn range_builder_step(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_range_builder_step(
     buil: *mut RangeBuilder,
-    tua: f64,
+    tua: i64,
 ) -> *mut RangeBuilder {
     unsafe { range_builder_step(buil, tua) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn range_builder_get_from(buil: *const RangeBuilder) -> f64 {
+pub unsafe extern "C" fn range_builder_get_from(buil: *const RangeBuilder) -> i64 {
     unsafe {
         if buil.is_null() {
-            return 0.0;
+            return 0;
         }
         (*buil).from
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn range_builder_get_to(buil: *const RangeBuilder) -> f64 {
+pub unsafe extern "C" fn range_builder_get_to(buil: *const RangeBuilder) -> i64 {
     unsafe {
         if buil.is_null() {
-            return 0.0;
+            return 0;
         }
         (*buil).to
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn range_builder_get_step(buil: *const RangeBuilder) -> f64 {
+pub unsafe extern "C" fn range_builder_get_step(buil: *const RangeBuilder) -> i64 {
     unsafe {
         if buil.is_null() {
-            return 1.0;
+            return 1;
         }
         let step = (*buil).step;
-        if step == 0.0 { 1.0 } else { step }
+        if step == 0 { 1 } else { step }
     }
 }
 
@@ -2697,7 +2720,9 @@ impl Token {
             println!("{} \"{}\" {}", token.kind, token.value, token.value);
         } else if let Eof = token.kind {
             println!("EOF  null");
-        } else if let Num(_) = token.kind {
+        } else if let Int(_) = token.kind {
+            println!("{} {} {}", token.kind, token.value, token.value);
+        } else if let Float(_) = token.kind {
             println!(
                 "{} {} {}",
                 token.kind,
@@ -2765,7 +2790,8 @@ enum TokenKind {
     While,
     Use,
     Eof,
-    Num(f64),
+    Int(i64),
+    Float(f64),
     Error(u64, std::string::String),
 }
 
@@ -2894,16 +2920,11 @@ impl Expr {
                 Ok(Type::Custom(Custype::Object(fields)))
             }
             Expr::Literal(tk) => match tk {
-                Value::Num(_) => Ok(Type::Num),
+                Value::Int(_) => Ok(Type::Int),
+                Value::Float(_) => Ok(Type::Float),
                 Value::Str(_) => Ok(Type::Str),
                 Value::Bool(_) => Ok(Type::Bool),
                 Value::Nil => Ok(Type::Nil),
-                _ => {
-                    return type_error(
-                        "Unsupported literal value".to_string(),
-                        Some("Only numbers, strings, booleans, and nil are valid literals here."),
-                    );
-                }
             },
             Expr::List(l) => Ok(Type::List(if let Some(r) = l.first() {
                 Box::new(infer_expr(r)?)
@@ -2914,6 +2935,14 @@ impl Expr {
             Expr::Binary(l, op, r) => {
                 let lt = infer_expr(l)?.unwrap();
                 let rt = infer_expr(r)?.unwrap();
+                let is_numeric = |t: &Type| matches!(t, Type::Int | Type::Float | Type::Num);
+                let numeric_result_type = |l: &Type, r: &Type| {
+                    if matches!(l, Type::Float) || matches!(r, Type::Float) {
+                        Type::Float
+                    } else {
+                        Type::Int
+                    }
+                };
                 match op {
                     BinOp::And | BinOp::Or => {
                         if lt == Type::Bool && rt == Type::Bool {
@@ -2928,28 +2957,25 @@ impl Expr {
                         }
                     }
                     BinOp::Plus => match (&lt, &rt) {
-                        (Type::Num, Type::Num) => Ok(Type::Num),
+                        (l, r) if is_numeric(l) && is_numeric(r) => Ok(numeric_result_type(l, r)),
                         (Type::Str, Type::Str) => Ok(Type::Str),
                         _ => type_error(
                             "The '+' operator needs two numbers or two strings".to_string(),
                             Some(
-                                "Convert values to a shared type (both Num or both Str) before adding.",
+                                "Convert values to a shared type (both Int, both Float, or both Str) before adding.",
                             ),
                         ),
                     },
-                    BinOp::Minus | BinOp::Mult | BinOp::Div => {
-                        if lt == Type::Num && rt == Type::Num {
-                            Ok(Type::Num)
-                        } else {
-                            type_error(
-                                format!("Operator {op:?} requires two numbers"),
-                                Some("Cast both operands to Num or adjust the expression."),
-                            )
-                        }
-                    }
+                    BinOp::Minus | BinOp::Mult | BinOp::Div => match (&lt, &rt) {
+                        (l, r) if is_numeric(l) && is_numeric(r) => Ok(numeric_result_type(l, r)),
+                        _ => type_error(
+                            format!("Operator {op:?} requires two numbers"),
+                            Some("Cast both operands to Int or Float or adjust the expression."),
+                        ),
+                    },
                     BinOp::EqEq | BinOp::NotEq => Ok(Type::Bool),
                     BinOp::Greater | BinOp::Less | BinOp::GreaterEqual | BinOp::LessEqual => {
-                        if lt == Type::Num && rt == Type::Num {
+                        if is_numeric(&lt) && is_numeric(&rt) {
                             Ok(Type::Bool)
                         } else {
                             type_error(
@@ -3015,7 +3041,7 @@ impl Expr {
                     },
                     Type::List(t) => {
                         if prop == "len" {
-                            Ok(Type::Function(vec![], Box::new(Type::Num)))
+                            Ok(Type::Function(vec![], Box::new(Type::Int)))
                         } else if prop == "push" {
                             Ok(Type::Function(
                                 vec![("pushing".to_string(), *t)],
@@ -3023,7 +3049,7 @@ impl Expr {
                             ))
                         } else if prop == "remove" {
                             Ok(Type::Function(
-                                vec![("removing".to_string(), Type::Num)],
+                                vec![("removing".to_string(), Type::Int)],
                                 Box::new(Type::Nil),
                             ))
                         } else if prop == "join" {
@@ -3051,13 +3077,21 @@ impl Expr {
                         // Special-case io properties
 
                         match prop.as_str() {
-                            "random" => Ok(Type::Function(vec![], Box::new(Type::Num))),
+                            "print" => Ok(Type::Function(
+                                vec![("output".to_string(), Type::Str)],
+                                Box::new(Type::Nil),
+                            )),
+                            "reprint" => Ok(Type::Function(
+                                vec![("output".to_string(), Type::Str)],
+                                Box::new(Type::Nil),
+                            )),
+                            "random" => Ok(Type::Function(vec![], Box::new(Type::Float))),
                             "input" => Ok(Type::Function(
                                 vec![("prompt".to_string(), Type::Str)],
                                 Box::new(Type::Str),
                             )),
                             "exit" => Ok(Type::Function(
-                                vec![("code".to_string(), Type::Num)],
+                                vec![("code".to_string(), Type::Int)],
                                 Box::new(Type::Never),
                             )),
                             "json" => Ok(Type::Function(
@@ -3079,7 +3113,7 @@ impl Expr {
                                     .insert("body".to_string(), Type::Option(Box::new(Type::Str)));
                                 Ok(Type::Function(
                                     vec![
-                                        ("port".to_string(), Type::Num),
+                                        ("port".to_string(), Type::Int),
                                         (
                                             "handler".to_string(),
                                             Type::Function(
@@ -3155,7 +3189,7 @@ impl Expr {
                                         "text".to_string(),
                                         Type::Function(
                                             vec![
-                                                ("status".to_string(), Type::Num),
+                                                ("status".to_string(), Type::Int),
                                                 ("content".to_string(), Type::Str),
                                             ],
                                             Box::new(Type::WebReturn),
@@ -3165,7 +3199,7 @@ impl Expr {
                                         "page".to_string(),
                                         Type::Function(
                                             vec![
-                                                ("status".to_string(), Type::Num),
+                                                ("status".to_string(), Type::Int),
                                                 ("content".to_string(), Type::Str),
                                             ],
                                             Box::new(Type::WebReturn),
@@ -3175,7 +3209,7 @@ impl Expr {
                                         "file".to_string(),
                                         Type::Function(
                                             vec![
-                                                ("status".to_string(), Type::Num),
+                                                ("status".to_string(), Type::Int),
                                                 ("name".to_string(), Type::Str),
                                             ],
                                             Box::new(Type::WebReturn),
@@ -3192,7 +3226,7 @@ impl Expr {
                                 return type_error(
                                     format!("Unknown io helper '{other}'"),
                                     Some(
-                                        "Check the available builders like range(), read(), write(), web(), listen(), input(), and random().",
+                                        "Check the available builders like range(), read(), write(), web(), listen(), input(), print(), and random().",
                                     ),
                                 );
                             }
@@ -3200,15 +3234,15 @@ impl Expr {
                     }
                     Type::RangeBuilder => match prop.as_str() {
                         "to" => Ok(Type::Function(
-                            vec![("rang".to_string(), Type::Num)],
+                            vec![("rang".to_string(), Type::Int)],
                             Box::new(Type::RangeBuilder),
                         )),
                         "from" => Ok(Type::Function(
-                            vec![("rang".to_string(), Type::Num)],
+                            vec![("rang".to_string(), Type::Int)],
                             Box::new(Type::RangeBuilder),
                         )),
                         "step" => Ok(Type::Function(
-                            vec![("rang".to_string(), Type::Num)],
+                            vec![("rang".to_string(), Type::Int)],
                             Box::new(Type::RangeBuilder),
                         )),
                         other => type_error(
@@ -3222,10 +3256,10 @@ impl Expr {
                             Box::new(Type::Option(Box::new(Type::JsonValue))),
                         )),
                         "at" => Ok(Type::Function(
-                            vec![("index".to_string(), Type::Num)],
+                            vec![("index".to_string(), Type::Int)],
                             Box::new(Type::Option(Box::new(Type::JsonValue))),
                         )),
-                        "len" => Ok(Type::Function(vec![], Box::new(Type::Num))),
+                        "len" => Ok(Type::Function(vec![], Box::new(Type::Int))),
                         "is_null" => Ok(Type::Function(vec![], Box::new(Type::Bool))),
                         "stringify" => Ok(Type::Function(vec![], Box::new(Type::Str))),
                         "str" => Ok(Type::Function(
@@ -3239,7 +3273,7 @@ impl Expr {
                             ),
                         ),
                     },
-                    Type::Num => match prop.as_str() {
+                    Type::Num | Type::Int | Type::Float => match prop.as_str() {
                         "str" => Ok(Type::Function(vec![], Box::new(Type::Str))),
                         other => type_error(
                             format!("Unknown Num helper '{other}'"),
@@ -3329,12 +3363,9 @@ impl Expr {
                     }
                     Type::Str => {
                         if prop == "len" {
-                            Ok(Type::Function(vec![], Box::new(Type::Num)))
+                            Ok(Type::Function(vec![], Box::new(Type::Int)))
                         } else if prop == "num" {
-                            Ok(Type::Function(
-                                vec![],
-                                Box::new(Type::Option(Box::new(Type::Num))),
-                            ))
+                            Ok(Type::Function(vec![], Box::new(Type::Float)))
                         } else if prop == "ends_with" || prop == "starts_with" {
                             Ok(Type::Function(
                                 vec![("thing".to_string(), Type::Str)],
@@ -3430,156 +3461,13 @@ impl Expr {
             }
             Expr::Block(_) => Ok(Type::Nil),
             Expr::Call(callee, args) => {
-                // Special-case: io.random() always returns a number
-                //             if let Expr::Get(inner, prop) = &**callee {
-                // if let Expr::Variable(obj) = &**inner {
-                //     if obj == "io" && prop == "random" {
-                //         if args.is_empty() {
-                //             return Ok(Type::Num);
-                //         } else {
-                //             return Err(format!(
-                //                 "io.random() expects no arguments, got {}",
-                //                 args.len(),
-                //             ));
-                //         }
-                //     } else if obj == "io" && prop == "listen" {
-                //         if args.len() == 1 || args.len() == 2 {
-                //             return Ok(Type::Num); // io.listen returns a number
-                //         } else {
-                //             return Err(format!(
-                //                 "io.listen() expects 1 or 2 arguments, got {}",
-                //                 args.len(),
-                //             ));
-                //         }
-                //     } else if obj == "io" && prop == "method" {
-                //         if args.is_empty() {
-                //             return Ok(Type::Str); // io.method() returns a string
-                //         } else {
-                //             return Err(format!(
-                //                 "io.method() expects no arguments, got {}",
-                //                 args.len(),
-                //             ));
-                //         }
-                //     } else if obj == "io" && prop == "path" {
-                //         if args.is_empty() {
-                //             return Ok(Type::Str); // io.path() returns a string
-                //         } else {
-                //             return Err(format!(
-                //                 "io.path() expects no arguments, got {}",
-                //                 args.len(),
-                //             ));
-                //         }
-                //     } else if obj == "io" && prop == "web" {
-                //         if args.is_empty() {
-                //             return Ok(Type::Custom({
-                //                 let mut web_type = HashMap::new();
-                //                 web_type.insert(
-                //                     "text".to_string(),
-                //                     Type::Function(
-                //                         vec![("content".to_string(), Type::Str)],
-                //                         Box::new(Type::WebReturn),
-                //                     ),
-                //                 );
-                //                 web_type.insert(
-                //                     "page".to_string(),
-                //                     Type::Function(
-                //                         vec![("content".to_string(), Type::Str)],
-                //                         Box::new(Type::WebReturn),
-                //                     ),
-                //                 );
-                //                 web_type.insert(
-                //                     "file".to_string(),
-                //                     Type::Function(
-                //                         vec![("name".to_string(), Type::Str)],
-                //                         Box::new(Type::WebReturn),
-                //                     ),
-                //                 );
-                //                 web_type.insert(
-                //                     "json".to_string(),
-                //                     Type::Function(
-                //                         vec![("content".to_string(), Type::Str)],
-                //                         Box::new(Type::WebReturn),
-                //                     ),
-                //                 );
-
-                //                 web_type.insert(
-                //                     "redirect".to_string(),
-                //                     Type::Function(
-                //                         vec![
-                //                             ("location".to_string(), Type::Str),
-                //                             ("permanent".to_string(), Type::Bool),
-                //                         ],
-                //                         Box::new(Type::WebReturn),
-                //                     ),
-                //                 );
-                //                 // Add error property with text method
-                //                 let mut error_type = HashMap::new();
-                //                 error_type.insert(
-                //                     "text".to_string(),
-                //                     Type::Function(
-                //                         vec![
-                //                             ("status".to_string(), Type::Num),
-                //                             ("content".to_string(), Type::Str),
-                //                         ],
-                //                         Box::new(Type::WebReturn),
-                //                     ),
-                //                 );
-                //                 error_type.insert(
-                //                     "page".to_string(),
-                //                     Type::Function(
-                //                         vec![
-                //                             ("status".to_string(), Type::Num),
-                //                             ("content".to_string(), Type::Str),
-                //                         ],
-                //                         Box::new(Type::WebReturn),
-                //                     ),
-                //                 );
-                //                 web_type.insert(
-                //                     "error".to_string(),
-                //                     Type::Custom(Custype::Object(error_type)),
-                //                 );
-                //                 Custype::Object(web_type)
-                //             })); // io.web() returns a web helper object
-                //         } else {
-                //             return Err(format!("io.web() expects no arguments, got {}", args.len(),));
-                //         }
-                //     } else if obj == "io" && prop == "read" {
-                //         if args.len() == 1 {
-                //             return Ok(Type::Str); // io.read() returns a string (async by default)
-                //         } else {
-                //             return Err(format!("io.read() expects 1 argument, got {}", args.len(),));
-                //         }
-                //     } else if obj == "io" && prop == "write" {
-                //         if args.len() == 2 {
-                //             return Ok(Type::Num); // io.write() returns a number (async by default)
-                //         } else {
-                //             return Err(format!(
-                //                 "io.write() expects 2 arguments, got {}",
-                //                 args.len(),
-                //             ));
-                //         }
-                //     } else if obj == "web" && (prop == "page" || prop == "text" || prop == "file") {
-                //         if args.len() == 1 {
-                //             return Ok(Type::WebReturn); // web.page() returns a response object
-                //         } else {
-                //             return Err(format!(
-                //                 "web.{prop}() expects 1 argument, got {}",
-                //                 args.len(),
-                //             ));
-                //         }
-                //     } else if obj == "web" && prop == "redirect" {
-                //         if args.len() == 2 {
-                //             return Ok(Type::WebReturn); // web.redirect() returns a response object
-                //         } else {
-                //             return Err(format!(
-                //                 "web.redirect() expects 2 arguments, got {}",
-                //                 args.len(),
-                //             ));
-                //         }
-                //     }
-                // }
-                // }
-
+                if let Expr::Variable(callee_name) = &**callee {
+                    if ctx.current_parsing_function.as_ref() == Some(callee_name) {
+                        if let Some(inferred_type) = &ctx.current_return_type {
+                            return Ok(inferred_type.clone());
+                        }
+                    }
+                }
                 // Existing function call type-checking
                 let callee_type = infer_expr(callee)?;
 
@@ -3707,7 +3595,12 @@ impl Expr {
                                 // Expressions of type Never can flow into any parameter.
                             }
                             (expected, actual) => {
-                                if expected != actual {
+                                if expected != actual
+                                    && expected
+                                        .infer(actual)
+                                        .or_else(|| actual.infer(expected))
+                                        .is_none()
+                                {
                                     return type_error(
                                         format!(
                                             "Argument {} has type {:?}, but {:?} is required",
@@ -3803,7 +3696,8 @@ enum Instruction {
 
 #[derive(Clone)]
 enum Value {
-    Num(f64),
+    Int(i64),
+    Float(f64),
     Str(String),
     /// Special return value used to signal early exit from functions
     Bool(bool),
@@ -3813,7 +3707,8 @@ enum Value {
 impl Debug for Value {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Num(n) => write!(f, "Num({n})"),
+            Self::Int(n) => write!(f, "Int({n})"),
+            Self::Float(n) => write!(f, "Float({n})"),
             Self::Str(s) => write!(f, "Str({s})"),
             Self::Bool(b) => write!(f, "Bool({b})"),
 
@@ -3891,6 +3786,8 @@ struct PreCtx {
     modules: HashMap<String, ModuleInfo>,
     current_line: Cell<Option<usize>>,
     warnings: RefCell<Vec<Warning>>,
+    current_parsing_function: Option<String>,
+    current_return_type: Option<Type>,
 }
 
 impl PreCtx {
@@ -3989,6 +3886,8 @@ impl PreCtx {
         match ty {
             Type::GenericParam(name) => format!("{name}"),
             Type::Num => "Num".to_string(),
+            Type::Int => "Int".to_string(),
+            Type::Float => "Float".to_string(),
             Type::Str => "Str".to_string(),
             Type::Bool => "Bool".to_string(),
             Type::Nil => "Nil".to_string(),
@@ -4091,7 +3990,7 @@ impl PreCtx {
 
     fn ensure_deserializable(&mut self, ty: &Type) -> Result<(), String> {
         match ty {
-            Type::Num | Type::Str | Type::Bool => Ok(()),
+            Type::Num | Type::Int | Type::Float | Type::Str | Type::Bool => Ok(()),
             Type::Option(inner) => self.ensure_deserializable(inner),
             Type::List(inner) => self.ensure_deserializable(inner),
             Type::Kv(inner) => self.ensure_deserializable(inner),
@@ -4159,6 +4058,8 @@ impl Default for Custype {
 enum Type {
     GenericParam(String),
     Num,
+    Int,
+    Float,
     Str,
     Bool,
     Nil,
@@ -4191,6 +4092,9 @@ impl Type {
             (other, Type::Never) => Some(other.clone()),
             (Type::List(b), Type::List(e)) if **b == Type::Nil => Some(Type::List(e.clone())),
             (Type::Kv(b), Type::List(e)) if **b == Type::Nil => Some(Type::Kv(e.clone())),
+            (Type::Num, Type::Int) | (Type::Int, Type::Num) => Some(Type::Int),
+            (Type::Num, Type::Float) | (Type::Float, Type::Num) => Some(Type::Float),
+            (Type::Int, Type::Float) | (Type::Float, Type::Int) => Some(Type::Float),
             (Type::Option(inner_actual), Type::Option(inner_expected)) => {
                 if **inner_actual == Type::Never {
                     Some(Type::Option(inner_expected.clone()))
@@ -4285,6 +4189,13 @@ impl PartialEq for Type {
             | (Type::RangeBuilder, Type::RangeBuilder)
             | (Type::JsonValue, Type::JsonValue) => true,
 
+            (Type::Num, Type::Int)
+            | (Type::Int, Type::Num)
+            | (Type::Num, Type::Float)
+            | (Type::Float, Type::Num)
+            | (Type::Int, Type::Int)
+            | (Type::Float, Type::Float) => true,
+
             (Type::List(left), Type::List(right)) | (Type::Option(left), Type::Option(right)) => {
                 left == right
             }
@@ -4348,7 +4259,8 @@ impl Display for TokenKind {
                 let binding = format!("\"{s}\"");
                 binding
             }
-            Self::Num(num) => format!("{num}"),
+            Self::Int(num) => format!("{num}"),
+            Self::Float(num) => format!("{num}"),
             Self::Identifier(ident) => ident.to_string(),
             Self::And => "and".to_string(),
             Self::Object => "object".to_string(),
@@ -5191,7 +5103,16 @@ async fn main() {
                         }
                         formatted.push_str(name);
                     }
-                    Num(num) => {
+                    Int(num) => {
+                        push_indent(&mut formatted, indent, &mut line_open);
+                        if !matches!(prev_kind, Some(LParen | Dot | LBrack | Colon))
+                            && !formatted.ends_with([' ', '\n', '\t'])
+                        {
+                            formatted.push(' ');
+                        }
+                        formatted.push_str(&format!("{num}"));
+                    }
+                    Float(num) => {
                         push_indent(&mut formatted, indent, &mut line_open);
                         if !matches!(prev_kind, Some(LParen | Dot | LBrack | Colon))
                             && !formatted.ends_with([' ', '\n', '\t'])
@@ -5556,14 +5477,26 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
                 j += 1;
             }
 
-            if let Ok(num_val) = number_str.parse::<f64>() {
-                tokens.push(Token {
-                    value: number_str,
-                    kind: Num(num_val),
-                    line,
-                });
-                index = j;
-                continue;
+            if has_dot {
+                if let Ok(num_val) = number_str.parse::<f64>() {
+                    tokens.push(Token {
+                        value: number_str,
+                        kind: Float(num_val),
+                        line,
+                    });
+                    index = j;
+                    continue;
+                }
+            } else {
+                if let Ok(num_val) = number_str.parse::<i64>() {
+                    tokens.push(Token {
+                        value: number_str,
+                        kind: Int(num_val),
+                        line,
+                    });
+                    index = j;
+                    continue;
+                }
             }
         }
 

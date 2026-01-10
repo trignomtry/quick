@@ -115,23 +115,23 @@ fn basics_cover_math_strings_collections_io() {
     let lines = non_empty_lines(&stdout);
     let mut iter = lines.iter();
     let expected_prefixes = vec![
-        "add:3.000000",
-        "mul:12.000000",
-        "div:4.000000",
-        "sub:7.000000",
+        "add:3",
+        "mul:12",
+        "div:4",
+        "sub:7",
         "cmp:true",
         "eq:true",
         "and:false",
         "or:true",
-        "strlen:9.000000",
+        "strlen:9",
         "starts:true",
         "ends:true",
         "contains:true",
         "replace:heXXo.txt",
-        "splitlen:3.000000",
+        "splitlen:3",
         "splitmid:b",
         "join:a-b-c",
-        "num:42.000000",
+        "num:42",
         "index:o",
     ];
     for expected in expected_prefixes {
@@ -153,13 +153,13 @@ fn basics_cover_math_strings_collections_io() {
 
     let remaining: Vec<&str> = iter.map(|s| s.as_str()).collect();
     let expected_tail = vec![
-        "range:2.000000",
-        "range:4.000000",
-        "range:6.000000",
-        "while:3.000000",
-        "listlen:2.000000",
-        "listidx:4.000000",
-        "listafter:2.000000",
+        "range:2",
+        "range:4",
+        "range:6",
+        "while:3",
+        "listlen:2",
+        "listidx:4",
+        "listafter:2",
         "read:read contents",
     ];
     assert_eq!(
@@ -187,14 +187,14 @@ fn objects_enums_modules_and_closures_work_together() {
     let stdout = run_sample_ok("tests/samples/objects_enums_modules.qx");
     let lines = non_empty_lines(&stdout);
     let expected = vec![
-        "box:5.000000:hi",
+        "box:5:hi",
         "box_from_json:json",
-        "pair_sum:3.000000",
+        "pair_sum:3",
         "mood:sad:wow",
         "obj:a:one",
         "obj:missing",
         "module:Hello, World!",
-        "module_const:67.000000",
+        "module_const:67",
     ];
     assert_eq!(lines, expected, "object/enum/module output mismatch");
 }

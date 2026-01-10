@@ -465,7 +465,8 @@ impl<'ctx> Compiler<'ctx> {
             Type::GenericParam(name) => {
                 panic!("Unresolved generic type parameter '{name}' reached LLVM lowering")
             }
-            Type::Num => self.context.f64_type().as_basic_type_enum(),
+            Type::Num | Type::Int => self.context.i64_type().as_basic_type_enum(),
+            Type::Float => self.context.f64_type().as_basic_type_enum(),
             Type::Bool => self.context.bool_type().as_basic_type_enum(),
             Type::Never => {
                 panic!("Type::Never has no direct LLVM representation");
@@ -543,7 +544,19 @@ impl<'ctx> Compiler<'ctx> {
         label: &str,
     ) -> Result<BasicValueEnum<'ctx>, BuilderError> {
         match expected {
-            Type::Num => match value {
+            Type::Num | Type::Int => match value {
+                BasicValueEnum::IntValue(_) => Ok(value),
+                BasicValueEnum::FloatValue(fv) => Ok(self
+                    .builder
+                    .build_float_to_signed_int(
+                        fv,
+                        self.context.i64_type(),
+                        &format!("{label}_float_to_int"),
+                    )?
+                    .as_basic_value_enum()),
+                other => panic!("Expected integer payload, got {other:?}"),
+            },
+            Type::Float => match value {
                 BasicValueEnum::FloatValue(_) => Ok(value),
                 BasicValueEnum::IntValue(iv) => Ok(self
                     .builder
@@ -553,7 +566,7 @@ impl<'ctx> Compiler<'ctx> {
                         &format!("{label}_int_to_float"),
                     )?
                     .as_basic_value_enum()),
-                other => panic!("Expected numeric payload, got {other:?}"),
+                other => panic!("Expected float payload, got {other:?}"),
             },
             Type::Bool => match value {
                 BasicValueEnum::IntValue(iv) => {
@@ -672,7 +685,8 @@ impl<'ctx> Compiler<'ctx> {
                 .context
                 .ptr_type(AddressSpace::default())
                 .as_basic_type_enum(),
-            Type::Num => self.context.f64_type().as_basic_type_enum(),
+            Type::Num | Type::Int => self.context.i64_type().as_basic_type_enum(),
+            Type::Float => self.context.f64_type().as_basic_type_enum(),
             Type::Bool => self.context.bool_type().as_basic_type_enum(),
             Type::Nil => self
                 .context
@@ -1172,7 +1186,30 @@ impl<'ctx> Compiler<'ctx> {
         label: &str,
     ) -> Result<IntValue<'ctx>, BuilderError> {
         match ty {
-            Type::Num => {
+            Type::Num | Type::Int => {
+                let i64_ty = self.context.i64_type();
+                let left_i = match left {
+                    BasicValueEnum::IntValue(iv) => iv,
+                    BasicValueEnum::FloatValue(fv) => self.builder.build_float_to_signed_int(
+                        fv,
+                        i64_ty,
+                        &format!("{label}_lhs_to_int"),
+                    )?,
+                    other => panic!("Cannot compare {other:?} as integer"),
+                };
+                let right_i = match right {
+                    BasicValueEnum::IntValue(iv) => iv,
+                    BasicValueEnum::FloatValue(fv) => self.builder.build_float_to_signed_int(
+                        fv,
+                        i64_ty,
+                        &format!("{label}_rhs_to_int"),
+                    )?,
+                    other => panic!("Cannot compare {other:?} as integer"),
+                };
+                self.builder
+                    .build_int_compare(IntPredicate::EQ, left_i, right_i, label)
+            }
+            Type::Float => {
                 let left_f = match left {
                     BasicValueEnum::FloatValue(fv) => fv,
                     BasicValueEnum::IntValue(iv) => self.builder.build_signed_int_to_float(
@@ -1828,7 +1865,7 @@ impl<'ctx> Compiler<'ctx> {
                 let saved_quick = self.quick_var_types.borrow().clone();
                 self.quick_var_types
                     .borrow_mut()
-                    .insert(iterator.clone(), Type::Num);
+                    .insert(iterator.clone(), Type::Float);
                 let range_val = self.compile_expr(range)?;
                 let range_ptr = match range_val {
                     BasicValueEnum::PointerValue(p) => p,
@@ -1841,29 +1878,29 @@ impl<'ctx> Compiler<'ctx> {
                 let get_to = self.get_or_create_range_builder_get_to();
                 let get_step = self.get_or_create_range_builder_get_step();
 
-                let from_f = self
+                let from_i = self
                     .builder
                     .build_call(get_from, &[range_ptr.into()], "range_from")?
                     .try_as_basic_value()
                     .left()
                     .unwrap()
-                    .into_float_value();
-                let to_f = self
+                    .into_int_value();
+                let to_i = self
                     .builder
                     .build_call(get_to, &[range_ptr.into()], "range_to")?
                     .try_as_basic_value()
                     .left()
                     .unwrap()
-                    .into_float_value();
-                let step_f = self
+                    .into_int_value();
+                let step_i = self
                     .builder
                     .build_call(get_step, &[range_ptr.into()], "range_step")?
                     .try_as_basic_value()
                     .left()
                     .unwrap()
-                    .into_float_value();
+                    .into_int_value();
 
-                let f64_ty = self.context.f64_type();
+                let i64_ty = self.context.i64_type();
 
                 // Allocate loop variable in entry block
                 let entry = function.get_first_basic_block().unwrap();
@@ -1873,15 +1910,15 @@ impl<'ctx> Compiler<'ctx> {
                     None => temp_builder.position_at_end(entry),
                 }
                 let iter_alloca = temp_builder
-                    .build_alloca(f64_ty.as_basic_type_enum(), iterator.as_str())
+                    .build_alloca(i64_ty.as_basic_type_enum(), iterator.as_str())
                     .unwrap();
                 self.vars.borrow_mut().insert(iterator.clone(), iter_alloca);
                 self.var_types
                     .borrow_mut()
-                    .insert(iterator.clone(), f64_ty.as_basic_type_enum());
+                    .insert(iterator.clone(), i64_ty.as_basic_type_enum());
 
                 // Initialize iterator
-                self.builder.build_store(iter_alloca, from_f)?;
+                self.builder.build_store(iter_alloca, from_i)?;
 
                 let cond_bb = self.context.append_basic_block(function, "for.cond");
                 let body_bb = self.context.append_basic_block(function, "for.body");
@@ -1908,31 +1945,25 @@ impl<'ctx> Compiler<'ctx> {
                 self.builder.position_at_end(cond_bb);
                 let current_val = self
                     .builder
-                    .build_load(f64_ty, iter_alloca, "for_iter")?
-                    .into_float_value();
-                let zero = f64_ty.const_float(0.0);
-                let step_positive = self.builder.build_float_compare(
-                    FloatPredicate::OGT,
-                    step_f,
-                    zero,
-                    "step_pos",
-                )?;
-                let step_negative = self.builder.build_float_compare(
-                    FloatPredicate::OLT,
-                    step_f,
-                    zero,
-                    "step_neg",
-                )?;
-                let cond_pos = self.builder.build_float_compare(
-                    FloatPredicate::OLT,
+                    .build_load(i64_ty, iter_alloca, "for_iter")?
+                    .into_int_value();
+                let zero = i64_ty.const_zero();
+                let step_positive =
+                    self.builder
+                        .build_int_compare(IntPredicate::SGT, step_i, zero, "step_pos")?;
+                let step_negative =
+                    self.builder
+                        .build_int_compare(IntPredicate::SLT, step_i, zero, "step_neg")?;
+                let cond_pos = self.builder.build_int_compare(
+                    IntPredicate::SLT,
                     current_val,
-                    to_f,
+                    to_i,
                     "for_lt",
                 )?;
-                let cond_neg = self.builder.build_float_compare(
-                    FloatPredicate::OGT,
+                let cond_neg = self.builder.build_int_compare(
+                    IntPredicate::SGT,
                     current_val,
-                    to_f,
+                    to_i,
                     "for_gt",
                 )?;
 
@@ -1993,11 +2024,11 @@ impl<'ctx> Compiler<'ctx> {
                 self.builder.position_at_end(step_bb);
                 let iter_val = self
                     .builder
-                    .build_load(f64_ty, iter_alloca, "for_iter_step")?
-                    .into_float_value();
+                    .build_load(i64_ty, iter_alloca, "for_iter_step")?
+                    .into_int_value();
                 let next_val = self
                     .builder
-                    .build_float_add(iter_val, step_f, "for_iter_next")?;
+                    .build_int_add(iter_val, step_i, "for_iter_next")?;
                 self.builder.build_store(iter_alloca, next_val)?;
                 self.builder.build_unconditional_branch(cond_bb)?;
 
@@ -2149,16 +2180,34 @@ impl<'ctx> Compiler<'ctx> {
 
                         let value = self.compile_expr(new_val)?;
                         match field_type.unwrap() {
-                            Type::Num => {
+                            Type::Num | Type::Int => {
                                 let val = match value {
-                                    BasicValueEnum::FloatValue(f) => f,
-                                    BasicValueEnum::IntValue(i) => {
-                                        self.builder.build_signed_int_to_float(
-                                            i,
-                                            self.context.f64_type(),
+                                    BasicValueEnum::IntValue(i) => i.as_basic_value_enum(),
+                                    BasicValueEnum::FloatValue(f) => self
+                                        .builder
+                                        .build_float_to_signed_int(
+                                            f,
+                                            self.context.i64_type(),
                                             "prop_num_cast",
                                         )?
-                                    }
+                                        .as_basic_value_enum(),
+                                    other => panic!(
+                                        "Cannot assign non-number {other:?} to numeric field"
+                                    ),
+                                };
+                                self.builder.build_store(field_ptr, val)?;
+                            }
+                            Type::Float => {
+                                let val = match value {
+                                    BasicValueEnum::FloatValue(f) => f.as_basic_value_enum(),
+                                    BasicValueEnum::IntValue(i) => self
+                                        .builder
+                                        .build_signed_int_to_float(
+                                            i,
+                                            self.context.f64_type(),
+                                            "prop_float_cast",
+                                        )?
+                                        .as_basic_value_enum(),
                                     other => panic!(
                                         "Cannot assign non-number {other:?} to numeric field"
                                     ),
@@ -2452,7 +2501,7 @@ impl<'ctx> Compiler<'ctx> {
 
                         let value = self.compile_expr(new_val)?;
                         match inner.unwrap() {
-                            Type::Num => {
+                            Type::Num | Type::Int | Type::Float => {
                                 let val = match value {
                                     BasicValueEnum::FloatValue(f) => f,
                                     BasicValueEnum::IntValue(i) => {
@@ -2621,10 +2670,10 @@ impl<'ctx> Compiler<'ctx> {
                         )?;
                     }
                     BasicValueEnum::FloatValue(i) => {
-                        // numeric case
+                        // numeric case; compact formatting
                         let fmt = self
                             .builder
-                            .build_global_string_ptr("%f\n\0", "fmt_d")
+                            .build_global_string_ptr("%g\n\0", "fmt_d")
                             .unwrap();
                         self.builder.build_call(
                             printf_fn,
@@ -2920,7 +2969,7 @@ impl<'ctx> Compiler<'ctx> {
                 }
 
                 let match_kind = match scrutinee_type.clone() {
-                    Type::Num | Type::Str => MatchKind::NeedsCatchAll,
+                    Type::Num | Type::Int | Type::Float | Type::Str => MatchKind::NeedsCatchAll,
                     Type::Bool => MatchKind::Bool,
                     other => {
                         let variants = self.enum_variants_for_type(&other);
@@ -3903,6 +3952,99 @@ impl<'ctx> Compiler<'ctx> {
             Expr::Call(callee, args)
                 if args.len() == 1
                     && matches!(&**callee, Expr::Get(obj, method)
+                        if matches!(&**obj, Expr::Variable(n) if n == "io") && (method == "print" || method == "reprint")) =>
+            {
+                let val = self.compile_expr(&args[0])?;
+                let printf_fn = self.get_or_create_printf();
+
+                match val {
+                    BasicValueEnum::PointerValue(p) => {
+                        // string case
+                        let fmt_str = if let Expr::Get(_, method) = &**callee {
+                            if method == "reprint" { "%s" } else { "%s\n" }
+                        } else { "%s\n" };
+                        let fmt = self
+                            .builder
+                            .build_global_string_ptr(fmt_str, "fmt_s")
+                            .unwrap();
+                        self.builder.build_call(
+                            printf_fn,
+                            &[fmt.as_pointer_value().into(), p.into()],
+                            "printf_str",
+                        )?;
+                    }
+                    BasicValueEnum::FloatValue(f) => {
+                        // numeric case
+                        let fmt_str = if let Expr::Get(_, method) = &**callee {
+                            if method == "reprint" { "%g" } else { "%g\n" }
+                        } else { "%g\n" };
+                        let fmt = self
+                            .builder
+                            .build_global_string_ptr(fmt_str, "fmt_f")
+                            .unwrap();
+                        self.builder.build_call(
+                            printf_fn,
+                            &[fmt.as_pointer_value().into(), f.into()],
+                            "printf_float",
+                        )?;
+                    }
+                    BasicValueEnum::IntValue(i) => {
+                        // bool case
+                        if i.get_type().get_bit_width() == 1 {
+                            let fmt_str = if let Expr::Get(_, method) = &**callee {
+                                if method == "reprint" { "%s" } else { "%s\n" }
+                            } else { "%s\n" };
+                            let fmt = self
+                                .builder
+                                .build_global_string_ptr(fmt_str, "fmt_b")
+                                .unwrap();
+                            let true_str = self
+                                .builder
+                                .build_global_string_ptr("true", "bool_true")
+                                .unwrap();
+                            let false_str = self
+                                .builder
+                                .build_global_string_ptr("false", "bool_false")
+                                .unwrap();
+                            let bool_text = self
+                                .builder
+                                .build_select(
+                                    i,
+                                    true_str.as_pointer_value().as_basic_value_enum(),
+                                    false_str.as_pointer_value().as_basic_value_enum(),
+                                    "bool_str",
+                                )?                                .into_pointer_value();
+                            self.builder.build_call(
+                                printf_fn,
+                                &[fmt.as_pointer_value().into(), bool_text.into()],
+                                "printf_bool",
+                            )?;
+                        } else {
+                            // other int case
+                            let fmt_str = if let Expr::Get(_, method) = &**callee {
+                                if method == "reprint" { "%ld" } else { "%ld\n" }
+                            } else { "%ld\n" };
+                            let fmt = self
+                                .builder
+                                .build_global_string_ptr(fmt_str, "fmt_i")
+                                .unwrap();
+                            let i64_ty = self.context.i64_type();
+                            let widened = self.builder.build_int_s_extend(i, i64_ty, "print_int_sext")?;
+                            self.builder.build_call(
+                                printf_fn,
+                                &[fmt.as_pointer_value().into(), widened.into()],
+                                "printf_int",
+                            )?;
+                        }
+                    }
+                    other => panic!("Unsupported value passed to print: {{other:?}}"),
+                }
+                // print returns nil, which is a 0.0 float
+                return Ok(self.context.f64_type().const_float(0.0).as_basic_value_enum());
+            }
+            Expr::Call(callee, args)
+                if args.len() == 1
+                    && matches!(&**callee, Expr::Get(obj, method)
                         if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "json") =>
             {
                 let payload_ptr = self.compile_expr(&args[0])?.into_pointer_value();
@@ -3924,53 +4066,72 @@ impl<'ctx> Compiler<'ctx> {
                         &**callee,
                         Expr::Get(obj, method)
                             if method == "str"
-                                && self
-                                    .expr_type_matches(obj, |t| matches!(t.unwrap(), Type::Num))
+                                && self.expr_type_matches(obj, |t| {
+                                    matches!(t.unwrap(), Type::Num | Type::Int | Type::Float)
+                                })
                     ) =>
             {
                 let Expr::Get(obj, _) = &**callee else {
                     unreachable!("Guard ensures Expr::Get");
                 };
+                let obj_ty = self
+                    .infer_expr_type(obj)
+                    .unwrap_or_else(|e| panic!("Type error in num.str(): {e}"));
                 let compiled_val = self.compile_expr(obj)?;
-                let num_val = match compiled_val {
-                    BasicValueEnum::FloatValue(f) => f,
-                    BasicValueEnum::IntValue(iv) => self.builder.build_signed_int_to_float(
-                        iv,
-                        self.context.f64_type(),
-                        "int_to_float",
-                    )?,
-                    BasicValueEnum::PointerValue(ptr) => {
+
+                enum NumVal<'a> {
+                    Float(inkwell::values::FloatValue<'a>),
+                    Int(inkwell::values::IntValue<'a>),
+                }
+
+                // Load pointer values using the correct LLVM type for the numeric kind
+                let resolved_val = match (compiled_val, obj_ty.unwrap()) {
+                    (BasicValueEnum::FloatValue(f), _) => NumVal::Float(f),
+                    (BasicValueEnum::IntValue(iv), _) => NumVal::Int(iv),
+                    (BasicValueEnum::PointerValue(ptr), ty) => {
+                        let llvm_ty = self.qtype_to_llvm(&ty.unwrap());
                         let loaded = self
                             .builder
-                            .build_load(self.context.f64_type(), ptr, "load_num_str")?;
-                        if let BasicValueEnum::FloatValue(f) = loaded {
-                            f
-                        } else if let BasicValueEnum::IntValue(iv) = loaded {
-                            self.builder.build_signed_int_to_float(
-                                iv,
-                                self.context.f64_type(),
-                                "ptr_int_to_float",
-                            )?
-                        } else {
-                            panic!(".str() pointer did not contain a numeric value: {loaded:?}")
+                            .build_load(llvm_ty, ptr, "load_num_str")?;
+                        match loaded {
+                            BasicValueEnum::FloatValue(f) => NumVal::Float(f),
+                            BasicValueEnum::IntValue(iv) => NumVal::Int(iv),
+                            other => panic!(".str() pointer did not contain a numeric value: {other:?}"),
                         }
                     }
-                    other => panic!(".str() called on non-numeric object: {:?}", other),
+                    other => panic!(".str() called on non-numeric object: {other:?}"),
                 };
-                let fmt = self
-                    .builder
-                    .build_global_string_ptr("%f\0", "fmt_str_call")
-                    .unwrap();
+
                 let i64_ty = self.context.i64_type();
                 let size = i64_ty.const_int(128, false);
                 let align = self.target_usize_type().const_int(1, false);
                 let buf_ptr = self.arena_alloc_bytes(size, align, "malloc_buf_call")?;
                 let sprintf_fn = self.get_or_create_sprintf();
-                self.builder.build_call(
-                    sprintf_fn,
-                    &[buf_ptr.into(), fmt.as_pointer_value().into(), num_val.into()],
-                    "sprintf_num_str_call",
-                )?;
+
+                match resolved_val {
+                    NumVal::Int(iv) => {
+                        let fmt = self
+                            .builder
+                            .build_global_string_ptr("%ld\0", "fmt_str_call_int")
+                            .unwrap();
+                        self.builder.build_call(
+                            sprintf_fn,
+                            &[buf_ptr.into(), fmt.as_pointer_value().into(), iv.into()],
+                            "sprintf_num_str_call_int",
+                        )?;
+                    }
+                    NumVal::Float(fv) => {
+                        let fmt = self
+                            .builder
+                            .build_global_string_ptr("%g\0", "fmt_str_call_float")
+                            .unwrap();
+                        self.builder.build_call(
+                            sprintf_fn,
+                            &[buf_ptr.into(), fmt.as_pointer_value().into(), fv.into()],
+                            "sprintf_num_str_call_float",
+                        )?;
+                    }
+                }
                 return Ok(buf_ptr.as_basic_value_enum());
             }
 
@@ -4390,11 +4551,11 @@ impl<'ctx> Compiler<'ctx> {
                                     if let Some(Type::Custom(Custype::Object(efields))) = fields.get("error") {
                                         match method.as_str() {
                                             "text" => matches!(efields.get("text"), Some(Type::Function(params, ret))
-                                                if params == &vec![("status".into(), Type::Num), ("content".into(), Type::Str)] && **ret == Type::WebReturn),
+                                                if params == &vec![("status".into(), Type::Int), ("content".into(), Type::Str)] && **ret == Type::WebReturn),
                                             "page" => matches!(efields.get("page"), Some(Type::Function(params, ret))
-                                                if params == &vec![("status".into(), Type::Num), ("content".into(), Type::Str)] && **ret == Type::WebReturn),
+                                                if params == &vec![("status".into(), Type::Int), ("content".into(), Type::Str)] && **ret == Type::WebReturn),
                                             "file" => matches!(efields.get("file"), Some(Type::Function(params, ret))
-                                                if params == &vec![("status".into(), Type::Num), ("name".into(), Type::Str)] && **ret == Type::WebReturn),
+                                                if params == &vec![("status".into(), Type::Int), ("name".into(), Type::Str)] && **ret == Type::WebReturn),
                                             _ => false,
                                         }
                                     } else { false }
@@ -4686,41 +4847,62 @@ impl<'ctx> Compiler<'ctx> {
             }
             Expr::Get(obj, method) if method == "str" => {
                 let compiled_obj = self.compile_expr(obj)?;
-                if let BasicValueEnum::FloatValue(float_val) = compiled_obj {
-                    let sprintf_fn = self.get_or_create_sprintf();
+                let sprintf_fn = self.get_or_create_sprintf();
 
-                    // Allocate buffer for string (e.g., 64 bytes for float string representation)
-                    let buffer_size = self.context.i64_type().const_int(64, false);
-                    let buffer_ptr = self.arena_alloc_bytes(
-                        buffer_size,
-                        self.target_usize_type().const_int(1, false),
-                        "str_buf_malloc",
-                    )?;
+                // Allocate buffer for string (e.g., 64 bytes for numeric representation)
+                let buffer_size = self.context.i64_type().const_int(64, false);
+                let buffer_ptr = self.arena_alloc_bytes(
+                    buffer_size,
+                    self.target_usize_type().const_int(1, false),
+                    "str_buf_malloc",
+                )?;
 
-                    // Format string: "%f\0"
-                    let format_str = self
-                        .builder
-                        .build_global_string_ptr("%f\0", "float_fmt_str")
-                        .unwrap();
+                match compiled_obj {
+                    BasicValueEnum::FloatValue(float_val) => {
+                        let format_str = self
+                            .builder
+                            .build_global_string_ptr("%g\0", "float_fmt_str")
+                            .unwrap();
 
-                    // Call sprintf
-                    self.builder.build_call(
-                        sprintf_fn,
-                        &[
-                            buffer_ptr.into(),
-                            format_str.as_pointer_value().into(),
-                            float_val.into(),
-                        ],
-                        "sprintf_call",
-                    )?;
+                        self.builder.build_call(
+                            sprintf_fn,
+                            &[
+                                buffer_ptr.into(),
+                                format_str.as_pointer_value().into(),
+                                float_val.into(),
+                            ],
+                            "sprintf_call",
+                        )?;
+                    }
+                    BasicValueEnum::IntValue(int_val) => {
+                        let format_str = self
+                            .builder
+                            .build_global_string_ptr("%ld\0", "int_fmt_str")
+                            .unwrap();
 
-                    Ok(buffer_ptr.as_basic_value_enum())
-                } else {
-                    panic!("Unsupported .str() call on non-numeric type");
+                        self.builder.build_call(
+                            sprintf_fn,
+                            &[
+                                buffer_ptr.into(),
+                                format_str.as_pointer_value().into(),
+                                int_val.into(),
+                            ],
+                            "sprintf_call",
+                        )?;
+                    }
+                    other => panic!("Unsupported .str() call on type {other:?}"),
                 }
+
+                Ok(buffer_ptr.as_basic_value_enum())
             }
-            Expr::Literal(Value::Num(n)) => {
-                // Cast f64 to u64 for integer literal
+            Expr::Literal(Value::Int(n)) => {
+                Ok(self
+                    .context
+                    .i64_type()
+                    .const_int(*n as u64, true)
+                    .as_basic_value_enum())
+            }
+            Expr::Literal(Value::Float(n)) => {
                 Ok(self
                     .context
                     .f64_type()
@@ -4751,25 +4933,11 @@ impl<'ctx> Compiler<'ctx> {
                     return self.build_logical_binop(left, right, op);
                 }
 
-                // Compile both sides
-                let lval = match self.compile_expr(left)? {
-                    BasicValueEnum::IntValue(i) => self
-                        .builder
-                        .build_signed_int_to_float(i, self.context.f64_type(), "number_value")?
-                        .as_basic_value_enum(),
-                    o => o,
-                };
-                let rval = match self.compile_expr(right)? {
-                    BasicValueEnum::IntValue(i) => self
-                        .builder
-                        .build_signed_int_to_float(i, self.context.f64_type(), "number_value")?
-                        .as_basic_value_enum(),
-                    o => o,
-                };
+                let lraw = self.compile_expr(left)?;
+                let rraw = self.compile_expr(right)?;
 
-                match (lval, rval) {
+                match (lraw, rraw) {
                     (BasicValueEnum::FloatValue(li), BasicValueEnum::FloatValue(ri)) => {
-                        // Integer operations
                         Ok(match op {
                             BinOp::Plus => self.builder.build_float_add(li, ri, "addtmp")?.into(),
                             BinOp::Minus => self.builder.build_float_sub(li, ri, "subtmp")?.into(),
@@ -4800,6 +4968,122 @@ impl<'ctx> Compiler<'ctx> {
                                 .build_float_compare(FloatPredicate::OGE, li, ri, "getmp")?
                                 .into(),
                             _ => unreachable!("Unhandled binary operator {op:?} for floats"),
+                        })
+                    }
+                    (BasicValueEnum::FloatValue(li), BasicValueEnum::IntValue(ri)) => {
+                        let ri_f = self
+                            .builder
+                            .build_signed_int_to_float(
+                                ri,
+                                self.context.f64_type(),
+                                "rhs_to_float",
+                            )?;
+                        Ok(match op {
+                            BinOp::Plus => self.builder.build_float_add(li, ri_f, "addtmp")?.into(),
+                            BinOp::Minus => self.builder.build_float_sub(li, ri_f, "subtmp")?.into(),
+                            BinOp::Mult => self.builder.build_float_mul(li, ri_f, "multmp")?.into(),
+                            BinOp::Div => self.builder.build_float_div(li, ri_f, "divtmp")?.into(),
+                            BinOp::EqEq => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OEQ, li, ri_f, "eqtmp")?
+                                .into(),
+                            BinOp::NotEq => self
+                                .builder
+                                .build_float_compare(FloatPredicate::ONE, li, ri_f, "netmp")?
+                                .into(),
+                            BinOp::Less => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OLT, li, ri_f, "lttmp")?
+                                .into(),
+                            BinOp::LessEqual => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OLE, li, ri_f, "letmp")?
+                                .into(),
+                            BinOp::Greater => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OGT, li, ri_f, "gttmp")?
+                                .into(),
+                            BinOp::GreaterEqual => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OGE, li, ri_f, "getmp")?
+                                .into(),
+                            _ => unreachable!("Unhandled binary operator {op:?} for floats"),
+                        })
+                    }
+                    (BasicValueEnum::IntValue(li), BasicValueEnum::FloatValue(ri)) => {
+                        let li_f = self
+                            .builder
+                            .build_signed_int_to_float(
+                                li,
+                                self.context.f64_type(),
+                                "lhs_to_float",
+                            )?;
+                        Ok(match op {
+                            BinOp::Plus => self.builder.build_float_add(li_f, ri, "addtmp")?.into(),
+                            BinOp::Minus => self.builder.build_float_sub(li_f, ri, "subtmp")?.into(),
+                            BinOp::Mult => self.builder.build_float_mul(li_f, ri, "multmp")?.into(),
+                            BinOp::Div => self.builder.build_float_div(li_f, ri, "divtmp")?.into(),
+                            BinOp::EqEq => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OEQ, li_f, ri, "eqtmp")?
+                                .into(),
+                            BinOp::NotEq => self
+                                .builder
+                                .build_float_compare(FloatPredicate::ONE, li_f, ri, "netmp")?
+                                .into(),
+                            BinOp::Less => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OLT, li_f, ri, "lttmp")?
+                                .into(),
+                            BinOp::LessEqual => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OLE, li_f, ri, "letmp")?
+                                .into(),
+                            BinOp::Greater => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OGT, li_f, ri, "gttmp")?
+                                .into(),
+                            BinOp::GreaterEqual => self
+                                .builder
+                                .build_float_compare(FloatPredicate::OGE, li_f, ri, "getmp")?
+                                .into(),
+                            _ => unreachable!("Unhandled binary operator {op:?} for floats"),
+                        })
+                    }
+                    (BasicValueEnum::IntValue(li), BasicValueEnum::IntValue(ri)) => {
+                        Ok(match op {
+                            BinOp::Plus => self.builder.build_int_add(li, ri, "addtmp")?.into(),
+                            BinOp::Minus => self.builder.build_int_sub(li, ri, "subtmp")?.into(),
+                            BinOp::Mult => self.builder.build_int_mul(li, ri, "multmp")?.into(),
+                            BinOp::Div => self
+                                .builder
+                                .build_int_signed_div(li, ri, "divtmp")?
+                                .into(),
+                            BinOp::EqEq => self
+                                .builder
+                                .build_int_compare(IntPredicate::EQ, li, ri, "eqtmp")?
+                                .into(),
+                            BinOp::NotEq => self
+                                .builder
+                                .build_int_compare(IntPredicate::NE, li, ri, "netmp")?
+                                .into(),
+                            BinOp::Less => self
+                                .builder
+                                .build_int_compare(IntPredicate::SLT, li, ri, "lttmp")?
+                                .into(),
+                            BinOp::LessEqual => self
+                                .builder
+                                .build_int_compare(IntPredicate::SLE, li, ri, "letmp")?
+                                .into(),
+                            BinOp::Greater => self
+                                .builder
+                                .build_int_compare(IntPredicate::SGT, li, ri, "gttmp")?
+                                .into(),
+                            BinOp::GreaterEqual => self
+                                .builder
+                                .build_int_compare(IntPredicate::SGE, li, ri, "getmp")?
+                                .into(),
+                            _ => unreachable!("Unhandled binary operator {op:?} for ints"),
                         })
                     }
                     (BasicValueEnum::PointerValue(lp), BasicValueEnum::PointerValue(rp)) => {
@@ -4902,7 +5186,7 @@ impl<'ctx> Compiler<'ctx> {
                             }
                         }
                     }
-                    _ => panic!("Type mismatch in binary expression: {lval} vs {rval}",),
+                    _ => panic!("Type mismatch in binary expression"),
                 }
             }
 
@@ -5131,7 +5415,8 @@ impl<'ctx> Compiler<'ctx> {
                         .context
                         .ptr_type(AddressSpace::default())
                         .as_basic_type_enum(),
-                    Type::Num => self.context.f64_type().as_basic_type_enum(),
+                    Type::Num | Type::Int => self.context.i64_type().as_basic_type_enum(),
+                    Type::Float => self.context.f64_type().as_basic_type_enum(),
                     Type::Bool => self.context.bool_type().as_basic_type_enum(),
                     other => panic!("Unsupported field type {other:?}"),
                 };
@@ -5236,7 +5521,7 @@ impl<'ctx> Compiler<'ctx> {
                             .builder
                             .build_call(
                                 unwrap_func,
-                                &[receiver_ptr.into(), self.compile_expr(&Expr::Literal(Value::Num(self.pctx.borrow().current_line().unwrap_or(67) as f64)))?.into()],
+                                &[receiver_ptr.into(), self.compile_expr(&Expr::Literal(Value::Float(self.pctx.borrow().current_line().unwrap_or(67) as f64)))?.into()],
                                 "unwrap_call",
                             )?
                             .try_as_basic_value()
@@ -5263,14 +5548,14 @@ impl<'ctx> Compiler<'ctx> {
                         };
 
                         let raw_arg = self.compile_expr(&args[0])?;
-                        let f64_ty = self.context.f64_type();
-                        let arg_f64 = match raw_arg {
-                            BasicValueEnum::FloatValue(f) => f,
-                            BasicValueEnum::IntValue(i) => self
+                        let i64_ty = self.context.i64_type();
+                        let arg_i64 = match raw_arg {
+                            BasicValueEnum::IntValue(i) => i,
+                            BasicValueEnum::FloatValue(f) => self
                                 .builder
-                                .build_signed_int_to_float(
-                                    i,
-                                    f64_ty,
+                                .build_float_to_signed_int(
+                                    f,
+                                    i64_ty,
                                     "range_arg_cast",
                                 )?,
                             other => panic!(
@@ -5287,7 +5572,7 @@ impl<'ctx> Compiler<'ctx> {
 
                         let call = self.builder.build_call(
                             setter,
-                            &[builder_ptr.into(), arg_f64.into()],
+                            &[builder_ptr.into(), arg_i64.into()],
                             "range_builder_set",
                         )?;
 
@@ -5324,10 +5609,10 @@ impl<'ctx> Compiler<'ctx> {
                                 }
                             }
                             BasicValueEnum::FloatValue(fv) => {
-                                // Allocate buffer and sprintf "%f"
+                                // Allocate buffer and sprintf with compact float format
                                 let fmt = self
                                     .builder
-                                    .build_global_string_ptr("%f\0", "fmt_insert_f")
+                                    .build_global_string_ptr("%g\0", "fmt_insert_f")
                                     .unwrap();
                                 let size = self.context.i64_type().const_int(64, false);
                                 let buf = self.arena_alloc_bytes(
@@ -5506,7 +5791,9 @@ impl<'ctx> Compiler<'ctx> {
                     // Method call `.str()` on numeric values
                     Expr::Get(obj, method)
                         if method == "str"
-                            && self.expr_type_matches(obj, |t| matches!(t.unwrap(), Type::Num)) =>
+                            && self.expr_type_matches(obj, |t| {
+                                matches!(t.unwrap(), Type::Num | Type::Int | Type::Float)
+                            }) =>
                     {
                         // Ensure the object compiles to an integer before converting
                         let compiled_val = self.compile_expr(obj)?;
@@ -5524,7 +5811,7 @@ impl<'ctx> Compiler<'ctx> {
                         // Prepare a "%ld" format string
                         let fmt = self
                             .builder
-                            .build_global_string_ptr("%f\0", "fmt_str")
+                            .build_global_string_ptr("%g\0", "fmt_str")
                             .unwrap();
                         // Allocate a 32-byte buffer
                         let size = self.context.i64_type().const_int(128, false);
@@ -5581,9 +5868,14 @@ impl<'ctx> Compiler<'ctx> {
                                 }
                                 Type::List(_) => {
                                     // For lists, load length from the first element
-                                    let i64_ty = self.context.f64_type();
-                                    let len = self.builder.build_load(i64_ty, ptr, "len")?;
-                                    Ok(len.as_basic_value_enum())
+                                    let f64_ty = self.context.f64_type();
+                                    let len_f = self.builder.build_load(f64_ty, ptr, "len")?;
+                                    let len_i = self.builder.build_float_to_signed_int(
+                                        len_f.into_float_value(),
+                                        self.context.i64_type(),
+                                        "list_len_to_int",
+                                    )?;
+                                    Ok(len_i.as_basic_value_enum())
                                 }
                                 _ => panic!("Unsupported type for .len() call: {:?}", obj_type),
                             }
@@ -6065,7 +6357,7 @@ impl<'ctx> Compiler<'ctx> {
                         // Compile the pushed value and convert it to the appropriate storage representation
                         let val = self.compile_expr(&args[0])?;
                         let value_to_store = match inner_ty {
-                            Type::Num => match val {
+                            Type::Num | Type::Int | Type::Float => match val {
                                 BasicValueEnum::FloatValue(f) => f.as_basic_value_enum(),
                                 BasicValueEnum::IntValue(iv) => self
                                     .builder
@@ -6760,12 +7052,24 @@ impl<'ctx> Compiler<'ctx> {
                         };
 
                         match *inner {
-                            Type::Num => {
+                            Type::Num | Type::Float => {
                                 let loaded = self
                                     .builder
                                     .build_load(self.context.f64_type(), elem_ptr, "load_num_elem")
                                     .unwrap();
                                 Ok(loaded)
+                            }
+                            Type::Int => {
+                                let loaded = self
+                                    .builder
+                                    .build_load(self.context.f64_type(), elem_ptr, "load_num_elem")?
+                                    .into_float_value();
+                                let casted = self.builder.build_float_to_signed_int(
+                                    loaded,
+                                    self.context.i64_type(),
+                                    "list_elem_to_int",
+                                )?;
+                                Ok(casted.as_basic_value_enum())
                             }
                             Type::Str => {
                                 let ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -6910,7 +7214,21 @@ impl<'ctx> Compiler<'ctx> {
                     }
                     Unary::Neg => {
                         let val = self.compile_expr(ex)?;
-                        Ok(self.builder.build_float_neg(val.into_float_value(), "negative")?.as_basic_value_enum())
+                        match val {
+                            BasicValueEnum::FloatValue(fv) => Ok(
+                                self.builder
+                                    .build_float_neg(fv, "negative")?
+                                    .as_basic_value_enum(),
+                            ),
+                            BasicValueEnum::IntValue(iv) => Ok(
+                                self.builder
+                                    .build_int_neg(iv, "negative_int")?
+                                    .as_basic_value_enum(),
+                            ),
+                            other => {
+                                panic!("Unary negation not supported for {other:?}")
+                            }
+                        }
                     }
                 }
             }
@@ -7125,7 +7443,7 @@ impl<'ctx> Compiler<'ctx> {
                         self.context.ptr_type(AddressSpace::default()),
                     )
                     .into(),
-                    self.context.f64_type().into(),
+                    self.context.i64_type().into(),
                 ],
                 false,
             )
@@ -7141,7 +7459,7 @@ impl<'ctx> Compiler<'ctx> {
                         self.context.ptr_type(AddressSpace::default()),
                     )
                     .into(),
-                    self.context.f64_type().into(),
+                    self.context.i64_type().into(),
                 ],
                 false,
             )
@@ -7157,7 +7475,7 @@ impl<'ctx> Compiler<'ctx> {
                         self.context.ptr_type(AddressSpace::default()),
                     )
                     .into(),
-                    self.context.f64_type().into(),
+                    self.context.i64_type().into(),
                 ],
                 false,
             )
@@ -7167,21 +7485,21 @@ impl<'ctx> Compiler<'ctx> {
     fn get_or_create_range_builder_get_from(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("range_builder_get_from", || {
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            self.context.f64_type().fn_type(&[ptr_ty.into()], false)
+            self.context.i64_type().fn_type(&[ptr_ty.into()], false)
         })
     }
 
     fn get_or_create_range_builder_get_to(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("range_builder_get_to", || {
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            self.context.f64_type().fn_type(&[ptr_ty.into()], false)
+            self.context.i64_type().fn_type(&[ptr_ty.into()], false)
         })
     }
 
     fn get_or_create_range_builder_get_step(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("range_builder_get_step", || {
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            self.context.f64_type().fn_type(&[ptr_ty.into()], false)
+            self.context.i64_type().fn_type(&[ptr_ty.into()], false)
         })
     }
 
