@@ -74,6 +74,14 @@ jobs:
           path: deps/install
           key: llvm-zstd-${{ runner.os }}-${{ matrix.arch }}-${{ env.LLVM_TAG }}
 
+      - name: Cache LLVM build (Windows)
+        if: runner.os == 'Windows'
+        id: cache-llvm-win
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/llvm
+          key: llvm-win-${{ matrix.arch }}-${{ env.LLVM_TAG }}
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -137,22 +145,36 @@ jobs:
           echo "${DEPS_PREFIX}/bin" >> "$GITHUB_PATH"
 
       - name: Install LLVM (Windows)
-        if: matrix.os_id == 'windows'
+        if: matrix.os_id == 'windows' && steps.cache-llvm-win.outputs.cache-hit != 'true'
         shell: pwsh
         env:
-          LLVM_PREFIX: "C:/Program Files/LLVM"
+          LLVM_TAG: ${{ env.LLVM_TAG }}
         run: |
           $ErrorActionPreference = 'Stop'
-          choco install llvm -y --no-progress
-          if (-not (Test-Path "$env:LLVM_PREFIX")) {
-            Write-Error "LLVM not found at $env:LLVM_PREFIX after install"
+          $version = $env:LLVM_TAG.TrimStart('llvmorg-')
+          $installer = "https://github.com/llvm/llvm-project/releases/download/$($env:LLVM_TAG)/LLVM-$version-win64.exe"
+          $dest = Join-Path $env:GITHUB_WORKSPACE "llvm"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "llvm-installer.exe"
+          Invoke-WebRequest -Uri $installer -OutFile $exePath
+          Start-Process -FilePath $exePath -ArgumentList "/S","/D=$dest" -Wait
+          if (-not (Test-Path (Join-Path $dest "bin/llvm-config.exe"))) {
+            Write-Error "llvm-config not found after install"
           }
+          Remove-Item $exePath -Force
+
+      - name: Add LLVM to PATH (Windows)
+        if: matrix.os_id == 'windows'
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:GITHUB_WORKSPACE "llvm"
+          echo "$dest\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Ensure libxml2 import lib (Windows)
         if: matrix.os_id == 'windows'
         shell: pwsh
         env:
-          LLVM_PREFIX: ${{ github.workspace }}/llvm/install
+          LLVM_PREFIX: ${{ github.workspace }}/llvm
         run: |
           $libDir = Join-Path $env:LLVM_PREFIX "lib"
           $xml = Join-Path $libDir "libxml2.lib"
@@ -214,8 +236,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          LLVM_PREFIX: "C:/Program Files/LLVM"
-          LLVM_SYS_181_PREFIX: "C:/Program Files/LLVM"
+          LLVM_PREFIX: ${{ github.workspace }}/llvm
+          LLVM_SYS_181_PREFIX: ${{ github.workspace }}/llvm
           LLVM_NO_LIBXML2: "1"
           RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target

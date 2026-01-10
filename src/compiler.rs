@@ -1356,10 +1356,10 @@ impl<'ctx> Compiler<'ctx> {
 
         // Ensure the arena global mirrors host storage for runtime helpers.
         let arena_slot = std::ptr::addr_of_mut!(GLOBAL_ARENA_PTR);
-        unsafe {
-            self.execution_engine
-                .add_global_mapping(&self.current_arena, arena_slot as usize);
-        }
+
+        self.execution_engine
+            .add_global_mapping(&self.current_arena, arena_slot as usize);
+
         // Compile module functions into the LLVM module first (no execution).
         {
             let modules: Vec<(String, ModuleInfo)> = self
@@ -2370,8 +2370,6 @@ impl<'ctx> Compiler<'ctx> {
                         self.builder
                             .build_conditional_branch(needs_resize, grow_bb, cont_bb)?;
 
-                        let mut new_raw_opt: Option<PointerValue<'ctx>> = None;
-
                         // Grow path: allocate new buffer and copy existing contents
                         self.builder.position_at_end(grow_bb);
                         let slot_bytes = i64_ty.const_int(std::mem::size_of::<f64>() as u64, false);
@@ -2423,7 +2421,7 @@ impl<'ctx> Compiler<'ctx> {
                         // Copy block
                         self.builder.position_at_end(copy_bb);
                         let memcpy_fn = self.get_or_create_memcpy();
-                        let i8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+                        let i8_ptr = self.context.ptr_type(AddressSpace::default());
                         let dst =
                             self.builder
                                 .build_pointer_cast(new_raw, i8_ptr, "list_assign_dst")?;
@@ -2473,7 +2471,7 @@ impl<'ctx> Compiler<'ctx> {
                                 .build_store(slot_ptr_cast, new_buf_ptr.as_basic_value_enum());
                         }
 
-                        new_raw_opt = Some(new_buf_ptr);
+                        let new_raw_opt = Some(new_buf_ptr);
                         self.builder.build_unconditional_branch(cont_bb)?;
                         let grow_end = self.builder.get_insert_block().unwrap();
 
@@ -4037,7 +4035,7 @@ impl<'ctx> Compiler<'ctx> {
                             )?;
                         }
                     }
-                    other => panic!("Unsupported value passed to print: {{other:?}}"),
+                    other => panic!("Unsupported value passed to print: {{{other:?}}}"),
                 }
                 // print returns nil, which is a 0.0 float
                 return Ok(self.context.f64_type().const_float(0.0).as_basic_value_enum());
@@ -6301,7 +6299,7 @@ impl<'ctx> Compiler<'ctx> {
 
                         // Copy current contents into the new buffer
                         let memcpy_fn = self.get_or_create_memcpy();
-                        let i8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+                        let i8_ptr = self.context.ptr_type(AddressSpace::default());
                         let dst = self
                             .builder
                             .build_pointer_cast(new_raw, i8_ptr, "list_push_dst")?;

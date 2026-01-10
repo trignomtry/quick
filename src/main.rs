@@ -102,7 +102,7 @@ struct KvMap {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct QsResult {
+pub struct QsResult {
     is_ok: bool,
     ok: *mut c_void,
     err: *mut c_void,
