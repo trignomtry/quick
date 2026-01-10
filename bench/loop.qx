@@ -1,0 +1,10 @@
+
+let total = 0;
+let start = 0;
+let end = 10000000;
+
+for i in io.range().from(start).to(end) {
+    total = total + i;
+}
+
+io.print("QuickScript Loop Total: " + total.str());

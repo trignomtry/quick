@@ -1,0 +1,14 @@
+
+fun fib(n: Num) {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 2) + fib(n - 1);
+}
+
+let total = 0;
+for i in io.range().from(0).to(20) {
+    total = total + fib(i);
+}
+
+io.print("QuickScript Long Test Total: " + total.str());

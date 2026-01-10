@@ -1,0 +1,13 @@
+
+
+fun fib(n: Num) {
+    if n <= 1 {
+        return n;
+    }
+    let first: Num = fib(n - 2);
+    let second: Num = fib(n - 1);
+    return first + second;
+}
+
+let n = 38;
+io.print("QuickScript Fib(" + n.str() + "): " + fib(n).str());
