@@ -165,7 +165,7 @@ jobs:
           $llvmConfig = Join-Path $dest "bin/llvm-config.exe"
           if (-not (Test-Path $llvmConfig)) {
             Write-Host "llvm-config not found in bundled installer, falling back to choco"
-            choco install llvm --version $version -y --no-progress
+            choco install llvm --version $version -y --no-progress --allow-downgrade
             $dest = "C:/Program Files/LLVM"
             $llvmConfig = Join-Path $dest "bin/llvm-config.exe"
             if (-not (Test-Path $llvmConfig)) {
