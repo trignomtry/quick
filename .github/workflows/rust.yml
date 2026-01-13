@@ -172,6 +172,27 @@ jobs:
             Write-Error "LLVM bin directory not found at $binDir"
           }
 
+          $cmakeConfig = Join-Path $dest "lib/cmake/llvm/LLVMConfig.cmake"
+          if (-not (Test-Path $cmakeConfig)) {
+            Write-Warning "LLVMConfig.cmake not found in installer; building LLVM from source with MSVC"
+            $srcDir = Join-Path $env:GITHUB_WORKSPACE "llvm-project"
+            $buildDir = Join-Path $env:GITHUB_WORKSPACE "llvm-build"
+            if (Test-Path $srcDir) { Remove-Item $srcDir -Recurse -Force }
+            if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
+            git clone --depth 1 --branch $env:LLVM_TAG https://github.com/llvm/llvm-project.git $srcDir
+            cmake -G "Visual Studio 17 2022" -A x64 -S "$srcDir/llvm" -B $buildDir `
+              -DLLVM_TARGETS_TO_BUILD="X86" `
+              -DLLVM_ENABLE_PROJECTS="clang;lld" `
+              -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_LINK_LLVM_DYLIB=OFF `
+              -DBUILD_SHARED_LIBS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF `
+              -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF `
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$dest
+            cmake --build $buildDir --config Release --target install
+            if (-not (Test-Path $cmakeConfig)) {
+              Write-Error "LLVMConfig.cmake not found after source build"
+            }
+          }
+
           "LLVM_PREFIX=$dest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "LLVM_SYS_181_PREFIX=$dest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
