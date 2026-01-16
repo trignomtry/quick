@@ -3757,11 +3757,7 @@ impl<'ctx> Compiler<'ctx> {
                 if (args.len() == 2)
                     && matches!(&**callee, Expr::Get(obj, method) if matches!(&**obj, Expr::Variable(n) if n == "io") && method == "listen") =>
             {
-                let port_f = self.compile_expr(&args[0])?.into_float_value();
-                let i32t = self.context.i32_type();
-                let port_i = self
-                    .builder
-                    .build_float_to_signed_int(port_f, i32t, "port_i")?;
+                let port_i = self.compile_expr(&args[0])?.into_int_value();
 
                 // New two-argument version with callback
                 let callback_ptr = match &args[1] {
@@ -4563,11 +4559,7 @@ impl<'ctx> Compiler<'ctx> {
                     }) =>
             {
                 if let Expr::Get(_obj, method) = &**callee {
-                    let status_f = self.compile_expr(&args[0])?.into_float_value();
-                    let i32t = self.context.i32_type();
-                    let status_i = self
-                        .builder
-                        .build_float_to_signed_int(status_f, i32t, "status_i")?;
+                    let status_i = self.compile_expr(&args[0])?.into_int_value();
                     let content_ptr = self.compile_expr(&args[1])?.into_pointer_value();
                     let web_error_fn = match method.as_str() {
                         "text" => Some(self.get_or_create_web_error_text()),
@@ -7359,11 +7351,11 @@ impl<'ctx> Compiler<'ctx> {
 
     fn get_or_create_qs_listen_with_callback(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("qs_listen_with_callback", || {
-            let i32t = self.context.i32_type();
+            let i64t = self.context.i64_type();
             let void_ptr = self.context.ptr_type(AddressSpace::default());
             self.context
                 .void_type()
-                .fn_type(&[i32t.into(), void_ptr.into()], false)
+                .fn_type(&[i64t.into(), void_ptr.into()], false)
         })
     }
 
@@ -7673,17 +7665,17 @@ impl<'ctx> Compiler<'ctx> {
 
     fn get_or_create_web_error_text(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("web_error_text", || {
-            let i32t = self.context.i32_type();
+            let i64t = self.context.i64_type();
             let i8ptr = self.context.ptr_type(AddressSpace::default());
-            i8ptr.fn_type(&[i32t.into(), i8ptr.into()], false)
+            i8ptr.fn_type(&[i64t.into(), i8ptr.into()], false)
         })
     }
 
     fn get_or_create_web_error_page(&self) -> FunctionValue<'ctx> {
         self.get_or_add_function("web_error_page", || {
-            let i32t = self.context.i32_type();
+            let i64t = self.context.i64_type();
             let i8ptr = self.context.ptr_type(AddressSpace::default());
-            i8ptr.fn_type(&[i32t.into(), i8ptr.into()], false)
+            i8ptr.fn_type(&[i64t.into(), i8ptr.into()], false)
         })
     }
 

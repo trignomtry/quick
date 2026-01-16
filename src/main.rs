@@ -2051,7 +2051,7 @@ pub unsafe extern "C" fn web_page(content: *const c_char) -> *mut ResponseObject
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_error_text(
-    status_code: i32,
+    status_code: i64,
     content: *const c_char,
 ) -> *mut ResponseObject {
     let content_bytes = if content.is_null() {
@@ -2063,7 +2063,7 @@ pub unsafe extern "C" fn web_error_text(
     let (body_ptr, body_len) = leak_bytes_as_body(content_bytes);
 
     let response = Box::new(ResponseObject {
-        status_code,
+        status_code: status_code as i32,
         content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
         body: body_ptr,
         body_len,
@@ -2075,7 +2075,7 @@ pub unsafe extern "C" fn web_error_text(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_error_page(
-    status_code: i32,
+    status_code: i64,
     content: *const c_char,
 ) -> *mut ResponseObject {
     let content_bytes = if content.is_null() {
@@ -2087,7 +2087,7 @@ pub unsafe extern "C" fn web_error_page(
     let (body_ptr, body_len) = leak_bytes_as_body(content_bytes);
 
     let response = Box::new(ResponseObject {
-        status_code,
+        status_code: status_code as i32,
         content_type: arena_alloc_cstring(b"text/html; charset=utf-8"),
         body: body_ptr,
         body_len,
@@ -2445,7 +2445,7 @@ pub unsafe extern "C" fn get_response_headers(response: *const ResponseObject) -
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qs_listen_with_callback(port: i32, callback: *const c_void) {
+pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_void) {
     let addr = format!("0.0.0.0:{port}");
     let callback_addr = callback as usize;
 

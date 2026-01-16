@@ -1,0 +1,9 @@
+let web = io.web()
+
+io.listen(8087, fun(req: Request) {
+    match req.path {
+        "/hi"       => return web.text("Hello!"),
+        "/api/data" => return web.json("{\"message\":\"Hello!\"}"),
+        _           => return web.error.text(404, "Not found"),
+    }
+})
