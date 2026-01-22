@@ -60,6 +60,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={LLVM_PREFIX_ENV}");
     println!("cargo:rerun-if-env-changed={LLVM_CONFIG_ENV}");
     println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=QUICK_RUNTIME_LIB");
 
     let llvm_config = locate_llvm_config().unwrap_or_else(|| {
         panic!(
@@ -103,6 +104,40 @@ fn main() {
     emit_additional_search_paths();
     emit_forced_library_search_paths();
     emit_cxx_runtime();
+
+    prepare_embedded_runtime();
+}
+
+fn prepare_embedded_runtime() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
+    let dest = out_dir.join("libquick_runtime.a");
+
+    // Prefer an explicit override; otherwise use a staged runtime build if available.
+    let source = env::var_os("QUICK_RUNTIME_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let staged = PathBuf::from("target/runtime/release/libquick_runtime.a");
+            staged.exists().then_some(staged)
+        })
+        .or_else(|| {
+            let staged = PathBuf::from("target/release/libquick_runtime.a");
+            staged.exists().then_some(staged)
+        });
+
+    let Some(src) = source else {
+        panic!(
+            "Missing runtime archive; build it with `cargo build --release --lib --features runtime-lib --target-dir target/runtime` or set QUICK_RUNTIME_LIB to a valid staticlib."
+        );
+    };
+
+    if let Err(err) = std::fs::copy(&src, &dest) {
+        panic!(
+            "Failed to stage runtime archive from {}: {err}",
+            src.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", src.display());
 }
 
 fn locate_llvm_config() -> Option<PathBuf> {

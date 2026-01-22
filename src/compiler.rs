@@ -2667,7 +2667,7 @@ impl<'ctx> Compiler<'ctx> {
                             "printf_str",
                         )?;
                     }
-                    BasicValueEnum::FloatValue(i) => {
+                    BasicValueEnum::FloatValue(f) => {
                         // numeric case; compact formatting
                         let fmt = self
                             .builder
@@ -2675,8 +2675,8 @@ impl<'ctx> Compiler<'ctx> {
                             .unwrap();
                         self.builder.build_call(
                             printf_fn,
-                            &[fmt.as_pointer_value().into(), i.into()],
-                            "printf_int",
+                            &[fmt.as_pointer_value().into(), f.into()],
+                            "printf_float",
                         )?;
                     }
                     BasicValueEnum::IntValue(i) => {
@@ -2951,8 +2951,8 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(())
             }
             Instruction::Use {
-                module_name: _,
-                mod_path: _,
+                _module_name: _,
+                _mod_path: _,
             } => Ok(()),
             Instruction::Match { expr, arms } => {
                 let scrutinee_type = self.infer_expr_type(expr).unwrap();
@@ -2960,10 +2960,7 @@ impl<'ctx> Compiler<'ctx> {
                 enum MatchKind {
                     NeedsCatchAll,
                     Bool,
-                    Enum {
-                        enum_type: Type,
-                        variants: Vec<String>,
-                    },
+                    Enum { variants: Vec<String> },
                 }
 
                 let match_kind = match scrutinee_type.clone() {
@@ -2972,7 +2969,6 @@ impl<'ctx> Compiler<'ctx> {
                     other => {
                         let variants = self.enum_variants_for_type(&other);
                         MatchKind::Enum {
-                            enum_type: other.clone(),
                             variants: variants
                                 .iter()
                                 .map(|variant| variant.name.clone())
@@ -3430,7 +3426,6 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(())
             }
             Instruction::Nothing => Ok(()),
-            l => unimplemented!("{:#?}", l),
         }
     }
 
@@ -3594,15 +3589,6 @@ impl<'ctx> Compiler<'ctx> {
         })
     }
 
-    fn get_or_create_free(&self) -> FunctionValue<'ctx> {
-        // Correct C signature: void free(void*)
-        self.get_or_add_function("free", || {
-            let void_ty = self.context.void_type();
-            let void_ptr = self.context.ptr_type(AddressSpace::default());
-            void_ty.fn_type(&[void_ptr.into()], false)
-        })
-    }
-
     fn expect_bool_value(&self, value: BasicValueEnum<'ctx>, context: &str) -> IntValue<'ctx> {
         if let BasicValueEnum::IntValue(int_val) = value {
             if int_val.get_type() == self.context.bool_type() {
@@ -3696,11 +3682,21 @@ impl<'ctx> Compiler<'ctx> {
                 let compiled = self.compile_expr(value)?;
                 self.lower_result_variant(expr, compiled, false)
             }
-            Expr::Variable( var_name) => {
-                let ptr = *self.vars.borrow().get(var_name).unwrap_or_else(||panic!("{var_name}"));
-                let ty = *self.var_types.borrow().get(var_name).unwrap();
-                let loaded = self.builder.build_load(ty, ptr, var_name)?;
-                 Ok(loaded)
+            Expr::Variable(var_name) => {
+                let ptr = *self
+                    .vars
+                    .borrow()
+                    .get(var_name)
+                    .unwrap_or_else(|| panic!("{var_name}"));
+                let ty = self
+                    .quick_var_types
+                    .borrow()
+                    .get(var_name)
+                    .unwrap()
+                    .clone();
+                let llvm_ty = self.qtype_to_llvm(&ty);
+                let loaded = self.builder.build_load(llvm_ty, ptr, var_name)?;
+                Ok(loaded)
             }
 
             // Handle io.random() as a call: io.ran"dom() → random integer < 1
@@ -4907,17 +4903,7 @@ impl<'ctx> Compiler<'ctx> {
                     .const_int(val, false)
                     .as_basic_value_enum())
             }
-            Expr::Literal(Value::Nil) => {
-                // Represent nil as the C-string "nil"
-                let _gs = self
-                    .builder
-                    .build_global_string_ptr("nil\0", "nil_literal")
-                    .unwrap();
-                //Ok(gs.as_pointer_value().as_basic_value_enum());
-                Ok(BasicValueEnum::PointerValue(
-                    self.context.ptr_type(AddressSpace::default()).const_null(),
-                ))
-            }
+
             Expr::Binary(left, op, right) => {
                 if matches!(op, BinOp::And | BinOp::Or) {
                     return self.build_logical_binop(left, right, op);
@@ -7222,8 +7208,26 @@ impl<'ctx> Compiler<'ctx> {
                     }
                 }
             }
+            Expr::Block(instrs) => {
+                let old_vars = self.vars.borrow().clone();
+                let mut last_expr_val = None;
 
-            _ => panic!("Unsupported expression in compile_expr: {expr:?}"),
+                if let Some((last_instr, body_instrs)) = instrs.split_last() {
+                    for instr in body_instrs {
+                        self.compile_instruction(self.builder.get_insert_block().unwrap().get_parent().unwrap(), instr)?;
+                    }
+
+                    if let Instruction::Expr(expr, _) = last_instr {
+                        last_expr_val = Some(self.compile_expr(expr)?);
+                    } else {
+                        self.compile_instruction(self.builder.get_insert_block().unwrap().get_parent().unwrap(), last_instr)?;
+                    }
+                }
+
+                *self.vars.borrow_mut() = old_vars;
+                Ok(last_expr_val.unwrap_or_else(|| self.context.f64_type().const_float(0.0).as_basic_value_enum()))
+            }
+
         }
     }
     fn get_or_create_strcmp(&self) -> FunctionValue<'ctx> {
@@ -7684,20 +7688,6 @@ impl<'ctx> Compiler<'ctx> {
             let i8ptr = self.context.ptr_type(AddressSpace::default());
             let bool_type = self.context.bool_type();
             i8ptr.fn_type(&[i8ptr.into(), bool_type.into()], false)
-        })
-    }
-
-    fn get_or_create_get_current_method(&self) -> FunctionValue<'ctx> {
-        self.get_or_add_function("get_current_method", || {
-            let i8ptr = self.context.ptr_type(AddressSpace::default());
-            i8ptr.fn_type(&[], false)
-        })
-    }
-
-    fn get_or_create_get_current_path(&self) -> FunctionValue<'ctx> {
-        self.get_or_add_function("get_current_path", || {
-            let i8ptr = self.context.ptr_type(AddressSpace::default());
-            i8ptr.fn_type(&[], false)
         })
     }
 

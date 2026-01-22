@@ -185,6 +185,9 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Instruction, String> {
         while self.match_kind(TokenKind::Semicolon) {}
+        if self.check(&TokenKind::RBrace) {
+            return Ok(Instruction::Nothing);
+        }
         // Optional debug hook to trace unexpected brace parsing issues
         if std::env::var("QS_DEBUG_BRACE").is_ok() && self.check(&TokenKind::RBrace) {
             let prev = if self.current > 0 {
@@ -369,7 +372,6 @@ impl Parser {
                                 | Expr::Literal(Value::Float(_))
                                 | Expr::Literal(Value::Str(_))
                                 | Expr::Literal(Value::Bool(_))
-                                | Expr::Literal(Value::Nil)
                         );
                         if !is_literal {
                             // Skip non-literal variables; they would require execution to evaluate
@@ -414,8 +416,8 @@ impl Parser {
             );
 
             Ok(Instruction::Use {
-                module_name: modname,
-                mod_path: modfile,
+                _module_name: modname,
+                _mod_path: modfile,
             })
         } else if self.match_kind(TokenKind::LBrace) {
             let was = self.is_global;
@@ -1212,7 +1214,7 @@ impl Parser {
                     }
                 }
             }
-            self.match_kind(TokenKind::Semicolon);
+
             Ok(Instruction::Expr(expr, expr_type))
         }
     }

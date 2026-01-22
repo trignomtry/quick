@@ -1,47 +1,73 @@
+#[cfg(not(feature = "runtime-lib"))]
 mod compiler;
+#[cfg(not(feature = "runtime-lib"))]
 mod parser;
+#[cfg(not(feature = "runtime-lib"))]
 use crate::TokenKind::*;
+#[cfg(not(feature = "runtime-lib"))]
 use crate::compiler::CodegenMode;
+#[cfg(not(feature = "runtime-lib"))]
 use clap::Parser as Clap;
+#[cfg(not(feature = "runtime-lib"))]
 use parser::Parser;
 
-use crate::compiler::Compiler;
-use inkwell::AddressSpace;
 #[cfg(not(feature = "runtime-lib"))]
-static LIBQUICK: &'static [u8] = include_bytes!("../target/runtime/release/libquick_runtime.a");
+use crate::compiler::Compiler;
+#[cfg(not(feature = "runtime-lib"))]
+use inkwell::AddressSpace;
+
+#[cfg(not(feature = "runtime-lib"))]
+static LIBQUICK: &'static [u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/libquick_runtime.a"
+));
 unsafe extern "C" {
+    #[cfg(not(feature = "runtime-lib"))]
     fn strcmp(a: *const i8, b: *const i8) -> i32;
-    fn strncmp(a: *const i8, b: *const i8, c: i32) -> i32;
     fn printf(fmt: *const i8, ...) -> i32;
+    #[cfg(not(feature = "runtime-lib"))]
     fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8;
+    #[cfg(not(feature = "runtime-lib"))]
     fn sprintf(buf: *mut i8, fmt: *const i8, ...) -> i32;
+    #[cfg(not(feature = "runtime-lib"))]
     fn strcat(dest: *mut i8, src: *const i8) -> *mut i8;
+    #[cfg(not(feature = "runtime-lib"))]
     fn strlen(s: *const i8) -> usize;
+    #[cfg(not(feature = "runtime-lib"))]
     fn atoi(s: *const i8) -> usize;
+    #[cfg(not(feature = "runtime-lib"))]
     // Correct strstr signature: returns pointer to match or NULL
     fn strstr(s: *const i8, o: *const i8) -> *mut i8;
-
+    #[cfg(not(feature = "runtime-lib"))]
     fn memcpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8;
-
+    #[cfg(not(feature = "runtime-lib"))]
     fn rand() -> i32;
+    #[cfg(not(feature = "runtime-lib"))]
     fn time(t: *mut i64) -> i64;
+    #[cfg(not(feature = "runtime-lib"))]
     fn srand(seed: u32);
     fn fdopen(fd: i32, mode: *const i8) -> *mut std::ffi::c_void;
+    #[cfg(not(feature = "runtime-lib"))]
     fn fopen(filename: *const i8, mode: *const i8) -> *mut std::ffi::c_void;
+    #[cfg(not(feature = "runtime-lib"))]
     fn fwrite(
         ptr: *const std::ffi::c_void,
         size: usize,
         count: usize,
         stream: *mut std::ffi::c_void,
     ) -> usize;
+    #[cfg(not(feature = "runtime-lib"))]
     fn fread(
         ptr: *mut std::ffi::c_void,
         size: usize,
         count: usize,
         stream: *mut std::ffi::c_void,
     ) -> usize;
+    #[cfg(not(feature = "runtime-lib"))]
     fn fclose(stream: *mut std::ffi::c_void) -> i32;
+    #[cfg(not(feature = "runtime-lib"))]
     fn LLVMLinkInMCJIT();
+    #[cfg(not(feature = "runtime-lib"))]
     fn LLVMLinkInInterpreter();
 
 }
@@ -126,16 +152,19 @@ fn qs_result_err(err: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(result)) as *mut c_void
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone)]
 struct CaptureDescriptor<'ctx> {
     global_name: String,
     ty: BasicTypeEnum<'ctx>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 struct FunctionScopeGuard<'a> {
     stack: &'a RefCell<Vec<String>>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl<'a> FunctionScopeGuard<'a> {
     fn new(stack: &'a RefCell<Vec<String>>, name: String) -> Self {
         stack.borrow_mut().push(name);
@@ -143,22 +172,26 @@ impl<'a> FunctionScopeGuard<'a> {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl<'a> Drop for FunctionScopeGuard<'a> {
     fn drop(&mut self) {
         let _ = self.stack.borrow_mut().pop();
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone)]
 struct LoopContext<'ctx> {
     break_block: BasicBlock<'ctx>,
     _continue_block: BasicBlock<'ctx>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 struct LoopScopeGuard<'a, 'ctx> {
     stack: &'a RefCell<Vec<LoopContext<'ctx>>>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl<'a, 'ctx> LoopScopeGuard<'a, 'ctx> {
     fn new(stack: &'a RefCell<Vec<LoopContext<'ctx>>>, ctx: LoopContext<'ctx>) -> Self {
         stack.borrow_mut().push(ctx);
@@ -166,6 +199,7 @@ impl<'a, 'ctx> LoopScopeGuard<'a, 'ctx> {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl<'a, 'ctx> Drop for LoopScopeGuard<'a, 'ctx> {
     fn drop(&mut self) {
         let _ = self.stack.borrow_mut().pop();
@@ -399,26 +433,36 @@ pub unsafe extern "C" fn qs_list_join(list: *mut c_void, separator: *const c_cha
 }
 use hyper::body::Body;
 use inkwell::basic_block::BasicBlock;
+#[cfg(not(feature = "runtime-lib"))]
 use inkwell::targets::InitializationConfig;
+#[cfg(not(feature = "runtime-lib"))]
 use inkwell::types::BasicTypeEnum;
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::borrow::Cow;
+#[cfg(not(feature = "runtime-lib"))]
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(not(feature = "runtime-lib"))]
+use std::collections::HashSet;
+#[cfg(not(feature = "runtime-lib"))]
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
-use std::fs;
+
 use std::mem;
 use std::process::Command;
-use std::ptr::{self, NonNull};
+#[cfg(not(feature = "runtime-lib"))]
+use std::ptr;
+use std::ptr::NonNull;
 
 use std::convert::Infallible;
 use std::ffi::c_void;
 use std::ffi::{CStr, CString};
 use std::future::Future;
 use std::os::raw::c_char;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(feature = "runtime-lib"))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -430,8 +474,10 @@ use serde_json::{self, Value as JsonValue};
 // ───── High-Performance HTTP Runtime (Actix-style) ─────
 
 // Unique ID generator for anonymous functions to avoid name collisions
+#[cfg(not(feature = "runtime-lib"))]
 static INLINE_FN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
+#[cfg(not(feature = "runtime-lib"))]
 static LLVM_INIT: OnceLock<()> = OnceLock::new();
 
 unsafe fn cstr_to_string(ptr: *const c_char) -> String {
@@ -495,6 +541,7 @@ fn block_on_in_runtime<F: Future>(fut: F) -> F::Output {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn ensure_llvm_ready() {
     LLVM_INIT.get_or_init(|| {
         inkwell::targets::Target::initialize_native(&InitializationConfig::default())
@@ -506,7 +553,7 @@ fn ensure_llvm_ready() {
     });
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "runtime-lib")))]
 fn detect_macos_deployment_target() -> Option<String> {
     if let Ok(val) = env::var("MACOSX_DEPLOYMENT_TARGET") {
         if !val.trim().is_empty() {
@@ -544,7 +591,7 @@ enum SchemaType {
     Bool,
     List(Box<SchemaType>),
     Option(Box<SchemaType>),
-    Result(Box<SchemaType>, Box<SchemaType>),
+    Result,
     Custom(String),
     Enum(Vec<EnumVariantSchema>),
 }
@@ -558,7 +605,7 @@ struct StructFieldSchema {
 #[derive(Clone, Debug)]
 struct StructDescriptor {
     canonical_name: String,
-    structural_signature: String,
+    _structural_signature: String,
     fields: Vec<StructFieldSchema>,
 }
 
@@ -646,9 +693,9 @@ fn parse_schema(signature: &str) -> Result<SchemaType, String> {
                 let (ok_part, err_part) = inner.split_at(idx);
                 let ok_part = ok_part.trim();
                 let err_part = err_part.trim_start_matches(',').trim();
-                let ok_ty = parse_schema(ok_part)?;
-                let err_ty = parse_schema(err_part)?;
-                return Ok(SchemaType::Result(Box::new(ok_ty), Box::new(err_ty)));
+                let _ok_ty = parse_schema(ok_part)?;
+                let _err_ty = parse_schema(err_part)?;
+                return Ok(SchemaType::Result);
             }
         }
         return Err(format!("Malformed Result signature: {trimmed}"));
@@ -739,7 +786,7 @@ fn find_descriptor(name: &str) -> Option<StructDescriptor> {
 #[derive(Clone, Debug)]
 struct EnumDescriptor {
     canonical_name: String,
-    structural_signature: String,
+    _structural_signature: String,
     variants: Vec<EnumVariantSchema>,
 }
 
@@ -837,13 +884,13 @@ fn coerce_json_to_value(schema: &SchemaType, value: &JsonValue) -> Result<ValueR
         SchemaType::Option(_) => {
             Err("Internal error: Option types should be handled by caller".to_string())
         }
-        SchemaType::Result(_, _) => {
+        SchemaType::Result => {
             Err("Result schemas are not yet supported in JSON conversion".to_string())
         }
         SchemaType::Enum(variants) => {
             let descriptor = EnumDescriptor {
                 canonical_name: "<inline>".to_string(),
-                structural_signature: String::new(),
+                _structural_signature: String::new(),
                 variants: variants.clone(),
             };
             let ptr = build_enum_from_json_value(&descriptor, value)?;
@@ -1105,7 +1152,7 @@ fn read_field_value(schema: &SchemaType, slot_ptr: *mut u8) -> JsonValue {
                 read_field_value(inner, ptr as *mut u8)
             }
         }
-        SchemaType::Result(_, _) => JsonValue::Null,
+        SchemaType::Result => JsonValue::Null,
         SchemaType::Enum(variants) => {
             let ptr = unsafe { *(slot_ptr as *mut *mut c_void) };
             if ptr.is_null() {
@@ -1196,7 +1243,7 @@ pub unsafe extern "C" fn qs_register_struct_descriptor(
                 name.clone(),
                 StructDescriptor {
                     canonical_name: name.clone(),
-                    structural_signature: signature.clone(),
+                    _structural_signature: signature.clone(),
                     fields,
                 },
             );
@@ -1245,7 +1292,7 @@ pub unsafe extern "C" fn qs_register_enum_variant(
                 .entry(canonical.clone())
                 .or_insert_with(|| EnumDescriptor {
                     canonical_name: canonical.clone(),
-                    structural_signature: structural.clone(),
+                    _structural_signature: structural.clone(),
                     variants: Vec::new(),
                 });
             entry.variants.push(EnumVariantSchema {
@@ -2704,6 +2751,7 @@ async fn handle_hyper_request(
     Ok(resp)
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Debug, Clone)]
 struct Token {
     value: std::string::String,
@@ -2711,6 +2759,7 @@ struct Token {
     line: usize,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl Token {
     fn print(&self) {
         let token = self;
@@ -2735,6 +2784,7 @@ impl Token {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(PartialEq, Debug, Clone)]
 enum TokenKind {
     LParen,
@@ -2795,12 +2845,14 @@ enum TokenKind {
     Error(u64, std::string::String),
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Debug, Clone)]
 enum Unary {
     Neg,
     Not,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Debug, Clone)]
 enum BinOp {
     Plus,
@@ -2818,6 +2870,7 @@ enum BinOp {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(feature = "runtime-lib"))]
 enum Expr {
     Literal(Value),
     OptionSome(Box<Expr>),
@@ -2836,6 +2889,7 @@ enum Expr {
     Function(Vec<(String, Type)>, Type, Box<Instruction>),
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl Expr {
     fn get_type(&self, ctx: &PreCtx) -> Result<Type, String> {
         let expr = self;
@@ -2924,7 +2978,6 @@ impl Expr {
                 Value::Float(_) => Ok(Type::Float),
                 Value::Str(_) => Ok(Type::Str),
                 Value::Bool(_) => Ok(Type::Bool),
-                Value::Nil => Ok(Type::Nil),
             },
             Expr::List(l) => Ok(Type::List(if let Some(r) = l.first() {
                 Box::new(infer_expr(r)?)
@@ -3459,7 +3512,17 @@ impl Expr {
                     ),
                 }
             }
-            Expr::Block(_) => Ok(Type::Nil),
+            Expr::Block(instrs) => {
+                if returns_on_all_paths(instrs.clone()) {
+                    return Ok(Type::Never);
+                }
+
+                if let Some(Instruction::Expr(_, ty)) = instrs.last() {
+                    Ok(ty.clone())
+                } else {
+                    Ok(Type::Nil)
+                }
+            }
             Expr::Call(callee, args) => {
                 if let Expr::Variable(callee_name) = &**callee {
                     if ctx.current_parsing_function.as_ref() == Some(callee_name) {
@@ -3632,6 +3695,7 @@ impl Expr {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(feature = "runtime-lib"))]
 enum MatchArm {
     CatchAll(String, Instruction),
     Literal(Expr, Instruction),
@@ -3645,6 +3709,7 @@ enum MatchArm {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(feature = "runtime-lib"))]
 enum Instruction {
     Let {
         name: String,
@@ -3682,18 +3747,15 @@ enum Instruction {
         return_type: Type,
         body: Vec<Instruction>,
     },
-    CallFn {
-        dest: Option<String>,
-        name: String,
-        args: Vec<Expr>,
-    },
+
     Use {
-        module_name: String,
-        mod_path: String,
+        _module_name: String,
+        _mod_path: String,
     },
     Nothing,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone)]
 enum Value {
     Int(i64),
@@ -3701,9 +3763,9 @@ enum Value {
     Str(String),
     /// Special return value used to signal early exit from functions
     Bool(bool),
-    Nil,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl Debug for Value {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3711,12 +3773,11 @@ impl Debug for Value {
             Self::Float(n) => write!(f, "Float({n})"),
             Self::Str(s) => write!(f, "Str({s})"),
             Self::Bool(b) => write!(f, "Bool({b})"),
-
-            Self::Nil => write!(f, "nil"),
         }
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone, Debug)]
 struct ModuleFunction {
     name: String,
@@ -3725,6 +3786,7 @@ struct ModuleFunction {
     body: Vec<Instruction>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone, Debug)]
 struct ModuleInfo {
     // functions and constants exported by the module
@@ -3738,6 +3800,7 @@ struct ModuleInfo {
     deserialize_plans: HashMap<String, DeserializeDescriptor>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl Default for ModuleInfo {
     fn default() -> Self {
         Self {
@@ -3751,24 +3814,27 @@ impl Default for ModuleInfo {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone, Debug)]
 struct GenericTypeTemplate {
     params: Vec<String>,
     body: Custype,
 }
-
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone, Debug)]
 struct DeserializeField {
-    name: String,
-    ty: Type,
+    _name: String,
+    _ty: Type,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Clone, Debug)]
 struct DeserializeDescriptor {
-    canonical_name: String,
-    fields: Vec<DeserializeField>,
+    _canonical_name: String,
+    _fields: Vec<DeserializeField>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Debug, Clone)]
 struct Warning {
     line: Option<usize>,
@@ -3776,6 +3842,7 @@ struct Warning {
     note: Option<String>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 #[derive(Default, Clone)]
 struct PreCtx {
     var_types: HashMap<String, Type>,
@@ -3790,6 +3857,7 @@ struct PreCtx {
     current_return_type: Option<Type>,
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl PreCtx {
     fn current_line(&self) -> Option<usize> {
         self.current_line.get()
@@ -3968,12 +4036,12 @@ impl PreCtx {
         let mut ordered_fields: Vec<_> = fields.iter().collect();
         ordered_fields.sort_by(|a, b| a.0.cmp(b.0));
         let descriptor = DeserializeDescriptor {
-            canonical_name: key.clone(),
-            fields: ordered_fields
+            _canonical_name: key.clone(),
+            _fields: ordered_fields
                 .into_iter()
                 .map(|(fname, fty)| DeserializeField {
-                    name: fname.clone(),
-                    ty: fty.clone(),
+                    _name: fname.clone(),
+                    _ty: fty.clone(),
                 })
                 .collect(),
         };
@@ -3987,67 +4055,30 @@ impl PreCtx {
             .entry(structural_key)
             .or_insert_with(|| descriptor);
     }
-
-    fn ensure_deserializable(&mut self, ty: &Type) -> Result<(), String> {
-        match ty {
-            Type::Num | Type::Int | Type::Float | Type::Str | Type::Bool => Ok(()),
-            Type::Option(inner) => self.ensure_deserializable(inner),
-            Type::List(inner) => self.ensure_deserializable(inner),
-            Type::Kv(inner) => self.ensure_deserializable(inner),
-            Type::Custom(Custype::Object(fields)) => {
-                let signature =
-                    self.canonicalize_type(&Type::Custom(Custype::Object(fields.clone())));
-                if self.deserialize_registry.contains_key(&signature) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "Type with fields {:?} is not registered for deserialization",
-                        fields.keys().collect::<Vec<_>>()
-                    ))
-                }
-            }
-            Type::Custom(Custype::Enum(variants)) => {
-                let signature =
-                    self.canonicalize_type(&Type::Custom(Custype::Enum(variants.clone())));
-                if enum_signature_registry()
-                    .lock()
-                    .ok()
-                    .map(|m| m.contains_key(&signature))
-                    .unwrap_or(false)
-                {
-                    Ok(())
-                } else {
-                    Ok(()) // Enum descriptors are registered during codegen; allow here.
-                }
-            }
-            Type::GenericParam(name) => Err(format!(
-                "Cannot deserialize unresolved generic parameter '{name}'"
-            )),
-            other => Err(format!(
-                "Type {other:?} is not supported for JSON deserialization"
-            )),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg(not(feature = "runtime-lib"))]
 struct EnumVariant {
     name: String,
     payload: Vec<Type>,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(feature = "runtime-lib"))]
 enum EnumPattern {
     Binding(String),
     Literal(Expr),
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg(not(feature = "runtime-lib"))]
 enum Custype {
     Object(HashMap<String, Type>),
     Enum(Vec<EnumVariant>),
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl Default for Custype {
     fn default() -> Self {
         Custype::Enum(vec![])
@@ -4055,6 +4086,7 @@ impl Default for Custype {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(feature = "runtime-lib"))]
 enum Type {
     GenericParam(String),
     Num,
@@ -4076,6 +4108,7 @@ enum Type {
     Function(Vec<(String, Type)>, Box<Type>),
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl Type {
     fn unwrap(&self) -> Self {
         if let Self::Option(l) = self {
@@ -4138,6 +4171,7 @@ impl Type {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn merge_return_types(old: &Type, new: &Type) -> Option<Type> {
     if old == new {
         return Some(old.clone());
@@ -4175,6 +4209,7 @@ fn merge_return_types(old: &Type, new: &Type) -> Option<Type> {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -4227,6 +4262,7 @@ impl PartialEq for Type {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 impl Display for TokenKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -4294,6 +4330,7 @@ impl Display for TokenKind {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn is_single_char_token(c: char) -> Option<TokenKind> {
     match c {
         '(' => Some(LParen),
@@ -4311,6 +4348,7 @@ fn is_single_char_token(c: char) -> Option<TokenKind> {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn get_special_ident(val: String) -> TokenKind {
     match val.as_str() {
         "and" => And,
@@ -4346,6 +4384,7 @@ fn is_identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn returns_on_all_paths(block: Vec<Instruction>) -> bool {
     for inst in block {
         match inst {
@@ -4401,6 +4440,7 @@ fn returns_on_all_paths(block: Vec<Instruction>) -> bool {
     false
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn valid_left_hand(left: &Expr) -> bool {
     match left {
         Expr::Get(ex, _) => valid_left_hand(ex),
@@ -4410,6 +4450,7 @@ fn valid_left_hand(left: &Expr) -> bool {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn else_certifies(elses: &Option<Box<Instruction>>) -> bool {
     match elses {
         None => false, // no else branch => not guaranteed
@@ -4491,7 +4532,7 @@ fn execute_run(filename: String, debug: bool) {
                 {
                     if !returns_on_all_paths(body) {
                         eprintln!(
-                            "Body of function '{name}' does not return a value every time. Try adding `return none` at the end of the function"
+                            "Body of function '{name}' does not return a value every time. Try adding `return None` at the end of the function"
                         );
                         std::process::exit(70);
                     }
@@ -4732,32 +4773,50 @@ fn execute_build(filename: String, debug: bool) {
             let output_bin = build_dir.join("program");
 
             let runtime_lib_path = build_dir.join("libquick.a");
-            // Prefer an explicit override, then a freshly built runtime from disk, and finally the embedded bytes.
+
+            // Always refresh the runtime archive to avoid stale copies from previous builds.
+            let _ = std::fs::remove_file(&runtime_lib_path);
+
+            // Prefer an explicit override; otherwise use the embedded runtime bytes that were
+            // staged at build time.
             if let Ok(path_override) = std::env::var("QUICK_RUNTIME_LIB") {
                 let override_path = PathBuf::from(&path_override);
                 if let Err(err) = std::fs::copy(&override_path, &runtime_lib_path) {
                     eprintln!(
-                        "Failed to copy runtime lib from {}: {err}; falling back to defaults",
+                        "Failed to copy runtime lib from {}: {err}; falling back to embedded runtime",
                         override_path.display()
                     );
                 }
             }
 
             if !runtime_lib_path.exists() {
-                let disk_runtime = PathBuf::from("target/runtime/release/libquick_runtime.a");
-                if disk_runtime.exists() {
-                    if let Err(err) = std::fs::copy(&disk_runtime, &runtime_lib_path) {
-                        eprintln!(
-                            "Failed to copy runtime lib from {}: {err}; falling back to embedded runtime",
-                            disk_runtime.display()
-                        );
-                    }
+                if let Err(e) = std::fs::write(&runtime_lib_path, &LIBQUICK) {
+                    eprintln!("Error writing embedded runtime library: {e}");
                 }
             }
 
             if !runtime_lib_path.exists() {
-                if let Err(e) = std::fs::write(&runtime_lib_path, &LIBQUICK) {
-                    eprintln!("Error writing embedded runtime library: {e}");
+                eprintln!("Unable to prepare runtime library; aborting build");
+                std::process::exit(70);
+            }
+
+            match std::fs::read(&runtime_lib_path) {
+                Ok(bytes) => {
+                    if !bytes.windows(b"qs_run_main".len()).any(|w| w == b"qs_run_main")
+                    {
+                        eprintln!(
+                            "Runtime library at {} is missing required exports; rebuild it with `cargo build --release --lib --features runtime-lib --target-dir target/runtime` or set QUICK_RUNTIME_LIB to a valid archive.",
+                            runtime_lib_path.display()
+                        );
+                        std::process::exit(65);
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to validate runtime library {}: {err}",
+                        runtime_lib_path.display()
+                    );
+                    std::process::exit(65);
                 }
             }
             let (linker_override, ld_override) = bundled_linker();
@@ -5243,6 +5302,7 @@ pub extern "C" fn __qs_export_roots() -> usize {
 
 type SumFunc = unsafe extern "C" fn() -> f64;
 
+#[cfg(not(feature = "runtime-lib"))]
 fn format_float(lexeme: &str) -> String {
     if lexeme.contains('.') {
         let mut s = lexeme.trim_end_matches('0').to_string();
@@ -5255,27 +5315,7 @@ fn format_float(lexeme: &str) -> String {
     }
 }
 
-fn find_runtime_archive(target_dir: &Path) -> Option<PathBuf> {
-    let release_dir = target_dir.join("release");
-    let direct = release_dir.join("libquick.a");
-    if direct.exists() {
-        return Some(direct);
-    }
-
-    fs::read_dir(&release_dir).ok()?.find_map(|entry| {
-        let path = entry.ok()?.path();
-        let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
-            return None;
-        };
-
-        if file_name.starts_with("libquick") && path.extension().is_some_and(|ext| ext == "a") {
-            Some(path)
-        } else {
-            None
-        }
-    })
-}
-
+#[cfg(not(feature = "runtime-lib"))]
 fn tokenize(chars: Vec<char>) -> Vec<Token> {
     let mut is_commented = false;
     let mut in_string = false;

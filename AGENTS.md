@@ -62,6 +62,7 @@
 - Favor zero-copy or pointer-based interop when safe; avoid allocations inside tight loops.
 - Widen functionality via modules or built-ins only after defining their types explicitly in `Type` and enforcing them in the parser.
 - Keep async boundaries non-blocking and make sure any blocking fallback goes through the shared runtimes.
+- Never trigger `cargo build` from runtime CLI code paths; builds must not spawn nested cargo processes.
 
 ## Extension Checklist
 
