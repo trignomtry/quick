@@ -17,10 +17,7 @@ use crate::compiler::Compiler;
 use inkwell::AddressSpace;
 
 #[cfg(not(feature = "runtime-lib"))]
-static LIBQUICK: &'static [u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/libquick_runtime.a"
-));
+static LIBQUICK: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libquick_runtime.a"));
 unsafe extern "C" {
     #[cfg(not(feature = "runtime-lib"))]
     fn strcmp(a: *const i8, b: *const i8) -> i32;
@@ -4772,13 +4769,15 @@ fn execute_build(filename: String, debug: bool) {
 
             let output_bin = build_dir.join("program");
 
-            let runtime_lib_path = build_dir.join("libquick.a");
+            let runtime_lib_path = dirs::home_dir()
+                .unwrap_or_else(|| {
+                    eprintln!("Could not build because user's home directory could not be found");
+                    std::process::exit(70);
+                })
+                .join(".quick")
+                .join("bin")
+                .join("libquick.a");
 
-            // Always refresh the runtime archive to avoid stale copies from previous builds.
-            let _ = std::fs::remove_file(&runtime_lib_path);
-
-            // Prefer an explicit override; otherwise use the embedded runtime bytes that were
-            // staged at build time.
             if let Ok(path_override) = std::env::var("QUICK_RUNTIME_LIB") {
                 let override_path = PathBuf::from(&path_override);
                 if let Err(err) = std::fs::copy(&override_path, &runtime_lib_path) {
@@ -4798,26 +4797,6 @@ fn execute_build(filename: String, debug: bool) {
             if !runtime_lib_path.exists() {
                 eprintln!("Unable to prepare runtime library; aborting build");
                 std::process::exit(70);
-            }
-
-            match std::fs::read(&runtime_lib_path) {
-                Ok(bytes) => {
-                    if !bytes.windows(b"qs_run_main".len()).any(|w| w == b"qs_run_main")
-                    {
-                        eprintln!(
-                            "Runtime library at {} is missing required exports; rebuild it with `cargo build --release --lib --features runtime-lib --target-dir target/runtime` or set QUICK_RUNTIME_LIB to a valid archive.",
-                            runtime_lib_path.display()
-                        );
-                        std::process::exit(65);
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "Failed to validate runtime library {}: {err}",
-                        runtime_lib_path.display()
-                    );
-                    std::process::exit(65);
-                }
             }
             let (linker_override, ld_override) = bundled_linker();
 

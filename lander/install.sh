@@ -114,12 +114,30 @@ case "${unpack}" in
             error "Failed to extract archive ${download_target}"
             exit 1
         fi
-        bin_src="${tmpdir}/${artifact_base}"
         ;;
     none)
-        bin_src="${tmpdir}/${download_target}"
         ;;
 esac
+
+bin_src="${tmpdir}/bin/quick"
+if [ ! -f "${bin_src}" ]; then
+    bin_src="${tmpdir}/${artifact_base}"
+fi
+
+lib_src="${tmpdir}/bin/libquick.a"
+if [ ! -f "${lib_src}" ]; then
+    for candidate in "${tmpdir}/libquick_runtime.a" "${tmpdir}/libquick.a" "${tmpdir}/libquick_runtime.lib" "${tmpdir}/libquick.lib"; do
+        if [ -f "${candidate}" ]; then
+            lib_src="${candidate}"
+            break
+        fi
+    done
+fi
+
+if [ ! -f "${bin_src}" ]; then
+    error "Binary not found in archive; aborting install."
+    exit 1
+fi
 
 chmod +x "${bin_src}"
 
@@ -153,6 +171,12 @@ if [ -e "${dest}" ] && [ ! -w "${dest}" ]; then
 fi
 
 install -m 755 "${bin_src}" "${dest}"
+
+if [ -f "${lib_src}" ]; then
+    install -m 644 "${lib_src}" "${dest_dir}/libquick.a"
+else
+    warn "libquick.a not found in release artifact; Ship/AOT mode will not work until it's available."
+fi
 
 # Install bundled toolchain binaries for AOT into INSTALL_DIR
 for tool in clang ld.lld lld llvm-ar llvm-ranlib; do

@@ -62,6 +62,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=QUICK_RUNTIME_LIB");
 
+    // When building the runtime library itself, skip staging the embedded archive
+    // to avoid a circular dependency on its own output.
+    let building_runtime = env::var_os("CARGO_FEATURE_RUNTIME_LIB").is_some();
+
     let llvm_config = locate_llvm_config().unwrap_or_else(|| {
         panic!(
             "Unable to locate llvm-config for LLVM >= {MIN_LLVM_MAJOR}.{MIN_LLVM_MINOR}. \
@@ -105,7 +109,9 @@ fn main() {
     emit_forced_library_search_paths();
     emit_cxx_runtime();
 
-    prepare_embedded_runtime();
+    if !building_runtime {
+        prepare_embedded_runtime();
+    }
 }
 
 fn prepare_embedded_runtime() {
@@ -113,26 +119,45 @@ fn prepare_embedded_runtime() {
     let dest = out_dir.join("libquick_runtime.a");
 
     // Prefer an explicit override; otherwise use a staged runtime build if available.
-    let source = env::var_os("QUICK_RUNTIME_LIB")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let staged = PathBuf::from("target/runtime/release/libquick_runtime.a");
-            staged.exists().then_some(staged)
-        })
-        .or_else(|| {
-            let staged = PathBuf::from("target/release/libquick_runtime.a");
-            staged.exists().then_some(staged)
-        });
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(override_path) = env::var_os("QUICK_RUNTIME_LIB") {
+        candidates.push(PathBuf::from(override_path));
+    }
+
+    // Prefer a dedicated runtime target-dir to avoid clobbering by feature-less builds.
+    candidates.push(PathBuf::from(format!("target/runtime/{profile}/libquick_runtime.a")));
+    candidates.push(PathBuf::from("target/runtime/release/libquick_runtime.a"));
+
+    // Fallback to the standard target dir only if present; validation below will guard
+    // against accidentally picking a build without the `runtime-lib` feature enabled.
+    candidates.push(PathBuf::from(format!("target/{profile}/libquick_runtime.a")));
+    candidates.push(PathBuf::from("target/release/libquick_runtime.a"));
+    candidates.push(PathBuf::from("target/debug/libquick_runtime.a"));
+
+    let source = candidates.into_iter().find(|p| p.exists());
 
     let Some(src) = source else {
         panic!(
-            "Missing runtime archive; build it with `cargo build --release --lib --features runtime-lib --target-dir target/runtime` or set QUICK_RUNTIME_LIB to a valid staticlib."
+            "Missing runtime archive; build it once with `cargo build --release --lib --features runtime-lib` or set QUICK_RUNTIME_LIB to a valid staticlib."
         );
     };
 
     if let Err(err) = std::fs::copy(&src, &dest) {
         panic!(
             "Failed to stage runtime archive from {}: {err}",
+            src.display()
+        );
+    }
+
+    let bytes = std::fs::read(&dest).expect("Failed to read staged runtime archive");
+    if !bytes
+        .windows(b"qs_run_main".len())
+        .any(|w| w == b"qs_run_main")
+    {
+        panic!(
+            "Staged runtime archive at {} is missing QuickScript entry points. Rebuild it with `cargo build --release --lib --features runtime-lib --target-dir target/runtime` or set QUICK_RUNTIME_LIB to a valid archive.",
             src.display()
         );
     }
