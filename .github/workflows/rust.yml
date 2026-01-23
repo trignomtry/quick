@@ -30,14 +30,6 @@ jobs:
             bin_ext: ""
             package: tar
             rustflags: ""
-          - name: linux-arm64
-            runner: ubuntu-22.04-arm64
-            os_id: linux
-            arch: arm64
-            target: aarch64-unknown-linux-gnu
-            bin_ext: ""
-            package: tar
-            rustflags: ""
           - name: macos-arm64
             runner: macos-14
             os_id: darwin
@@ -410,4 +402,104 @@ jobs:
           tag_name: v${{ env.VERSION }}
           name: v${{ env.VERSION }}
           files: ${{ steps.package-unix.outputs.asset || steps.package-win.outputs.asset }}
+          fail_on_unmatched_files: true
+
+  build-linux-arm64-cross:
+    name: linux-arm64-cross
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TERM_COLOR: always
+      LLVM_TAG: llvmorg-18.1.4
+      ZSTD_VERSION: 1.5.6
+      DEPS_PREFIX: ${{ github.workspace }}/deps/install
+      LLVM_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="quick") | .version')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build and package (ARM64 via emulation)
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          env: |
+            LLVM_PREFIX=/usr/lib/llvm-18
+            LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+            LLVM_CONFIG_PATH=/usr/bin/llvm-config-18
+            DEPS_PREFIX=${{ github.workspace }}/deps/install
+            CARGO_TARGET_DIR=${{ github.workspace }}/target
+            VERSION=${{ env.VERSION }}
+          install: |
+            set -euo pipefail
+            apt-get update
+            apt-get install -y curl build-essential pkg-config libtinfo5 libncurses5 zstd libzstd-dev xz-utils gnupg software-properties-common ca-certificates jq lsb-release
+            curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+            chmod +x /tmp/llvm.sh
+            /tmp/llvm.sh 18
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain nightly --profile minimal
+          run: |
+            set -euo pipefail
+            . "$HOME/.cargo/env"
+            rustup target add aarch64-unknown-linux-gnu
+            export CC="clang-18"
+            export CXX="clang++-18"
+            export AR="llvm-ar-18"
+            export RANLIB="llvm-ranlib-18"
+            export LLVM_CONFIG_PATH="/usr/bin/llvm-config-18"
+            export LIBRARY_PATH="/usr/lib/llvm-18/lib"
+            export LD_LIBRARY_PATH="/usr/lib/llvm-18/lib"
+
+            cargo build --locked --release --lib --features runtime-lib --target aarch64-unknown-linux-gnu
+            lib_path="target/aarch64-unknown-linux-gnu/release/libquick_runtime.a"
+            if [ ! -f "$lib_path" ]; then
+              alt="target/aarch64-unknown-linux-gnu/release/libquick.a"
+              if [ -f "$alt" ]; then
+                lib_path="$alt"
+              else
+                echo "Static library not found" >&2
+                exit 1
+              fi
+            fi
+
+            mkdir -p build target/runtime/release
+            cp "$lib_path" build/libquick_runtime.a
+            cp "$lib_path" target/runtime/release/libquick_runtime.a
+
+            cargo build --locked --release --target aarch64-unknown-linux-gnu
+
+            ARTIFACT_BASE="quick-linux-arm64"
+            TARGET_DIR="target/aarch64-unknown-linux-gnu/release"
+            OUT_DIR="${GITHUB_WORKSPACE}/dist/linux-arm64"
+            BIN_SRC="${TARGET_DIR}/quick"
+            mkdir -p "$OUT_DIR" "$OUT_DIR/bin"
+            cp "$BIN_SRC" "$OUT_DIR/${ARTIFACT_BASE}"
+            cp "$BIN_SRC" "$OUT_DIR/bin/quick"
+            cp "$lib_path" "$OUT_DIR/bin/libquick.a"
+
+            tar -czf "$OUT_DIR/${ARTIFACT_BASE}.tar.gz" -C "$OUT_DIR" "${ARTIFACT_BASE}" bin
+            echo "ARM_ASSET=$OUT_DIR/${ARTIFACT_BASE}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact (ARM64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: ${{ env.ARM_ASSET }}
+
+      - name: Publish release asset (ARM64)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          files: ${{ env.ARM_ASSET }}
           fail_on_unmatched_files: true
