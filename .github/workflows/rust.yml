@@ -440,6 +440,8 @@ jobs:
             curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
             chmod +x /tmp/llvm.sh
             /tmp/llvm.sh 18
+            apt-get update
+            apt-get install -y llvm-18-dev libpolly-18-dev clang-18 lld-18
             curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain nightly --profile minimal
           run: |
             set -euo pipefail
@@ -447,6 +449,7 @@ jobs:
             export LLVM_PREFIX="/usr/lib/llvm-18"
             export LLVM_SYS_181_PREFIX="/usr/lib/llvm-18"
             export LLVM_CONFIG_PATH="/usr/bin/llvm-config-18"
+            export LLVM_SYS_181_POLLY=OFF
             export DEPS_PREFIX="${GITHUB_WORKSPACE}/deps/install"
             export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target"
             rustup target add aarch64-unknown-linux-gnu
@@ -485,7 +488,30 @@ jobs:
             cp "$BIN_SRC" "$OUT_DIR/bin/quick"
             cp "$lib_path" "$OUT_DIR/bin/libquick.a"
 
-            tar -czf "$OUT_DIR/${ARTIFACT_BASE}.tar.gz" -C "$OUT_DIR" "${ARTIFACT_BASE}" bin
+            LLVM_BIN="/usr/lib/llvm-18/bin"
+            if [ -x "$LLVM_BIN/clang" ]; then
+              mkdir -p "$OUT_DIR/llvm/bin"
+              cp "$LLVM_BIN/clang" "$OUT_DIR/llvm/bin/"
+              if [ -x "$LLVM_BIN/ld.lld" ]; then
+                cp "$LLVM_BIN/ld.lld" "$OUT_DIR/llvm/bin/"
+              fi
+              if [ -x "$LLVM_BIN/lld" ]; then
+                cp "$LLVM_BIN/lld" "$OUT_DIR/llvm/bin/"
+              fi
+              if [ -x "$LLVM_BIN/llvm-ar" ]; then
+                cp "$LLVM_BIN/llvm-ar" "$OUT_DIR/llvm/bin/"
+              fi
+              if [ -x "$LLVM_BIN/llvm-ranlib" ]; then
+                cp "$LLVM_BIN/llvm-ranlib" "$OUT_DIR/llvm/bin/"
+              fi
+            fi
+
+            entries=("${ARTIFACT_BASE}" "bin")
+            if [ -d "$OUT_DIR/llvm" ]; then
+              entries+=("llvm")
+            fi
+
+            tar -czf "$OUT_DIR/${ARTIFACT_BASE}.tar.gz" -C "$OUT_DIR" "${entries[@]}"
             echo "ARM artifact at $OUT_DIR/${ARTIFACT_BASE}.tar.gz"
 
       - name: Upload build artifact (ARM64)
