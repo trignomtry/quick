@@ -433,13 +433,6 @@ jobs:
           arch: aarch64
           distro: ubuntu22.04
           githubToken: ${{ github.token }}
-          env: |
-            LLVM_PREFIX=/usr/lib/llvm-18
-            LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
-            LLVM_CONFIG_PATH=/usr/bin/llvm-config-18
-            DEPS_PREFIX=${{ github.workspace }}/deps/install
-            CARGO_TARGET_DIR=${{ github.workspace }}/target
-            VERSION=${{ env.VERSION }}
           install: |
             set -euo pipefail
             apt-get update
@@ -451,6 +444,11 @@ jobs:
           run: |
             set -euo pipefail
             . "$HOME/.cargo/env"
+            export LLVM_PREFIX="/usr/lib/llvm-18"
+            export LLVM_SYS_181_PREFIX="/usr/lib/llvm-18"
+            export LLVM_CONFIG_PATH="/usr/bin/llvm-config-18"
+            export DEPS_PREFIX="${GITHUB_WORKSPACE}/deps/install"
+            export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target"
             rustup target add aarch64-unknown-linux-gnu
             export CC="clang-18"
             export CXX="clang++-18"
@@ -488,18 +486,18 @@ jobs:
             cp "$lib_path" "$OUT_DIR/bin/libquick.a"
 
             tar -czf "$OUT_DIR/${ARTIFACT_BASE}.tar.gz" -C "$OUT_DIR" "${ARTIFACT_BASE}" bin
-            echo "ARM_ASSET=$OUT_DIR/${ARTIFACT_BASE}.tar.gz" >> "$GITHUB_ENV"
+            echo "ARM artifact at $OUT_DIR/${ARTIFACT_BASE}.tar.gz"
 
       - name: Upload build artifact (ARM64)
         uses: actions/upload-artifact@v4
         with:
           name: linux-arm64
-          path: ${{ env.ARM_ASSET }}
+          path: ${{ github.workspace }}/dist/linux-arm64/quick-linux-arm64.tar.gz
 
       - name: Publish release asset (ARM64)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
           name: v${{ env.VERSION }}
-          files: ${{ env.ARM_ASSET }}
+          files: ${{ github.workspace }}/dist/linux-arm64/quick-linux-arm64.tar.gz
           fail_on_unmatched_files: true
