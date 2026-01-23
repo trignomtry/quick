@@ -436,7 +436,7 @@ jobs:
           install: |
             set -euo pipefail
             apt-get update
-            apt-get install -y curl build-essential pkg-config libtinfo5 libncurses5 zstd libzstd-dev xz-utils gnupg software-properties-common ca-certificates jq lsb-release
+            apt-get install -y curl build-essential pkg-config libtinfo5 libncurses5 zstd libzstd-dev zlib1g-dev xz-utils gnupg software-properties-common ca-certificates jq lsb-release
             curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
             chmod +x /tmp/llvm.sh
             /tmp/llvm.sh 18
