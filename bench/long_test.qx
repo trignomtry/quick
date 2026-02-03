@@ -11,4 +11,4 @@ for i in io.range().from(0).to(20) {
     total = total + fib(i);
 }
 
-io.print("QuickScript Long Test Total: " + total.str());
+print("QuickScript Long Test Total: " + total.str());

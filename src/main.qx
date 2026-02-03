@@ -1,8 +1,5 @@
-
-let wow = {
-    let x = 5;
-    x;
-    6 * x * x
-};
-
-print(wow)
+print("Hello, World!")
+let web = io.web();
+io.listen(8080, fun(req: Request) {
+    return web.file("./lander" + req.path).not_found("./lander/404.html");
+})

@@ -10,4 +10,4 @@ fun fib(n: Num) {
 }
 
 let n = 38;
-io.print("QuickScript Fib(" + n.str() + "): " + fib(n).str());
+print("QuickScript Fib(" + n.str() + "): " + fib(n).str());

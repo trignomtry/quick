@@ -115,49 +115,18 @@ fn main() {
 }
 
 fn prepare_embedded_runtime() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
-    let dest = out_dir.join("libquick_runtime.a");
-
-    // Prefer an explicit override; otherwise use a staged runtime build if available.
-    let profile = env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    if let Some(override_path) = env::var_os("QUICK_RUNTIME_LIB") {
-        candidates.push(PathBuf::from(override_path));
+    let src = PathBuf::from("target/release/libquick_runtime.a");
+    if !src.exists() {
+        panic!("Quick runtime does not exist!");
     }
 
-    // Prefer a dedicated runtime target-dir to avoid clobbering by feature-less builds.
-    candidates.push(PathBuf::from(format!("target/runtime/{profile}/libquick_runtime.a")));
-    candidates.push(PathBuf::from("target/runtime/release/libquick_runtime.a"));
-
-    // Fallback to the standard target dir only if present; validation below will guard
-    // against accidentally picking a build without the `runtime-lib` feature enabled.
-    candidates.push(PathBuf::from(format!("target/{profile}/libquick_runtime.a")));
-    candidates.push(PathBuf::from("target/release/libquick_runtime.a"));
-    candidates.push(PathBuf::from("target/debug/libquick_runtime.a"));
-
-    let source = candidates.into_iter().find(|p| p.exists());
-
-    let Some(src) = source else {
-        panic!(
-            "Missing runtime archive; build it once with `cargo build --release --lib --features runtime-lib` or set QUICK_RUNTIME_LIB to a valid staticlib."
-        );
-    };
-
-    if let Err(err) = std::fs::copy(&src, &dest) {
-        panic!(
-            "Failed to stage runtime archive from {}: {err}",
-            src.display()
-        );
-    }
-
-    let bytes = std::fs::read(&dest).expect("Failed to read staged runtime archive");
+    let bytes = std::fs::read(&src).expect("Failed to read staged runtime archive");
     if !bytes
         .windows(b"qs_run_main".len())
         .any(|w| w == b"qs_run_main")
     {
         panic!(
-            "Staged runtime archive at {} is missing QuickScript entry points. Rebuild it with `cargo build --release --lib --features runtime-lib --target-dir target/runtime` or set QUICK_RUNTIME_LIB to a valid archive.",
+            "Staged runtime archive at {} is missing QuickScript entry points. Rebuild it with `cargo build --release --lib --features runtime-lib` or set QUICK_RUNTIME_LIB to a valid archive.",
             src.display()
         );
     }

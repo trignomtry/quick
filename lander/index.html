@@ -12,12 +12,14 @@
         />
         <style>
             :root {
-                --bg: #0f172a;
-                --card: #111827;
-                --text: #e5e7eb;
-                --muted: #94a3b8;
-                --accent: #f97316;
-                --border: #1f2937;
+                --bg: #050915;
+                --bg2: #0b1223;
+                --card: #0c1325;
+                --text: #e6ecf8;
+                --muted: #9ca8c7;
+                --accent: #6cf0ff;
+                --accent-strong: #60a5fa;
+                --border: rgba(255, 255, 255, 0.06);
             }
 
             * {
@@ -26,12 +28,11 @@
 
             body {
                 margin: 0;
-                background: linear-gradient(
-                    135deg,
-                    #0b1223 0%,
-                    #0f172a 45%,
-                    #0b1327 100%
-                );
+                min-height: 100vh;
+                background: radial-gradient(circle at 20% 20%, #0f1f3d, transparent 25%),
+                    radial-gradient(circle at 80% 10%, #112a42, transparent 28%),
+                    radial-gradient(circle at 50% 80%, #122a3f, transparent 32%),
+                    linear-gradient(135deg, var(--bg), var(--bg2));
                 color: var(--text);
                 font-family:
                     "Space Grotesk",
@@ -43,79 +44,217 @@
             }
 
             .page {
-                max-width: 1100px;
+                max-width: 1120px;
                 margin: 0 auto;
-                padding: 3rem 1.5rem 4rem;
+                padding: 2.5rem 1.5rem 4rem;
             }
 
-            header {
-                padding: 1.5rem;
+            .hero {
+                position: relative;
+                overflow: hidden;
                 border: 1px solid var(--border);
-                border-radius: 18px;
-                background: linear-gradient(
-                    135deg,
-                    rgba(249, 115, 22, 0.12),
-                    rgba(17, 24, 39, 0.6)
+                border-radius: 20px;
+                background: linear-gradient(145deg, rgba(96, 165, 250, 0.08), rgba(6, 182, 212, 0.12)),
+                    linear-gradient(120deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0));
+                box-shadow: 0 25px 80px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.03);
+                padding: 3rem 2.25rem;
+            }
+
+            .hero::before,
+            .hero::after {
+                content: "";
+                position: absolute;
+                inset: -40%;
+                background: conic-gradient(
+                    from 90deg,
+                    rgba(108, 240, 255, 0.08),
+                    rgba(96, 165, 250, 0.2),
+                    rgba(255, 255, 255, 0.08),
+                    rgba(6, 182, 212, 0.2),
+                    rgba(108, 240, 255, 0.08)
                 );
-                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+                filter: blur(70px);
+                opacity: 0.5;
+                animation: pulse 6s linear infinite;
             }
 
-            h1 {
-                margin: 0 0 0.25rem 0;
-                font-size: clamp(2rem, 4vw, 3rem);
-                letter-spacing: -0.02em;
+            .hero::after {
+                animation-direction: reverse;
+                opacity: 0.35;
             }
 
-            p {
-                margin: 0 0 0.5rem 0;
+            @keyframes pulse {
+                0% {
+                    transform: rotate(0deg) scale(1);
+                }
+                50% {
+                    transform: rotate(180deg) scale(1.02);
+                }
+                100% {
+                    transform: rotate(360deg) scale(1);
+                }
+            }
+
+            .hero-content {
+                position: relative;
+                z-index: 1;
+                text-align: center;
+            }
+
+            .logo-burst {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                margin-bottom: 1.2rem;
+                position: relative;
+            }
+
+            .logo-burst::after {
+                content: "";
+                position: absolute;
+                inset: -18px;
+                background: radial-gradient(circle, rgba(96, 165, 250, 0.3), rgba(96, 165, 250, 0));
+                filter: blur(12px);
+                opacity: 0.8;
+            }
+
+            .hero-title {
+                margin: 0;
+                font-size: clamp(2.8rem, 7vw, 4.8rem);
+                letter-spacing: -0.03em;
+                font-weight: 700;
+                text-transform: uppercase;
+                color: #e8f7ff;
+                text-shadow:
+                    0 0 15px rgba(108, 240, 255, 0.6),
+                    0 0 30px rgba(96, 165, 250, 0.35),
+                    0 0 45px rgba(6, 182, 212, 0.3);
+                position: relative;
+            }
+
+            .hero-title::after {
+                content: "⚡";
+                position: absolute;
+                right: -1.2ch;
+                top: 0.1em;
+                font-size: 0.6em;
+                color: var(--accent);
+                filter: drop-shadow(0 0 8px rgba(108, 240, 255, 0.8));
+                animation: flicker 1.8s infinite;
+            }
+
+            @keyframes flicker {
+                0%,
+                19%,
+                21%,
+                23%,
+                64%,
+                100% {
+                    opacity: 0.98;
+                }
+                20%,
+                22%,
+                63% {
+                    opacity: 0.4;
+                }
+            }
+
+            .hero-sub {
+                max-width: 760px;
+                margin: 0.75rem auto 1.5rem;
                 color: var(--muted);
+                font-size: 1.1rem;
             }
 
             .cta-row {
                 display: flex;
                 gap: 0.75rem;
                 flex-wrap: wrap;
-                margin-top: 1rem;
+                justify-content: center;
+                margin: 1.25rem 0 0.5rem;
             }
 
             .btn {
                 display: inline-flex;
                 align-items: center;
                 gap: 0.35rem;
-                padding: 0.65rem 1rem;
-                border-radius: 12px;
+                padding: 0.75rem 1.15rem;
+                border-radius: 14px;
                 border: 1px solid var(--border);
-                font-weight: 600;
+                font-weight: 700;
                 color: var(--text);
                 text-decoration: none;
+                letter-spacing: 0.01em;
                 transition:
-                    transform 120ms ease,
-                    border-color 120ms ease,
-                    background 120ms ease;
+                    transform 140ms ease,
+                    border-color 140ms ease,
+                    background 140ms ease,
+                    box-shadow 140ms ease;
+                background: rgba(255, 255, 255, 0.03);
             }
 
             .btn.primary {
-                background: var(--accent);
-                color: #0b0f1a;
-                border-color: var(--accent);
+                background: linear-gradient(120deg, var(--accent), var(--accent-strong));
+                color: #041220;
+                border-color: rgba(108, 240, 255, 0.4);
+                box-shadow: 0 10px 40px rgba(108, 240, 255, 0.25);
             }
 
             .btn.github {
-                border-color: rgba(249, 115, 22, 0.35);
-                background: rgba(255, 255, 255, 0.04);
+                border-color: rgba(255, 255, 255, 0.1);
+                background: rgba(255, 255, 255, 0.05);
             }
 
             .btn:hover {
-                transform: translateY(-1px);
-                border-color: rgba(249, 115, 22, 0.7);
+                transform: translateY(-2px) scale(1.01);
+                border-color: rgba(108, 240, 255, 0.8);
+                box-shadow: 0 12px 45px rgba(108, 240, 255, 0.25);
             }
 
-            .code {
-                margin-top: 1.25rem;
+            .install {
+                margin: 1.75rem auto 0;
+                max-width: 720px;
+                background: rgba(12, 19, 37, 0.85);
+                border: 1px solid var(--border);
+                border-radius: 14px;
+                padding: 0.75rem 1rem;
+                font-family: "Source Code Pro", Menlo, monospace;
+                color: #d6e8ff;
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+            }
+
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                gap: 1rem;
+                margin-top: 2.25rem;
+            }
+
+            .card {
+                padding: 1.1rem 1rem;
+                border: 1px solid var(--border);
+                border-radius: 14px;
+                background: rgba(255, 255, 255, 0.02);
+                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
+            }
+
+            .card h3 {
+                margin: 0 0 0.35rem 0;
+                font-size: 1.05rem;
+            }
+
+            .card p {
+                margin: 0;
+                color: var(--muted);
+                font-size: 0.98rem;
+            }
+
+            .code-block {
+                margin-top: 2rem;
                 background: #0b1220;
                 border: 1px solid var(--border);
                 border-radius: 14px;
-                padding: 1rem;
+                padding: 1rem 1.2rem;
                 font-family:
                     "Source Code Pro", "SFMono-Regular", Menlo, monospace;
                 color: #e2e8f0;
@@ -127,41 +266,59 @@
 
     <body>
         <div class="page">
-            <header>
-                <h1>QuickScript</h1>
-                <p>
-                    Small, strongly typed, async-first, and LLVM-backed. Build
-                    servers, scripts, and services with predictable speed.
-                </p>
-                <div class="cta-row">
-                    <a class="btn primary" href="/docs/">Read the Docs</a>
-                    <a class="btn" href="/docs/#quickstart">Quickstart</a>
-                    <a
-                        class="btn github"
-                        href="https://github.com/trignomtry/quick"
-                        target="_blank"
-                        rel="noopener"
-                        >View on GitHub</a
-                    >
-                </div>
-                <code>
-                    <h1>Install It Now</h1>
-                    curl -fsSL https://quick-script.dev/install.sh | sh
-                </code>
-                <div class="code">
-                    <pre>
-let web = io.web()
-
-io.listen(8087, fun(req: Request) {
-    match req.path {
-        "/hi"       => return web.text("Hello!"),
-        "/api/data" => return web.json("{\"message\":\"Hello!\"}"),
-        _           => return web.error.text(404, "Not found"),
-    }
-})</pre
-                    >
+            <header class="hero">
+                <div class="hero-content">
+                    <div class="logo-burst">
+                        <h1 class="hero-title">QuickScript</h1>
+                    </div>
+                    <p class="hero-sub">
+                        Strong types. Async built-in. LLVM muscle. Write concise scripts, services, and APIs that ship fast and stay fast.
+                    </p>
+                    <div class="cta-row">
+                        <a class="btn primary" href="/docs/#quickstart">Install in seconds</a>
+                        <a class="btn" href="/docs/">Read the docs</a>
+                        <a
+                            class="btn github"
+                            href="https://github.com/trignomtry/quick"
+                            target="_blank"
+                            rel="noopener"
+                            >GitHub</a
+                        >
+                    </div>
+                    <div class="install">curl -fsSL https://quick-script.dev/install.sh | sh</div>
                 </div>
             </header>
+
+            <section class="grid">
+                <div class="card">
+                    <h3>⚡ Strongly typed, zero guesswork</h3>
+                    <p>Catch errors before they run. Functions, HTTP helpers, and modules are statically checked front to back.</p>
+                </div>
+                <div class="card">
+                    <h3>🚀 LLVM-native speed</h3>
+                    <p>JIT or ahead-of-time with aggressive optimizations. No VM overhead, just native code.</p>
+                </div>
+                <div class="card">
+                    <h3>🌐 Batteries-included async</h3>
+                    <p>Async I/O, HTTP, JSON, files, ranges, and web helpers ready to go. Launch servers with a few lines.</p>
+                </div>
+                <div class="card">
+                    <h3>⚙️ Small surface, big reach</h3>
+                    <p>Minimal, predictable syntax that scales from scripts to services without new mental models.</p>
+                </div>
+            </section>
+
+            <div class="code-block">
+<pre>let web = io.web()
+
+io.listen(8080, fun(req: Request) {
+    match req.path {
+        "/"          => return web.page("&lth1&gt⚡ Quick!&lth1&gt"),
+        "/api/ping"  => return web.json("{\"ok\":true}"),
+        _            => return web.error.text(404, "Not found"),
+    }
+})</pre>
+            </div>
         </div>
     </body>
 </html>

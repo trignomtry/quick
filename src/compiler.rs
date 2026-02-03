@@ -1354,12 +1354,6 @@ impl<'ctx> Compiler<'ctx> {
         self.builder.position_at_end(entry_bb);
         let _main_scope = FunctionScopeGuard::new(&self.current_function, "main".to_string());
 
-        // Ensure the arena global mirrors host storage for runtime helpers.
-        let arena_slot = std::ptr::addr_of_mut!(GLOBAL_ARENA_PTR);
-
-        self.execution_engine
-            .add_global_mapping(&self.current_arena, arena_slot as usize);
-
         // Compile module functions into the LLVM module first (no execution).
         {
             let modules: Vec<(String, ModuleInfo)> = self
@@ -1699,13 +1693,18 @@ impl<'ctx> Compiler<'ctx> {
                     let ret_val = self.compile_expr(expr)?;
                     // Promote returned heap values so callers can safely observe them
                     if let BasicValueEnum::PointerValue(ret_ptr) = ret_val {
-                        let arena_ptr = self.load_arena_ptr()?;
-                        let retain_fn = self.get_or_create_arena_retain();
-                        let _ = self.builder.build_call(
-                            retain_fn,
-                            &[arena_ptr.into(), ret_ptr.into()],
-                            "return_retain",
-                        )?;
+                        let returned_type = self
+                            .infer_expr_type(expr)
+                            .expect("Failed to infer type of returned expression");
+                        if !matches!(returned_type, Type::WebReturn) {
+                            let arena_ptr = self.load_arena_ptr()?;
+                            let retain_fn = self.get_or_create_arena_retain();
+                            let _ = self.builder.build_call(
+                                retain_fn,
+                                &[arena_ptr.into(), ret_ptr.into()],
+                                "return_retain",
+                            )?;
+                        }
                     }
                     // Caller retains if needed; keep return path arena-clean
                     // Release function-scope arena allocations before returning
@@ -1865,7 +1864,7 @@ impl<'ctx> Compiler<'ctx> {
                 let saved_quick = self.quick_var_types.borrow().clone();
                 self.quick_var_types
                     .borrow_mut()
-                    .insert(iterator.clone(), Type::Float);
+                    .insert(iterator.clone(), Type::Int);
                 let range_val = self.compile_expr(range)?;
                 let range_ptr = match range_val {
                     BasicValueEnum::PointerValue(p) => p,
@@ -2570,14 +2569,7 @@ impl<'ctx> Compiler<'ctx> {
                                 let val = match value {
                                     BasicValueEnum::PointerValue(p) => p.as_basic_value_enum(),
                                     BasicValueEnum::FloatValue(f) => f.as_basic_value_enum(),
-                                    BasicValueEnum::IntValue(iv) => self
-                                        .builder
-                                        .build_signed_int_to_float(
-                                            iv,
-                                            self.context.f64_type(),
-                                            "int_to_float_nil_assign",
-                                        )?
-                                        .as_basic_value_enum(),
+                                    BasicValueEnum::IntValue(iv) => iv.as_basic_value_enum(),
                                     other => panic!(
                                         "Cannot assign unsupported value {other:?} to nil list element"
                                     ),
@@ -3920,10 +3912,8 @@ impl<'ctx> Compiler<'ctx> {
             {
                 let raw_arg = self.compile_expr(&args[0])?;
                 let f64_arg = match raw_arg {
-                    BasicValueEnum::FloatValue(f) => f,
-                    BasicValueEnum::IntValue(i) => self
-                        .builder
-                        .build_signed_int_to_float(i, self.context.f64_type(), "io_exit_arg")?,
+                    BasicValueEnum::FloatValue(f) => self.builder.build_float_to_signed_int(f, self.context.i64_type(), "float_to_int_for_exit")?,
+                    BasicValueEnum::IntValue(i) => i,
                     other => panic!(
                         "io.exit expects numeric argument, got {other:?}"
                     ),
@@ -4199,12 +4189,8 @@ impl<'ctx> Compiler<'ctx> {
                     .left()
                     .unwrap()
                     .into_int_value();
-                let len_f64 = self.builder.build_signed_int_to_float(
-                    len_call,
-                    self.context.f64_type(),
-                    "json_len_f64",
-                )?;
-                return Ok(len_f64.as_basic_value_enum());
+
+                return Ok(len_call.as_basic_value_enum());
             }
             // json.is_null()
             Expr::Call(callee, args)
@@ -5876,12 +5862,8 @@ impl<'ctx> Compiler<'ctx> {
                         let result =
                             self.builder
                                 .build_call(atoi_fn, &[obj_val.into()], "atoi_call")?;
-                        let result = self.builder.build_signed_int_to_float(
-                            result.try_as_basic_value().left().unwrap().into_int_value(),
-                            self.context.f64_type(),
-                            "int_to_float",
-                        )?;
-                        Ok(result.as_basic_value_enum())
+                        let result = result.try_as_basic_value().left().unwrap();
+                        Ok(result)
                     }
 
                     Expr::Get(obj, method)
@@ -6380,18 +6362,8 @@ impl<'ctx> Compiler<'ctx> {
                                 BasicValueEnum::PointerValue(p) => p.as_basic_value_enum(),
                                 BasicValueEnum::FloatValue(f) => f.as_basic_value_enum(),
                                 BasicValueEnum::IntValue(iv) => {
-                                    if iv.get_type().get_bit_width() == 1 {
-                                        iv.as_basic_value_enum()
-                                    } else {
-                                        self
-                                            .builder
-                                            .build_signed_int_to_float(
-                                                iv,
-                                                f64_ty,
-                                                "int_to_float_push",
-                                            )?
-                                            .as_basic_value_enum()
-                                    }
+                                    iv.as_basic_value_enum()
+
                                 }
                                 other => panic!(
                                     "Attempted to push unsupported value into untyped list: {:?}",

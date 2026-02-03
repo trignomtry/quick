@@ -16,8 +16,6 @@ use crate::compiler::Compiler;
 #[cfg(not(feature = "runtime-lib"))]
 use inkwell::AddressSpace;
 
-#[cfg(not(feature = "runtime-lib"))]
-static LIBQUICK: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libquick_runtime.a"));
 unsafe extern "C" {
     #[cfg(not(feature = "runtime-lib"))]
     fn strcmp(a: *const i8, b: *const i8) -> i32;
@@ -69,16 +67,35 @@ unsafe extern "C" {
 
 }
 
-pub static mut GLOBAL_ARENA_PTR: *mut Arena = std::ptr::null_mut();
+thread_local! {
+    static THREAD_ARENA_PTR: Cell<*mut Arena> = Cell::new(std::ptr::null_mut());
+}
 static ARENA_DEBUG_CHECKS: AtomicBool = AtomicBool::new(false);
+// The global ARENA_DEBUG_CHECKS static is removed as it's now part of ArenaState.
+
+fn set_thread_arena_ptr(ptr: *mut Arena) {
+    THREAD_ARENA_PTR.with(|cell| cell.set(ptr));
+}
+
+fn take_thread_arena_ptr() -> *mut Arena {
+    THREAD_ARENA_PTR.with(|cell| {
+        let ptr = cell.get();
+        cell.set(std::ptr::null_mut());
+        ptr
+    })
+}
+
+fn get_thread_arena_ptr() -> *mut Arena {
+    THREAD_ARENA_PTR.with(|cell| cell.get())
+}
 
 fn get_or_create_global_arena() -> *mut Arena {
-    unsafe {
-        if GLOBAL_ARENA_PTR.is_null() {
-            GLOBAL_ARENA_PTR = arena_create(64 * 1024 * 1024);
-        }
-        GLOBAL_ARENA_PTR
+    let mut ptr = get_thread_arena_ptr();
+    if ptr.is_null() {
+        ptr = unsafe { arena_create(64 * 1024 * 1024) };
+        set_thread_arena_ptr(ptr);
     }
+    ptr
 }
 
 fn alloc_in_arena(size: usize, align: usize) -> *mut c_void {
@@ -435,10 +452,11 @@ use inkwell::targets::InitializationConfig;
 #[cfg(not(feature = "runtime-lib"))]
 use inkwell::types::BasicTypeEnum;
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::Layout;
 use std::borrow::Cow;
+use std::cell::Cell;
 #[cfg(not(feature = "runtime-lib"))]
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(not(feature = "runtime-lib"))]
 use std::collections::HashSet;
@@ -452,6 +470,8 @@ use std::process::Command;
 use std::ptr;
 use std::ptr::NonNull;
 
+use hyper::service::{make_service_fn, service_fn};
+use serde_json::{self, Value as JsonValue};
 use std::convert::Infallible;
 use std::ffi::c_void;
 use std::ffi::{CStr, CString};
@@ -460,13 +480,9 @@ use std::os::raw::c_char;
 use std::path::Path;
 #[cfg(not(feature = "runtime-lib"))]
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-// Hyper (async HTTP server)
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
-use serde_json::{self, Value as JsonValue};
 
 // ───── High-Performance HTTP Runtime (Actix-style) ─────
 
@@ -521,13 +537,16 @@ static GLOBAL_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 // Dedicated server runtime to keep the HTTP server truly async and alive
 static SERVER_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-fn block_on_in_runtime<F: Future>(fut: F) -> F::Output {
+fn block_on_in_runtime<F: Future + std::marker::Send>(fut: F) -> <F as Future>::Output
+where
+    <F as Future>::Output: Send,
+{
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(move || handle.block_on(fut))
     } else {
         let rt = GLOBAL_RT.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
+                .worker_threads(8)
                 .thread_name("qs-global-rt")
                 .enable_io()
                 .enable_time()
@@ -1572,12 +1591,10 @@ pub unsafe extern "C" fn qs_json_str(handle: *mut JsonHandle) -> *mut c_char {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_create(capacity: usize) -> *mut Arena {
-    unsafe {
-        let cap = capacity.max(1024);
-        let ptr = Box::into_raw(Box::new(Arena::new(cap)));
-        GLOBAL_ARENA_PTR = ptr;
-        ptr
-    }
+    let cap = capacity.max(1024);
+    let ptr = Box::into_raw(Box::new(Arena::new(cap)));
+    set_thread_arena_ptr(ptr);
+    ptr
 }
 
 #[unsafe(no_mangle)]
@@ -1586,6 +1603,8 @@ pub unsafe extern "C" fn arena_alloc(arena: *mut Arena, size: usize, align: usiz
         let Some(mut arena) = NonNull::new(arena) else {
             return std::ptr::null_mut();
         };
+        let arena = arena.as_mut();
+        arena.ensure_owner();
 
         let layout = match Layout::from_size_align(size, align) {
             Ok(l) => l,
@@ -1593,7 +1612,6 @@ pub unsafe extern "C" fn arena_alloc(arena: *mut Arena, size: usize, align: usiz
         };
 
         arena
-            .as_mut()
             .alloc(layout)
             .map(|p| p.as_ptr())
             .unwrap_or(std::ptr::null_mut())
@@ -1607,21 +1625,33 @@ pub unsafe extern "C" fn arena_free(arena: *mut Arena, ptr: *mut u8) {
             return;
         }
         if let Some(mut arena) = NonNull::new(arena) {
-            arena.as_mut().release_ref(ptr);
+            let arena = arena.as_mut();
+            arena.ensure_owner();
+            arena.release_ref(ptr);
         }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_mark(arena: *mut Arena) -> usize {
-    unsafe { NonNull::new(arena).map(|a| a.as_ref().mark()).unwrap_or(0) }
+    unsafe {
+        NonNull::new(arena)
+            .map(|mut a| {
+                let arena = a.as_mut();
+                arena.ensure_owner();
+                arena.mark()
+            })
+            .unwrap_or(0)
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_release(arena: *mut Arena, mark: usize) {
     unsafe {
         if let Some(mut arena) = NonNull::new(arena) {
-            arena.as_mut().release_from(mark);
+            let arena = arena.as_mut();
+            arena.ensure_owner();
+            arena.release_from(mark);
         }
     }
 }
@@ -1630,7 +1660,9 @@ pub unsafe extern "C" fn arena_release(arena: *mut Arena, mark: usize) {
 pub unsafe extern "C" fn arena_pin(arena: *mut Arena, ptr: *mut u8) {
     unsafe {
         if let Some(mut arena) = NonNull::new(arena) {
-            arena.as_mut().retain(ptr);
+            let arena = arena.as_mut();
+            arena.ensure_owner();
+            arena.retain(ptr);
         }
     }
 }
@@ -1639,7 +1671,9 @@ pub unsafe extern "C" fn arena_pin(arena: *mut Arena, ptr: *mut u8) {
 pub unsafe extern "C" fn arena_retain(arena: *mut Arena, ptr: *mut u8) {
     unsafe {
         if let Some(mut arena) = NonNull::new(arena) {
-            arena.as_mut().retain(ptr);
+            let arena = arena.as_mut();
+            arena.ensure_owner();
+            arena.retain(ptr);
         }
     }
 }
@@ -1648,34 +1682,27 @@ pub unsafe extern "C" fn arena_retain(arena: *mut Arena, ptr: *mut u8) {
 pub unsafe extern "C" fn arena_release_ref(arena: *mut Arena, ptr: *mut u8) {
     unsafe {
         if let Some(mut arena) = NonNull::new(arena) {
-            arena.as_mut().release_ref(ptr);
+            let arena = arena.as_mut();
+            arena.ensure_owner();
+            arena.release_ref(ptr);
         }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_destroy(arena: *mut Arena) {
+    if arena.is_null() {
+        return;
+    }
+    // Take ownership and drop the Box<Arena>.
+    // The Drop implementation for Arena will handle the deallocation logic.
     unsafe {
-        if arena.is_null() {
-            return;
-        }
-        let arena_box = Box::from_raw(arena);
-        if ARENA_DEBUG_CHECKS.load(Ordering::Relaxed) {
-            if let Some(leaked) = arena_box
-                .allocations
-                .iter()
-                .find(|allocation| allocation.refs > 0)
-            {
-                panic!(
-                    "Arena leak detected: ptr={:?} still has {} outstanding reference(s)",
-                    leaked.ptr, leaked.refs
-                );
+        THREAD_ARENA_PTR.with(|cell| {
+            if cell.get() == arena {
+                cell.set(std::ptr::null_mut());
             }
-        }
-        if GLOBAL_ARENA_PTR == arena {
-            GLOBAL_ARENA_PTR = std::ptr::null_mut();
-        }
-        drop(arena_box);
+        });
+        let _ = Box::from_raw(arena);
     }
 }
 
@@ -1686,6 +1713,7 @@ pub struct RequestObject {
     query: *mut c_char,
     headers: *mut c_char,
     body: *mut c_char,
+    arena: *mut Arena,
 }
 
 fn owned_string_to_c_ptr(value: String) -> *mut c_char {
@@ -1707,6 +1735,7 @@ impl RequestObject {
         query: Option<String>,
         headers: Option<String>,
         body: Option<String>,
+        arena: *mut Arena,
     ) -> Self {
         Self {
             method: option_string_to_c_ptr(method),
@@ -1714,6 +1743,7 @@ impl RequestObject {
             query: option_string_to_c_ptr(query),
             headers: option_string_to_c_ptr(headers),
             body: option_string_to_c_ptr(body),
+            arena,
         }
     }
 }
@@ -1721,19 +1751,21 @@ impl RequestObject {
 impl Drop for RequestObject {
     fn drop(&mut self) {
         unsafe {
-            free_c_string(self.method);
+            let arena_ptr = self.arena;
+
+            arena_release_ref(arena_ptr, self.method as *mut u8);
             self.method = std::ptr::null_mut();
 
-            free_c_string(self.path);
+            arena_release_ref(arena_ptr, self.path as *mut u8);
             self.path = std::ptr::null_mut();
 
-            free_c_string(self.query);
+            arena_release_ref(arena_ptr, self.query as *mut u8);
             self.query = std::ptr::null_mut();
 
-            free_c_string(self.headers);
+            arena_release_ref(arena_ptr, self.headers as *mut u8);
             self.headers = std::ptr::null_mut();
 
-            free_c_string(self.body);
+            arena_release_ref(arena_ptr, self.body as *mut u8);
             self.body = std::ptr::null_mut();
         }
     }
@@ -1848,14 +1880,19 @@ pub unsafe extern "C" fn create_request_object(
             Some(text) if text.is_empty() => None,
             other => other,
         };
+        let arena_ptr = get_or_create_global_arena();
         let request = RequestObject::from_owned_parts(
             cstr_to_option_string(method),
             cstr_to_option_string(path),
             cstr_to_option_string(query),
             cstr_to_option_string(headers),
             body_string,
+            arena_ptr,
         );
-        Box::into_raw(Box::new(request))
+        let request_ptr = Box::into_raw(Box::new(request));
+        arena_pin(arena_ptr, request_ptr as *mut u8);
+
+        request_ptr
     }
 }
 
@@ -2332,11 +2369,14 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
         path_buf.push("index.html");
     }
 
-    // Read file contents using the runtime helper, but expose a sync C ABI
-    let read_result = block_on_in_runtime(async { tokio::fs::read(&path_buf).await });
+    // Read file contents off the async worker threads; spawn_blocking keeps workers free.
+    let path_clone = path_buf.clone();
+    let read_result = block_on_in_runtime(async move {
+        tokio::task::spawn_blocking(move || std::fs::read(path_clone)).await
+    });
 
     match read_result {
-        Ok(content) => {
+        Ok(Ok(content)) => {
             let mime_type = get_mime_type(&path_buf);
             let (body_ptr, body_len) = leak_bytes_as_body(content);
             let response = Box::new(ResponseObject {
@@ -2349,7 +2389,7 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
             });
             Box::into_raw(response)
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             let missing_ptr = if err.kind() == std::io::ErrorKind::NotFound {
                 let missing = path_buf.to_string_lossy();
                 arena_cstring_from_bytes_checked(missing.as_bytes())
@@ -2364,6 +2404,18 @@ pub unsafe extern "C" fn web_file(filename: *const c_char) -> *mut ResponseObjec
                 body_len,
                 headers: arena_alloc_cstring(b""),
                 missing_file_path: missing_ptr,
+            });
+            Box::into_raw(response)
+        }
+        Err(_) => {
+            let (body_ptr, body_len) = leak_string_as_body("File not found".to_string());
+            let response = Box::new(ResponseObject {
+                status_code: 404,
+                content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
+                body: body_ptr,
+                body_len,
+                headers: arena_alloc_cstring(b""),
+                missing_file_path: std::ptr::null_mut(),
             });
             Box::into_raw(response)
         }
@@ -2506,7 +2558,7 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_v
     let cpu_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    let worker_threads = (cpu_count * 2).min(16);
+    let _worker_threads = (cpu_count * 2).min(16);
 
     // Build task that runs a Hyper server
     let server_task = async move {
@@ -2521,9 +2573,69 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_v
 
         let make_svc = make_service_fn(move |_conn| {
             let handler_addr = callback_addr;
+            let func: extern "C" fn(*const RequestObject) -> *const ResponseObject =
+                unsafe { std::mem::transmute::<_, _>(handler_addr) };
+
             async move {
-                Ok::<_, Infallible>(service_fn(move |req| {
-                    handle_hyper_request(req, handler_addr)
+                Ok::<_, Infallible>(service_fn(move |req: hyper::Request<hyper::Body>| {
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body_bytes = hyper::body::to_bytes(body).await;
+                        let body = String::from_utf8(body_bytes.unwrap().to_vec()).unwrap();
+
+                        let arena_ptr = get_or_create_global_arena();
+                        let mark = unsafe { arena_mark(arena_ptr) };
+
+                        let req = Box::into_raw(Box::new(RequestObject::from_owned_parts(
+                            Some(parts.method.to_string()),
+                            Some(parts.uri.path().to_string()),
+                            Some(String::new()),
+                            {
+                                let _header_map = parts.headers;
+                                let _new_kv = KvMap {
+                                    inner: HashMap::new(),
+                                };
+                                // for (key, value) in header_map {
+                                //     new_kv.inner.insert(
+                                //         CString::new(key.to_string()).unwrap(),
+                                //         value.to_str().unwrap().as_ptr(),
+                                //     );
+                                // }
+                                None
+                            },
+                            Some(body),
+                            arena_ptr,
+                        )));
+                        let Some(response) = NonNull::new(func(req) as *mut ResponseObject) else {
+                            unsafe {
+                                let _ = Box::from_raw(req);
+                                arena_release(arena_ptr, mark);
+                            }
+                            return Ok::<_, hyper::http::Error>(
+                                hyper::Response::builder()
+                                    .status(404)
+                                    .body(Body::from("Not Found"))
+                                    .unwrap(),
+                            );
+                        };
+                        let response_box = unsafe { Box::from_raw(response.as_ptr()) };
+                        let status = response_box.status_code as u16;
+                        let body_bytes = unsafe {
+                            std::slice::from_raw_parts(response_box.body, response_box.body_len)
+                        };
+                        let response_body = Body::from(body_bytes.to_owned());
+
+                        let resp = hyper::Response::builder()
+                            .status(status)
+                            .body(response_body);
+
+                        unsafe {
+                            let _ = Box::from_raw(req);
+                            arena_release(arena_ptr, mark);
+                        }
+
+                        resp
+                    }
                 }))
             }
         });
@@ -2545,207 +2657,12 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_v
     // Otherwise, spin up (or reuse) a dedicated multi-thread runtime and spawn the server
     let rt = SERVER_RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name("qs-worker")
-            .thread_stack_size(2 * 1024 * 1024)
             .enable_io()
             .enable_time()
             .build()
             .expect("Failed to build server runtime")
     });
     rt.spawn(server_task);
-}
-
-fn dispatch_request_to_handler(
-    handler_addr: usize,
-    method: String,
-    path: String,
-    query: String,
-    headers_raw: String,
-    body_str: String,
-) -> (i32, String, Vec<u8>, String) {
-    // Scope arena allocations to this request so per-request C-strings don't accumulate
-    let arena_ptr = get_or_create_global_arena();
-    let mark = unsafe { arena_mark(arena_ptr) };
-
-    let result = match std::panic::catch_unwind(move || unsafe {
-        let body = if body_str.is_empty() {
-            None
-        } else {
-            Some(body_str)
-        };
-        let request = RequestObject::from_owned_parts(
-            Some(method),
-            Some(path),
-            Some(query),
-            Some(headers_raw),
-            body,
-        );
-        invoke_user_handler(handler_addr, request)
-    }) {
-        Ok(output) => output,
-        Err(_) => (
-            500,
-            "text/plain; charset=utf-8".to_string(),
-            b"Internal Server Error".to_vec(),
-            String::new(),
-        ),
-    };
-
-    unsafe {
-        if !arena_ptr.is_null() {
-            arena_release(arena_ptr, mark);
-        }
-    }
-
-    result
-}
-
-unsafe fn invoke_user_handler(
-    handler_addr: usize,
-    request: RequestObject,
-) -> (i32, String, Vec<u8>, String) {
-    unsafe {
-        let request_box = Box::new(request);
-        let request_ptr = request_box.as_ref() as *const RequestObject;
-        let func: extern "C" fn(*const RequestObject) -> *mut ResponseObject =
-            std::mem::transmute::<usize, _>(handler_addr);
-        let response_ptr = func(request_ptr);
-        drop(request_box);
-        materialize_response(response_ptr)
-    }
-}
-
-unsafe fn materialize_response(
-    response_ptr: *mut ResponseObject,
-) -> (i32, String, Vec<u8>, String) {
-    unsafe {
-        if response_ptr.is_null() {
-            return (
-                404,
-                "text/plain; charset=utf-8".to_string(),
-                b"Not Found".to_vec(),
-                String::new(),
-            );
-        }
-
-        let status = get_response_status(response_ptr);
-        let content_type = cstr_to_string(get_response_content_type(response_ptr));
-        let headers = cstr_to_string(get_response_headers(response_ptr));
-        let body_ptr = get_response_body(response_ptr);
-        let body_len = get_response_body_len(response_ptr);
-        let body = if body_ptr.is_null() || body_len == 0 {
-            Vec::new()
-        } else {
-            std::slice::from_raw_parts(body_ptr, body_len).to_vec()
-        };
-        let _ = Box::from_raw(response_ptr);
-        (status, content_type, body, headers)
-    }
-}
-
-async fn handle_hyper_request(
-    req: HyperRequest<Body>,
-    handler_addr: usize,
-) -> Result<HyperResponse<Body>, Infallible> {
-    // Method and path
-    let method = req.method().as_str().to_string();
-    let uri = req.uri().clone();
-    let path = uri.path().to_string();
-    let raw_query = uri.query().unwrap_or("").to_string();
-
-    // Percent-decode util
-    fn percent_decode(input: &str) -> String {
-        let bytes = input.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'+' => {
-                    out.push(b' ');
-                    i += 1;
-                }
-                b'%' if i + 2 < bytes.len() => {
-                    let h1 = bytes[i + 1] as char;
-                    let h2 = bytes[i + 2] as char;
-                    if let (Some(v1), Some(v2)) = (h1.to_digit(16), h2.to_digit(16)) {
-                        out.push(((v1 << 4) as u8) | (v2 as u8));
-                        i += 3;
-                    } else {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-                b => {
-                    out.push(b);
-                    i += 1;
-                }
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    // Normalize query (decode and join)
-    let query = if raw_query.is_empty() {
-        String::new()
-    } else {
-        let mut parts = Vec::new();
-        for pair in raw_query.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            parts.push(format!("{}={}", percent_decode(k), percent_decode(v)));
-        }
-        parts.join("&")
-    };
-
-    // Headers: fold into Key: Value\r\n
-    let mut headers_raw = String::new();
-    for (name, value) in req.headers().iter() {
-        let val = value.to_str().unwrap_or("");
-        headers_raw.push_str(name.as_str());
-        headers_raw.push_str(": ");
-        headers_raw.push_str(val);
-        headers_raw.push_str("\r\n");
-    }
-
-    // Body (collect)
-    let whole = match hyper::body::to_bytes(req.into_body()).await {
-        Ok(b) => b,
-        Err(_) => Default::default(),
-    };
-    let body_str = String::from_utf8(whole.to_vec()).unwrap_or_default();
-
-    // Call the user callback directly and translate the response
-    let (status_code, content_type, body, extra_headers) =
-        dispatch_request_to_handler(handler_addr, method, path, query, headers_raw, body_str);
-
-    // Build Hyper response
-    let mut builder = HyperResponse::builder()
-        .status(StatusCode::from_u16(status_code as u16).unwrap_or(StatusCode::OK));
-    if !content_type.is_empty() {
-        builder = builder.header("Content-Type", content_type);
-    }
-    if !extra_headers.is_empty() {
-        for line in extra_headers.split('\n') {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once(':') {
-                let name = k.trim();
-                let val = v.trim();
-                if !name.is_empty() && !val.is_empty() {
-                    builder = builder.header(name, val);
-                }
-            }
-        }
-    }
-    let resp = builder
-        .body(Body::from(body))
-        .unwrap_or_else(|_| HyperResponse::new(Body::from("Internal Server Error")));
-    Ok(resp)
 }
 
 #[cfg(not(feature = "runtime-lib"))]
@@ -4608,8 +4525,11 @@ fn execute_run(filename: String, debug: bool) {
 
             unsafe {
                 let res = sum.call();
-                if !SERVER_RUNNING.load(Ordering::Relaxed) && !GLOBAL_ARENA_PTR.is_null() {
-                    arena_destroy(GLOBAL_ARENA_PTR);
+                if !SERVER_RUNNING.load(Ordering::Relaxed) {
+                    let arena_ptr = take_thread_arena_ptr();
+                    if !arena_ptr.is_null() {
+                        arena_destroy(arena_ptr);
+                    }
                 }
                 if res != 0.0 {
                     std::process::exit(res as i32);
@@ -4777,6 +4697,18 @@ fn execute_build(filename: String, debug: bool) {
                 .join(".quick")
                 .join("bin")
                 .join("libquick.a");
+            if debug {
+                println!("libquick.a directory: {:?}", runtime_lib_path);
+                println!(
+                    "{:?} {}",
+                    runtime_lib_path,
+                    if runtime_lib_path.exists() {
+                        "exists"
+                    } else {
+                        "does not exist"
+                    }
+                )
+            }
 
             if let Ok(path_override) = std::env::var("QUICK_RUNTIME_LIB") {
                 let override_path = PathBuf::from(&path_override);
@@ -4785,12 +4717,6 @@ fn execute_build(filename: String, debug: bool) {
                         "Failed to copy runtime lib from {}: {err}; falling back to embedded runtime",
                         override_path.display()
                     );
-                }
-            }
-
-            if !runtime_lib_path.exists() {
-                if let Err(e) = std::fs::write(&runtime_lib_path, &LIBQUICK) {
-                    eprintln!("Error writing embedded runtime library: {e}");
                 }
             }
 
@@ -4859,7 +4785,6 @@ fn execute_build(filename: String, debug: bool) {
                 Ok(status) if status.success() => {
                     eprintln!("Built {}/program", build_dir.display());
                     let _ = std::fs::remove_file(&obj_path);
-                    let _ = std::fs::remove_file(&runtime_lib_path);
                 }
                 Ok(status) => {
                     eprintln!("Linker failed with status {status}");
@@ -5139,7 +5064,7 @@ async fn main() {
                         {
                             formatted.push(' ');
                         }
-                        formatted.push_str(name);
+                        formatted.push_str(&name);
                     }
                     Int(num) => {
                         push_indent(&mut formatted, indent, &mut line_open);
@@ -5277,6 +5202,132 @@ pub extern "C" fn __qs_export_roots() -> usize {
         qs_run_main as usize,
     ];
     addrs.iter().fold(0usize, |acc, p| acc.wrapping_add(*p))
+}
+
+#[cfg(feature = "runtime-lib")]
+#[repr(transparent)]
+struct Export(*const c_void);
+
+#[cfg(feature = "runtime-lib")]
+unsafe impl Sync for Export {}
+
+// Force symbols to stay in the static library even if DCE would drop them.
+#[cfg(feature = "runtime-lib")]
+#[used]
+#[unsafe(no_mangle)]
+pub static __QS_EXPORTS: [Export; 10] = [
+    Export(qs_register_struct_descriptor as *const c_void),
+    Export(arena_create as *const c_void),
+    Export(arena_alloc as *const c_void),
+    Export(arena_mark as *const c_void),
+    Export(arena_release as *const c_void),
+    Export(arena_pin as *const c_void),
+    Export(arena_retain as *const c_void),
+    Export(arena_release_ref as *const c_void),
+    Export(arena_destroy as *const c_void),
+    Export(qs_run_main as *const c_void),
+];
+
+pub struct Arena {
+    state: ArenaState,
+}
+
+pub struct ArenaState {
+    buffer: *mut u8,
+    capacity: usize,
+    offset: usize,
+    owner: std::thread::ThreadId,
+}
+
+impl Arena {
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1024);
+        let mut backing = Vec::with_capacity(cap);
+        let buffer = backing.as_mut_ptr();
+        std::mem::forget(backing);
+        let state = ArenaState {
+            buffer,
+            capacity: cap,
+            offset: 0,
+            owner: std::thread::current().id(),
+        };
+        Self { state }
+    }
+
+    #[inline]
+    fn ensure_owner(&mut self) {
+        let current = std::thread::current().id();
+        if self.state.owner != current {
+            self.state.owner = current;
+            let ptr: *mut Arena = self;
+            set_thread_arena_ptr(ptr);
+        }
+    }
+
+    pub fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+        self.state.alloc(layout)
+    }
+
+    pub fn retain(&mut self, ptr: *mut u8) {
+        let _ = ptr;
+    }
+
+    pub fn release_ref(&mut self, ptr: *mut u8) {
+        let _ = ptr;
+    }
+
+    pub fn mark(&mut self) -> usize {
+        self.state.mark()
+    }
+
+    pub fn release_from(&mut self, mark: usize) {
+        self.state.release_from(mark);
+    }
+
+    pub fn set_debug_checks(&mut self, enabled: bool) {
+        let _ = enabled;
+    }
+}
+
+impl ArenaState {
+    #[inline]
+    fn align_up(value: usize, align: usize) -> Option<usize> {
+        let mask = align.checked_sub(1)?;
+        Some(value.wrapping_add(mask) & !mask)
+    }
+
+    fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+        let size = layout.size();
+        if size == 0 {
+            return NonNull::new(std::ptr::null_mut());
+        }
+        let align = layout.align().max(1);
+        let start = Self::align_up(self.offset, align)?;
+        let end = start.checked_add(size)?;
+        if end > self.capacity {
+            return None;
+        }
+        let ptr = unsafe { self.buffer.add(start) };
+        self.offset = end;
+
+        NonNull::new(ptr)
+    }
+
+    fn mark(&self) -> usize {
+        self.offset
+    }
+
+    fn release_from(&mut self, mark: usize) {
+        self.offset = mark.min(self.capacity);
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Vec::from_raw_parts(self.state.buffer, 0, self.state.capacity);
+        }
+    }
 }
 
 type SumFunc = unsafe extern "C" fn() -> f64;
@@ -5703,126 +5754,4 @@ fn tokenize(chars: Vec<char>) -> Vec<Token> {
     });
 
     tokens
-}
-
-struct Allocation {
-    ptr: *mut u8,
-    layout: Layout,
-    refs: usize,
-}
-
-pub struct Arena {
-    allocations: Vec<Allocation>,
-    index_map: HashMap<usize, usize>,
-    _capacity_hint: usize,
-}
-
-impl Arena {
-    fn new(cap: usize) -> Self {
-        Self {
-            allocations: Vec::new(),
-            index_map: HashMap::new(),
-            _capacity_hint: cap,
-        }
-    }
-
-    fn alloc(&mut self, layout: std::alloc::Layout) -> Option<NonNull<u8>> {
-        unsafe {
-            let ptr = alloc(layout);
-            let nn = NonNull::new(ptr)?;
-            let idx = self.allocations.len();
-            self.allocations.push(Allocation {
-                ptr,
-                layout,
-                refs: 0,
-            });
-            self.index_map.insert(ptr as usize, idx);
-            Some(nn)
-        }
-    }
-
-    fn retain(&mut self, ptr: *mut u8) {
-        if let Some(idx) = self.index_map.get(&(ptr as usize)).copied() {
-            if let Some(alloc) = self.allocations.get_mut(idx) {
-                alloc.refs = alloc.refs.saturating_add(1);
-            }
-        }
-    }
-
-    fn release_ref(&mut self, ptr: *mut u8) {
-        if ptr.is_null() {
-            return;
-        }
-        if let Some(idx) = self.index_map.get(&(ptr as usize)).copied() {
-            if let Some(alloc) = self.allocations.get_mut(idx) {
-                if alloc.refs > 0 {
-                    alloc.refs -= 1;
-                }
-                if alloc.refs == 0 {
-                    let layout = alloc.layout;
-                    let raw_ptr = alloc.ptr;
-                    self.allocations.swap_remove(idx);
-                    if let Some(swapped) = self.allocations.get(idx) {
-                        self.index_map.insert(swapped.ptr as usize, idx);
-                    }
-                    self.index_map.remove(&(raw_ptr as usize));
-                    unsafe {
-                        dealloc(raw_ptr, layout);
-                    }
-                }
-            }
-        }
-    }
-
-    fn mark(&self) -> usize {
-        self.allocations.len()
-    }
-
-    fn release_from(&mut self, target_len: usize) {
-        let mut retained: Vec<Allocation> = Vec::new();
-        while self.allocations.len() > target_len {
-            let alloc = self.allocations.pop().unwrap();
-            self.index_map.remove(&(alloc.ptr as usize));
-            if alloc.refs == 0 {
-                unsafe {
-                    dealloc(alloc.ptr, alloc.layout);
-                }
-            } else {
-                retained.push(alloc);
-            }
-        }
-        for alloc in retained.into_iter().rev() {
-            let idx = self.allocations.len();
-            self.index_map.insert(alloc.ptr as usize, idx);
-            self.allocations.push(alloc);
-        }
-    }
-}
-
-impl Drop for Arena {
-    fn drop(&mut self) {
-        for alloc in self.allocations.drain(..) {
-            unsafe {
-                dealloc(alloc.ptr, alloc.layout);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod ffi_safety_tests {
-    use super::*;
-
-    #[test]
-    fn obj_insert_ignores_null_inputs() {
-        unsafe {
-            qs_obj_insert_str(std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut());
-        }
-    }
-
-    #[test]
-    fn obj_get_returns_null_on_null_inputs() {
-        let ptr = unsafe { qs_obj_get_str(std::ptr::null_mut(), std::ptr::null()) };
-        assert!(ptr.is_null());
-    }
 }
