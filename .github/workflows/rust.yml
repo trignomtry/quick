@@ -263,6 +263,9 @@ jobs:
           mkdir -p build target/runtime/release
           cp "$lib_path" build/libquick_runtime.a
           cp "$lib_path" target/runtime/release/libquick_runtime.a
+          # Place where build.rs expects it when running host tools
+          mkdir -p target/release
+          cp "$lib_path" target/release/libquick_runtime.a
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build release (Windows)
@@ -295,6 +298,9 @@ jobs:
           $runtimeDir = Join-Path $env:GITHUB_WORKSPACE "target/runtime/release"
           New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
           Copy-Item $libPath (Join-Path $runtimeDir "libquick_runtime.a") -Force
+          # Place where build.rs expects it when running host tools
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE "target/release") | Out-Null
+          Copy-Item $libPath (Join-Path $env:GITHUB_WORKSPACE "target/release/libquick_runtime.a") -Force
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package artifact (Linux/macOS)
