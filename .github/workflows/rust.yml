@@ -271,7 +271,11 @@ jobs:
           mkdir -p build target/runtime/release
           cp "$lib_path" build/libquick_runtime.a
           cp "$lib_path" target/runtime/release/libquick_runtime.a
-          # Host runtime already built at target/release/libquick_runtime.a
+          # Ensure build.rs sees a staged runtime archive
+          if [ "$lib_path" != "target/release/libquick_runtime.a" ]; then
+            mkdir -p target/release
+            cp "$lib_path" target/release/libquick_runtime.a
+          fi
           # Build host binary (uses staged host runtime)
           cargo build --locked --release
           # Build target binary
@@ -467,6 +471,7 @@ jobs:
             export LLVM_SYS_181_POLLY=OFF
             export DEPS_PREFIX="${GITHUB_WORKSPACE}/deps/install"
             export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target"
+            export CARGO_BUILD_JOBS=1
             rustup target add aarch64-unknown-linux-gnu
             export CC="clang-18"
             export CXX="clang++-18"
@@ -501,9 +506,11 @@ jobs:
             cp "$lib_path" build/libquick_runtime.a
             cp "$lib_path" target/runtime/release/libquick_runtime.a
 
-            # Stage host runtime where build.rs expects it
-            mkdir -p target/release
-            cp "$host_lib" target/release/libquick_runtime.a
+            # Stage runtime where build.rs expects it
+            if [ "$lib_path" != "target/release/libquick_runtime.a" ]; then
+              mkdir -p target/release
+              cp "$lib_path" target/release/libquick_runtime.a
+            fi
 
             cargo build --locked --release --target aarch64-unknown-linux-gnu
 
