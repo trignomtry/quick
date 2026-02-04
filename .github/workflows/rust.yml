@@ -248,6 +248,14 @@ jobs:
             fi
           fi
           export RUSTFLAGS="$NEW_RUSTFLAGS"
+          # Build host runtime to stage for build.rs
+          cargo build --locked --release --lib --features runtime-lib
+          host_lib="target/release/libquick_runtime.a"
+          if [ ! -f "$host_lib" ]; then
+            echo "Host runtime archive not found at $host_lib" >&2
+            exit 1
+          fi
+          # Build target runtime
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
           lib_path="target/${{ matrix.target }}/release/libquick_runtime.a"
           if [ ! -f "$lib_path" ]; then
@@ -265,7 +273,10 @@ jobs:
           cp "$lib_path" target/runtime/release/libquick_runtime.a
           # Place where build.rs expects it when running host tools
           mkdir -p target/release
-          cp "$lib_path" target/release/libquick_runtime.a
+          cp "$host_lib" target/release/libquick_runtime.a
+          # Build host binary (uses staged host runtime)
+          cargo build --locked --release
+          # Build target binary
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build release (Windows)
