@@ -249,12 +249,20 @@ jobs:
           fi
           export RUSTFLAGS="$NEW_RUSTFLAGS"
           # Build host runtime to stage for build.rs
-          cargo build --locked --release --lib --features runtime-lib
-          host_lib="target/release/libquick_runtime.a"
+          cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
+          host_lib="target/${{ matrix.target }}/release/libquick_runtime.a"
           if [ ! -f "$host_lib" ]; then
-            echo "Host runtime archive not found at $host_lib" >&2
-            exit 1
+            alt_host="target/${{ matrix.target }}/release/libquick.a"
+            if [ -f "$alt_host" ]; then
+              host_lib="$alt_host"
+            else
+              echo "Host runtime archive not found at $host_lib" >&2
+              exit 1
+            fi
           fi
+          # Stage host runtime where build.rs expects it
+          mkdir -p target/release
+          cp "$host_lib" target/release/libquick_runtime.a
           # Build target runtime
           cargo build --locked --release --lib --features runtime-lib --target ${{ matrix.target }}
           lib_path="target/${{ matrix.target }}/release/libquick_runtime.a"
@@ -506,8 +514,8 @@ jobs:
             cp "$lib_path" build/libquick_runtime.a
             cp "$lib_path" target/runtime/release/libquick_runtime.a
 
-            # Stage runtime where build.rs expects it
-            if [ "$lib_path" != "target/release/libquick_runtime.a" ]; then
+            # Stage runtime where build.rs expects it (ensure present)
+            if [ ! -f target/release/libquick_runtime.a ]; then
               mkdir -p target/release
               cp "$lib_path" target/release/libquick_runtime.a
             fi

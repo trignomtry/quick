@@ -110,28 +110,8 @@ fn main() {
     emit_cxx_runtime();
 
     if !building_runtime {
-        prepare_embedded_runtime();
+        // prepare_embedded_runtime();
     }
-}
-
-fn prepare_embedded_runtime() {
-    let src = PathBuf::from("target/release/libquick_runtime.a");
-    if !src.exists() {
-        panic!("Quick runtime does not exist!");
-    }
-
-    let bytes = std::fs::read(&src).expect("Failed to read staged runtime archive");
-    if !bytes
-        .windows(b"qs_run_main".len())
-        .any(|w| w == b"qs_run_main")
-    {
-        panic!(
-            "Staged runtime archive at {} is missing QuickScript entry points. Rebuild it with `cargo build --release --lib --features runtime-lib` or set QUICK_RUNTIME_LIB to a valid archive.",
-            src.display()
-        );
-    }
-
-    println!("cargo:rerun-if-changed={}", src.display());
 }
 
 fn locate_llvm_config() -> Option<PathBuf> {

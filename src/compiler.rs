@@ -1355,6 +1355,8 @@ impl<'ctx> Compiler<'ctx> {
         let _main_scope = FunctionScopeGuard::new(&self.current_function, "main".to_string());
 
         // Compile module functions into the LLVM module first (no execution).
+
+        // Compile module functions into the LLVM module first (no execution).
         {
             let modules: Vec<(String, ModuleInfo)> = self
                 .pctx

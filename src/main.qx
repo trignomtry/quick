@@ -1,5 +1,5 @@
 print("Hello, World!")
 let web = io.web();
 io.listen(8080, fun(req: Request) {
-    return web.file("./lander" + req.path).not_found("./lander/404.html");
+    return web.file("./lander" + req.path);
 })

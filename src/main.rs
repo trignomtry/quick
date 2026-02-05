@@ -70,8 +70,6 @@ unsafe extern "C" {
 thread_local! {
     static THREAD_ARENA_PTR: Cell<*mut Arena> = Cell::new(std::ptr::null_mut());
 }
-static ARENA_DEBUG_CHECKS: AtomicBool = AtomicBool::new(false);
-// The global ARENA_DEBUG_CHECKS static is removed as it's now part of ArenaState.
 
 fn set_thread_arena_ptr(ptr: *mut Arena) {
     THREAD_ARENA_PTR.with(|cell| cell.set(ptr));
@@ -92,7 +90,7 @@ fn get_thread_arena_ptr() -> *mut Arena {
 fn get_or_create_global_arena() -> *mut Arena {
     let mut ptr = get_thread_arena_ptr();
     if ptr.is_null() {
-        ptr = unsafe { arena_create(64 * 1024 * 1024) };
+        ptr = unsafe { arena_create(8 * 1024 * 1024) };
         set_thread_arena_ptr(ptr);
     }
     ptr
@@ -446,6 +444,7 @@ pub unsafe extern "C" fn qs_list_join(list: *mut c_void, separator: *const c_cha
     }
 }
 use hyper::body::Body;
+#[cfg(not(feature = "runtime-lib"))]
 use inkwell::basic_block::BasicBlock;
 #[cfg(not(feature = "runtime-lib"))]
 use inkwell::targets::InitializationConfig;
@@ -462,9 +461,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(not(feature = "runtime-lib"))]
 use std::env;
-use std::fmt::{Debug, Display, Formatter};
-
+use std::fmt::Debug;
+#[cfg(not(feature = "runtime-lib"))]
+use std::fmt::{Display, Formatter};
+#[cfg(not(feature = "runtime-lib"))]
 use std::mem;
+#[cfg(not(feature = "runtime-lib"))]
 use std::process::Command;
 #[cfg(not(feature = "runtime-lib"))]
 use std::ptr;
@@ -482,8 +484,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
+#[cfg(not(feature = "runtime-lib"))]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 // ───── High-Performance HTTP Runtime (Actix-style) ─────
 
 // Unique ID generator for anonymous functions to avoid name collisions
@@ -1805,8 +1808,6 @@ unsafe fn free_body(ptr: *mut u8, len: usize) {
     }
 }
 
-unsafe fn free_c_string(_ptr: *mut c_char) {}
-
 impl ResponseObject {
     unsafe fn take_body_bytes(&mut self) -> Vec<u8> {
         unsafe {
@@ -1838,17 +1839,17 @@ impl ResponseObject {
 impl Drop for ResponseObject {
     fn drop(&mut self) {
         unsafe {
-            free_c_string(self.content_type);
+            arena_release_ref(get_thread_arena_ptr(), self.content_type as *mut u8);
             self.content_type = std::ptr::null_mut();
 
             free_body(self.body, self.body_len);
             self.body = std::ptr::null_mut();
             self.body_len = 0;
 
-            free_c_string(self.headers);
+            arena_release_ref(get_thread_arena_ptr(), self.headers as *mut u8);
             self.headers = std::ptr::null_mut();
 
-            free_c_string(self.missing_file_path);
+            arena_release_ref(get_thread_arena_ptr(), self.missing_file_path as *mut u8);
             self.missing_file_path = std::ptr::null_mut();
         }
     }
@@ -2079,10 +2080,12 @@ pub unsafe extern "C" fn web_text(content: *const c_char) -> *mut ResponseObject
 
     let response = Box::new(ResponseObject {
         status_code: 200,
-        content_type: arena_alloc_cstring(b"text/plain; charset=utf-8"),
+        content_type: CString::new("text/plain; charset=utf-8")
+            .unwrap()
+            .into_raw(),
         body: body_ptr,
         body_len,
-        headers: arena_alloc_cstring(b""),
+        headers: CString::new("").unwrap().into_raw(),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -2100,10 +2103,12 @@ pub unsafe extern "C" fn web_json(content: *const c_char) -> *mut ResponseObject
 
     let response = Box::new(ResponseObject {
         status_code: 200,
-        content_type: arena_alloc_cstring(b"application/json; charset=utf-8"),
+        content_type: CString::new("application/json; charset=utf-8")
+            .unwrap()
+            .into_raw(),
         body: body_ptr,
         body_len,
-        headers: arena_alloc_cstring(b""),
+        headers: CString::new("").unwrap().into_raw(),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -2121,10 +2126,10 @@ pub unsafe extern "C" fn web_page(content: *const c_char) -> *mut ResponseObject
 
     let response = Box::new(ResponseObject {
         status_code: 200,
-        content_type: arena_alloc_cstring(b"text/html; charset=utf-8"),
+        content_type: CString::new("text/html; charset=utf-8").unwrap().into_raw(),
         body: body_ptr,
         body_len,
-        headers: arena_alloc_cstring(b""),
+        headers: CString::new("").unwrap().into_raw(),
         missing_file_path: std::ptr::null_mut(),
     });
     Box::into_raw(response)
@@ -2580,12 +2585,15 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_v
                 Ok::<_, Infallible>(service_fn(move |req: hyper::Request<hyper::Body>| {
                     async move {
                         let (parts, body) = req.into_parts();
-                        let body_bytes = hyper::body::to_bytes(body).await;
-                        let body = String::from_utf8(body_bytes.unwrap().to_vec()).unwrap();
+                        let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+                        let body = if body_bytes.is_empty() {
+                            String::new()
+                        } else {
+                            String::from_utf8_lossy(&body_bytes).into_owned()
+                        };
 
                         let arena_ptr = get_or_create_global_arena();
                         let mark = unsafe { arena_mark(arena_ptr) };
-
                         let req = Box::into_raw(Box::new(RequestObject::from_owned_parts(
                             Some(parts.method.to_string()),
                             Some(parts.uri.path().to_string()),
@@ -2606,9 +2614,9 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_v
                             Some(body),
                             arena_ptr,
                         )));
+
                         let Some(response) = NonNull::new(func(req) as *mut ResponseObject) else {
                             unsafe {
-                                let _ = Box::from_raw(req);
                                 arena_release(arena_ptr, mark);
                             }
                             return Ok::<_, hyper::http::Error>(
@@ -2618,19 +2626,15 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_v
                                     .unwrap(),
                             );
                         };
-                        let response_box = unsafe { Box::from_raw(response.as_ptr()) };
+                        let mut response_box = unsafe { Box::from_raw(response.as_ptr()) };
                         let status = response_box.status_code as u16;
-                        let body_bytes = unsafe {
-                            std::slice::from_raw_parts(response_box.body, response_box.body_len)
-                        };
-                        let response_body = Body::from(body_bytes.to_owned());
-
+                        let body_bytes = unsafe { response_box.take_body_bytes() };
+                        let response_body = Body::from(body_bytes);
                         let resp = hyper::Response::builder()
                             .status(status)
                             .body(response_body);
-
+                        let _ = unsafe { Box::from_raw(req) };
                         unsafe {
-                            let _ = Box::from_raw(req);
                             arena_release(arena_ptr, mark);
                         }
 
@@ -2638,9 +2642,6 @@ pub unsafe extern "C" fn qs_listen_with_callback(port: i64, callback: *const c_v
                     }
                 }))
             }
-        });
-        tokio::spawn(async move {
-            std::thread::park();
         });
 
         if let Err(e) = hyper::Server::bind(&socket_addr).serve(make_svc).await {
@@ -4294,6 +4295,7 @@ fn get_special_ident(val: String) -> TokenKind {
     }
 }
 
+#[cfg(not(feature = "runtime-lib"))]
 fn is_identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -4802,6 +4804,7 @@ fn execute_build(filename: String, debug: bool) {
         }
     }
 }
+#[cfg(not(feature = "runtime-lib"))]
 
 fn bundled_linker() -> (Option<std::ffi::OsString>, Option<std::path::PathBuf>) {
     if let Some(env_linker) = std::env::var_os("QUICK_LINKER") {
@@ -4836,6 +4839,7 @@ fn bundled_linker() -> (Option<std::ffi::OsString>, Option<std::path::PathBuf>) 
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(not(feature = "runtime-lib"))]
 fn macos_sdk_root() -> Option<std::path::PathBuf> {
     let validate = |p: &std::path::Path| p.join("usr/lib/libSystem.tbd").exists();
 
@@ -4884,8 +4888,6 @@ fn macos_sdk_root() -> Option<std::path::PathBuf> {
 async fn main() {
     let args = Args::parse();
     let debug = args.debug;
-
-    ARENA_DEBUG_CHECKS.store(debug, Ordering::Relaxed);
 
     let command = args.command.unwrap_or(Commands::Run { filename: None });
 
@@ -5171,7 +5173,7 @@ async fn main() {
 
 #[cfg(feature = "runtime-lib")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qs_run_main() -> i32 {
+pub extern "C" fn qs_run_main() -> i32 {
     unsafe extern "C" {
         fn main() -> f64;
     }
@@ -5179,6 +5181,13 @@ pub unsafe extern "C" fn qs_run_main() -> i32 {
     let res = unsafe { main() };
     if SERVER_RUNNING.load(Ordering::Relaxed) {
         std::thread::park();
+    } else {
+        let arena_ptr = take_thread_arena_ptr();
+        if !arena_ptr.is_null() {
+            unsafe {
+                arena_destroy(arena_ptr);
+            }
+        }
     }
     res.round() as i32
 }
@@ -5206,7 +5215,7 @@ pub extern "C" fn __qs_export_roots() -> usize {
 
 #[cfg(feature = "runtime-lib")]
 #[repr(transparent)]
-struct Export(*const c_void);
+pub struct Export(*const c_void);
 
 #[cfg(feature = "runtime-lib")]
 unsafe impl Sync for Export {}
@@ -5329,7 +5338,7 @@ impl Drop for Arena {
         }
     }
 }
-
+#[cfg(not(feature = "runtime-lib"))]
 type SumFunc = unsafe extern "C" fn() -> f64;
 
 #[cfg(not(feature = "runtime-lib"))]
