@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Documentation - QuickScript</title>
+        <meta
+            name="description"
+            content="QuickScript documentation - Learn how to use the blazingly fast, async-first programming language."
+        />
+        <link rel="stylesheet" href="styles.css" />
+    </head>
+    <body>
+        <!-- Header -->
+        <header class="header">
+            <div class="container header-content">
+                <a href="index.html" class="logo">
+                    <div class="logo-icon glow">
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                        >
+                            <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+                        </svg>
+                    </div>
+                    <span class="logo-text font-display"
+                        >Quick<span>Script</span></span
+                    >
+                </a>
+                <nav class="nav">
+                    <a href="docs.html" class="nav-link active">
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                        >
+                            <path
+                                d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"
+                            />
+                        </svg>
+                        Docs
+                    </a>
+                    <a
+                        href="https://github.com"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="nav-link"
+                    >
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                        >
+                            <path
+                                d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"
+                            />
+                            <path d="M9 18c-4.51 2-5-2-7-2" />
+                        </svg>
+                        GitHub
+                    </a>
+                    <a href="#" class="btn btn-primary btn-sm glow"
+                        >Get Started</a
+                    >
+                </nav>
+            </div>
+        </header>
+
+        <!-- Docs Layout -->
+        <div class="docs-layout">
+            <!-- Sidebar -->
+            <aside class="docs-sidebar" id="docs-sidebar">
+                <div class="sidebar-section">
+                    <h3 class="sidebar-title">Getting Started</h3>
+                    <nav class="sidebar-nav">
+                        <a
+                            class="sidebar-link active"
+                            data-section="introduction"
+                            >Introduction</a
+                        >
+                        <a class="sidebar-link" data-section="installation"
+                            >Installation</a
+                        >
+                        <a class="sidebar-link" data-section="hello-world"
+                            >Hello World</a
+                        >
+                    </nav>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3 class="sidebar-title">Language</h3>
+                    <nav class="sidebar-nav">
+                        <a class="sidebar-link" data-section="variables"
+                            >Variables</a
+                        >
+                        <a class="sidebar-link" data-section="functions"
+                            >Functions</a
+                        >
+                        <a class="sidebar-link" data-section="types">Types</a>
+                        <a class="sidebar-link" data-section="control-flow"
+                            >Control Flow</a
+                        >
+                    </nav>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3 class="sidebar-title">Standard Library</h3>
+                    <nav class="sidebar-nav">
+                        <a class="sidebar-link" data-section="io-module"
+                            >IO Module</a
+                        >
+                        <a class="sidebar-link" data-section="web-module"
+                            >Web Module</a
+                        >
+                        <a class="sidebar-link" data-section="collections"
+                            >Collections</a
+                        >
+                    </nav>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3 class="sidebar-title">Tooling</h3>
+                    <nav class="sidebar-nav">
+                        <a class="sidebar-link" data-section="cli"
+                            >CLI Commands</a
+                        >
+                        <a class="sidebar-link" data-section="jit-vs-aot"
+                            >JIT vs AOT</a
+                        >
+                        <a class="sidebar-link" data-section="debugging"
+                            >Debugging</a
+                        >
+                    </nav>
+                </div>
+            </aside>
+
+            <!-- Main Content -->
+            <main class="docs-content">
+                <!-- Introduction -->
+                <section id="introduction" class="docs-section active">
+                    <h1 class="font-display">
+                        Quick<span>Script</span> Documentation
+                    </h1>
+                    <p class="docs-intro">
+                        Welcome to QuickScript, a blazingly fast, async-first
+                        programming language designed for modern computing. This
+                        documentation will guide you through everything you need
+                        to know to get started.
+                    </p>
+
+                    <h2>What is QuickScript?</h2>
+                    <p>
+                        QuickScript is a statically-typed, compiled programming
+                        language that leverages LLVM to generate highly
+                        optimized machine code. It's designed for developers who
+                        need both rapid development cycles and production-grade
+                        performance.
+                    </p>
+
+                    <h2>Key Features</h2>
+                    <p>
+                        <strong>Blazingly Fast:</strong> Compiles to native code
+                        via LLVM, achieving C-level performance.<br />
+                        <strong>Async First:</strong> Built-in async/await with
+                        lightweight runtime for handling concurrent
+                        operations.<br />
+                        <strong>JIT & AOT:</strong> Choose between Just-In-Time
+                        compilation for development or Ahead-Of-Time for
+                        production.<br />
+                        <strong>Type Safe:</strong> Strong static typing with
+                        inference catches errors at compile time.
+                    </p>
+                </section>
+
+                <!-- Installation -->
+                <section id="installation" class="docs-section">
+                    <h1 class="font-display">Installation</h1>
+                    <p class="docs-intro">
+                        Get QuickScript up and running on your system in
+                        minutes.
+                    </p>
+
+                    <h2>macOS & Linux</h2>
+                    <p>
+                        Install QuickScript using the official installer script:
+                    </p>
+                    <div class="code-block">
+                        <pre><code>curl -fsSL https://quick-script.dev/install.sh | sh</code></pre>
+                    </div>
+
+                    <h2>Windows</h2>
+                    <p>
+                        Download the Windows installer from the releases page or
+                        use PowerShell:
+                    </p>
+                    <div class="code-block">
+                        <pre><code>irm https://quick-script.dev/install.ps1 | iex</code></pre>
+                    </div>
+
+                    <h2>Verify Installation</h2>
+                    <div class="code-block">
+                        <pre><code>quick --version</code></pre>
+                    </div>
+                </section>
+
+                <!-- Hello World -->
+                <section id="hello-world" class="docs-section">
+                    <h1 class="font-display">Hello World</h1>
+                    <p class="docs-intro">
+                        Write and run your first QuickScript program.
+                    </p>
+
+                    <h2>Create Your First Program</h2>
+                    <p>Create a new file called <code>hello.qx</code>:</p>
+                    <div class="code-block">
+                        <div class="code-block-header">
+                            <div class="code-block-dots">
+                                <div
+                                    class="code-block-dot code-block-dot-red"
+                                ></div>
+                                <div
+                                    class="code-block-dot code-block-dot-yellow"
+                                ></div>
+                                <div
+                                    class="code-block-dot code-block-dot-green"
+                                ></div>
+                            </div>
+                            <span class="code-block-filename">hello.qx</span>
+                        </div>
+                        <pre><code>print("Hello, World!")</code></pre>
+                    </div>
+
+                    <h2>Run It</h2>
+                    <div class="code-block">
+                        <pre><code>quick run hello.qx</code></pre>
+                    </div>
+                </section>
+
+                <!-- Variables -->
+                <section id="variables" class="docs-section">
+                    <h1 class="font-display">Variables</h1>
+                    <p class="docs-intro">
+                        Learn how to declare and use variables in QuickScript.
+                    </p>
+
+                    <h2>Declaration</h2>
+                    <p>
+                        Use the <code>let</code> keyword to declare variables:
+                    </p>
+                    <div class="code-block">
+                        <pre><code>let name = "QuickScript";
+let version = 1.0;
+let isAwesome = true;</code></pre>
+                    </div>
+
+                    <h2>Type Annotations</h2>
+                    <p>You can optionally specify types explicitly:</p>
+                    <div class="code-block">
+                        <pre><code>let count: Num = 42;
+let message: Str = "Hello";
+let active: Bool = true;</code></pre>
+                    </div>
+                </section>
+
+                <!-- Functions -->
+                <section id="functions" class="docs-section">
+                    <h1 class="font-display">Functions</h1>
+                    <p class="docs-intro">
+                        Define reusable blocks of code with functions.
+                    </p>
+
+                    <h2>Basic Functions</h2>
+                    <div class="code-block">
+                        <pre><code>fun greet(name: Str) {
+    print("Hello, " + name + "!");
+}
+
+greet("World");</code></pre>
+                    </div>
+
+                    <h2>Return Values</h2>
+                    <div class="code-block">
+                        <pre><code>fun add(a: Num, b: Num) {
+    return a + b;
+}
+
+let result = add(5, 3);
+print(result); // Outputs: 8</code></pre>
+                    </div>
+
+                    <h2>Anonymous Functions</h2>
+                    <div class="code-block">
+                        <pre><code>let double = fun(x: Num) {
+    return x * 2;
+};
+
+print(double(21)); // Outputs: 42</code></pre>
+                    </div>
+                </section>
+
+                <!-- Types -->
+                <section id="types" class="docs-section">
+                    <h1 class="font-display">Types</h1>
+                    <p class="docs-intro">
+                        QuickScript's type system keeps your code safe and fast.
+                    </p>
+
+                    <h2>Primitive Types</h2>
+                    <p>
+                        <strong>Num</strong> - Numbers (integers and floats)<br />
+                        <strong>Str</strong> - Strings<br />
+                        <strong>Bool</strong> - Booleans (true/false)
+                    </p>
+
+                    <h2>Type Inference</h2>
+                    <p>QuickScript automatically infers types when possible:</p>
+                    <div class="code-block">
+                        <pre><code>let x = 42;        // Inferred as Num
+let y = "hello";   // Inferred as Str
+let z = true;      // Inferred as Bool</code></pre>
+                    </div>
+                </section>
+
+                <!-- Control Flow -->
+                <section id="control-flow" class="docs-section">
+                    <h1 class="font-display">Control Flow</h1>
+                    <p class="docs-intro">
+                        Control the execution flow of your programs.
+                    </p>
+
+                    <h2>If Statements</h2>
+                    <div class="code-block">
+                        <pre><code>let age = 18;
+
+if age >= 18 {
+    print("Adult");
+} else {
+    print("Minor");
+}</code></pre>
+                    </div>
+
+                    <h2>For Loops</h2>
+                    <div class="code-block">
+                        <pre><code>for i in io.range().to(10) {
+    print(i.str());
+}</code></pre>
+                    </div>
+                </section>
+
+                <!-- IO Module -->
+                <section id="io-module" class="docs-section">
+                    <h1 class="font-display">IO Module</h1>
+                    <p class="docs-intro">
+                        Handle input/output operations with the IO module.
+                    </p>
+
+                    <h2>Console Output</h2>
+                    <div class="code-block">
+                        <pre><code>print("Hello, World!");
+let answer = 42;
+print("The answer is: " + answer.str());</code></pre>
+                    </div>
+
+                    <h2>Ranges</h2>
+                    <div class="code-block">
+                        <pre><code>for i in io.range().from(1).to(5) {
+    print(i.str());
+}
+// Outputs: 1, 2, 3, 4</code></pre>
+                    </div>
+
+                    <h2>Network Listeners</h2>
+                    <div class="code-block">
+                        <pre><code>io.listen(8080, fun(req: Request) {
+    return web.text("Hello!");
+});</code></pre>
+                    </div>
+                </section>
+
+                <!-- Web Module -->
+                <section id="web-module" class="docs-section">
+                    <h1 class="font-display">Web Module</h1>
+                    <p class="docs-intro">
+                        Build web servers and APIs with ease.
+                    </p>
+
+                    <h2>Creating a Web Server</h2>
+                    <div class="code-block">
+                        <div class="code-block-header">
+                            <div class="code-block-dots">
+                                <div
+                                    class="code-block-dot code-block-dot-red"
+                                ></div>
+                                <div
+                                    class="code-block-dot code-block-dot-yellow"
+                                ></div>
+                                <div
+                                    class="code-block-dot code-block-dot-green"
+                                ></div>
+                            </div>
+                            <span class="code-block-filename">server.qx</span>
+                        </div>
+                        <pre><code>let web = io.web();
+
+io.listen(8080, fun(req: Request) {
+    return web.file("./public" + req.path);
+})
+</code></pre>
+                    </div>
+
+                    <h2>Text Responses</h2>
+                    <div class="code-block">
+                        <pre><code>let web = io.web();
+
+io.listen(8087, fun(req: Request) {
+    return web.text("Ok!");
+})</code></pre>
+                    </div>
+                </section>
+
+                <!-- Collections -->
+                <section id="collections" class="docs-section">
+                    <h1 class="font-display">Collections</h1>
+                    <p class="docs-intro">
+                        Work with arrays and other collection types.
+                    </p>
+
+                    <h2>Arrays</h2>
+                    <div class="code-block">
+                        <pre><code>let numbers = [1, 2, 3, 4, 5];
+let names = ["Alice", "Bob", "Charlie"];</code></pre>
+                    </div>
+
+                    <h2>Iteration</h2>
+                    <div class="code-block">
+                        <pre><code>let items = [10, 20, 30];
+
+for i in io.range().to(items.len()){
+    print(items[i].str());
+}</code></pre>
+                    </div>
+                </section>
+
+                <!-- CLI -->
+                <section id="cli" class="docs-section">
+                    <h1 class="font-display">CLI Commands</h1>
+                    <p class="docs-intro">
+                        Master the QuickScript command-line interface.
+                    </p>
+
+                    <h2>Running Programs</h2>
+                    <div class="code-block">
+                        <pre><code>quick run script.qx      # Run with JIT
+quick build script.qx    # Compile to binary</code></pre>
+                    </div>
+
+                    <h2>Project Management</h2>
+                    <div class="code-block">
+                        <pre><code>
+quick format                # Format code</code></pre>
+                    </div>
+                </section>
+
+                <!-- JIT vs AOT -->
+                <section id="jit-vs-aot" class="docs-section">
+                    <h1 class="font-display">JIT vs AOT</h1>
+                    <p class="docs-intro">
+                        Choose the right compilation strategy for your use case.
+                    </p>
+
+                    <h2>JIT (Just-In-Time)</h2>
+                    <p>
+                        Best for development and scripting. Fast startup,
+                        immediate execution.
+                    </p>
+                    <div class="code-block">
+                        <pre><code>quick run script.qx</code></pre>
+                    </div>
+
+                    <h2>AOT (Ahead-Of-Time)</h2>
+                    <p>
+                        Best for production. Maximum performance, standalone
+                        binaries.
+                    </p>
+                    <div class="code-block">
+                        <pre><code>quick build script.qx
+./bulid/program</code></pre>
+                    </div>
+                </section>
+
+                <!-- Debugging -->
+                <section id="debugging" class="docs-section">
+                    <h1 class="font-display">Debugging</h1>
+                    <p class="docs-intro">
+                        Tools and techniques for debugging QuickScript programs.
+                    </p>
+
+                    <h2>Debug Mode</h2>
+                    <p>Run with debug symbols for better error messages:</p>
+                    <div class="code-block">
+                        <pre><code>quick run --debug script.qx</code></pre>
+                    </div>
+
+                    <h2>Print Debugging</h2>
+                    <div class="code-block">
+                        <pre><code>let value = computeSomething();
+print("DEBUG: value = " + value.str());
+
+// Continue with program...</code></pre>
+                    </div>
+                </section>
+            </main>
+        </div>
+
+        <!-- Mobile Menu Button -->
+        <button
+            class="mobile-menu-btn"
+            id="mobile-menu-btn"
+            aria-label="Toggle menu"
+        >
+            <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+            >
+                <line x1="4" x2="20" y1="12" y2="12" />
+                <line x1="4" x2="20" y1="6" y2="6" />
+                <line x1="4" x2="20" y1="18" y2="18" />
+            </svg>
+        </button>
+
+        <script src="script.js"></script>
+    </body>
+</html>
