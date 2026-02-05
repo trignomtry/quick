@@ -530,7 +530,7 @@ fn cstr_to_path<'a>(ptr: *const c_char) -> Option<Cow<'a, Path>> {
         #[cfg(not(unix))]
         {
             let owned = cstr.to_string_lossy().to_string();
-            return Some(Cow::Owned(PathBuf::from(owned)));
+            return Some(Cow::Owned(std::path::PathBuf::from(owned)));
         }
     }
 }
