@@ -186,7 +186,7 @@ jobs:
               -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_LINK_LLVM_DYLIB=OFF `
               -DBUILD_SHARED_LIBS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF `
               -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF `
-              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$dest
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$dest"
             cmake --build $buildDir --config Release --target install
             if (-not (Test-Path $cmakeConfig)) {
               Write-Error "LLVMConfig.cmake not found after source build"
