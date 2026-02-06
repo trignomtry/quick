@@ -305,13 +305,18 @@ jobs:
           $libPath = "target/${{ matrix.target }}/release/libquick_runtime.a"
           $altPath = "target/${{ matrix.target }}/release/libquick.a"
           $altPath2 = "target/${{ matrix.target }}/release/quick.lib"
+          $altPath3 = "target/${{ matrix.target }}/release/quick_runtime.lib"
           if (-not (Test-Path $libPath)) {
             if (Test-Path $altPath) {
               $libPath = $altPath
             } elseif (Test-Path $altPath2) {
               $libPath = $altPath2
+            } elseif (Test-Path $altPath3) {
+              $libPath = $altPath3
             } else {
-              Write-Error "Static library not found at $libPath or $altPath or $altPath2"
+              Write-Host "--- Listing files in target/${{ matrix.target }}/release/ ---"
+              Get-ChildItem -Path "target/${{ matrix.target }}/release/"
+              Write-Error "Static library not found at $libPath or $altPath or $altPath2 or $altPath3"
             }
           }
           New-Item -ItemType Directory -Force -Path build | Out-Null
